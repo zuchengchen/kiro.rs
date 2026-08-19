@@ -79,7 +79,11 @@ jobs:
             exit 1
           fi
 
-          TARGET="$(git rev-list -n 1 "${TAG}" 2>/dev/null || echo "${GITHUB_SHA}")"
+          if git rev-parse --verify --quiet "refs/tags/${TAG}" >/dev/null; then
+            TARGET="$(git rev-list -n 1 "${TAG}")"
+          else
+            TARGET="${GITHUB_SHA}"
+          fi
 
           git fetch --no-tags origin main-czc:refs/remotes/origin/main-czc
           if ! git merge-base --is-ancestor "$TARGET" refs/remotes/origin/main-czc; then
