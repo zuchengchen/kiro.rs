@@ -36,6 +36,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Validate version
         id: meta
@@ -78,6 +80,12 @@ jobs:
           fi
 
           TARGET="$(git rev-list -n 1 "${TAG}" 2>/dev/null || echo "${GITHUB_SHA}")"
+
+          git fetch --no-tags origin main-czc:refs/remotes/origin/main-czc
+          if ! git merge-base --is-ancestor "$TARGET" refs/remotes/origin/main-czc; then
+            echo "::error::Formal releases must target a tested main-czc revision"
+            exit 1
+          fi
 
           NAMESPACE="${DOCKERHUB_NAMESPACE:-$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')}"
 

@@ -3,7 +3,7 @@ name: Build and Push Docker Hub Images
 on:
   push:
     branches:
-      - master
+      - dev-czc
     paths-ignore:
       - '**.md'
       - 'docs/**'

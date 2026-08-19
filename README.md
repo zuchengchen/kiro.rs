@@ -81,7 +81,7 @@ volumes:
 ```bash
 mkdir -p /opt/kiro-rs/data
 cd /opt/kiro-rs
-curl -O https://raw.githubusercontent.com/ZyphrZero/kiro.rs/master/docker-compose.yml
+curl -O https://raw.githubusercontent.com/zuchengchen/kiro.rs/main-czc/docker-compose.yml
 docker compose up -d
 ```
 
@@ -802,12 +802,20 @@ Docker 镜像：
 
 - `zyphrzero/kiro-rs:<version>`
 - `zyphrzero/kiro-rs:latest`
-- `zyphrzero/kiro-rs:beta`（master beta 构建）
+- `zyphrzero/kiro-rs:beta`（`dev-czc` beta 构建）
 
 容器内在线更新会下载对应平台二进制并替换当前可执行文件；替换后进程退出，由 Docker `restart: unless-stopped` 拉起新进程。回退依赖本地 `<exe>.backup`。
 
 <a id="development"></a>
 ## 开发
+
+分支职责：
+
+- `main`：只快进同步 `ZyphrZero/kiro.rs` 的上游默认分支，不承载定制提交或发布。
+- `dev-czc`：日常开发与上游变更集成分支；推送后触发 beta 构建。
+- `main-czc`：经过测试的稳定定制分支；正式 `vX.Y.Z` tag 必须从该分支的提交创建。
+
+功能和修复先进入 `dev-czc`，测试通过后再快进或通过 PR 推进到 `main-czc`。`main-czc` 的紧急修复完成后必须回合并到 `dev-czc`。
 
 常用命令：
 
