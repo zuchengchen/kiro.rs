@@ -551,6 +551,11 @@ impl AdminService {
         let token_manager_tls_backend = token_manager.config().tls_backend;
 
         let balance_cache = Self::load_balance_cache_from(&cache_path);
+        // 将启动时仍然新鲜的额度缓存同步给调度器；余额过期后由调度器自动回退
+        // 到原有 priority 规则，避免因持久化缓存短暂缺失而阻塞请求。
+        for (&id, cached) in &balance_cache {
+            token_manager.set_balance_snapshot(id, cached.data.remaining, cached.cached_at);
+        }
         let update_config = RuntimeUpdateConfig::from_config(token_manager.config());
 
         let svc = Self {
@@ -809,16 +814,19 @@ impl AdminService {
         let balance = self.fetch_balance(id).await?;
 
         // 更新缓存
+        let cached_at = Utc::now().timestamp() as f64;
         {
             let mut cache = self.balance_cache.lock();
             cache.insert(
                 id,
                 CachedBalance {
-                    cached_at: Utc::now().timestamp() as f64,
+                    cached_at,
                     data: balance.clone(),
                 },
             );
         }
+        self.token_manager
+            .set_balance_snapshot(id, balance.remaining, cached_at);
         self.save_balance_cache();
 
         Ok(balance)
@@ -1016,16 +1024,20 @@ impl AdminService {
             }
             match self.fetch_balance(entry.id).await {
                 Ok(balance) => {
+                    let cached_at = Utc::now().timestamp() as f64;
+                    let remaining = balance.remaining;
                     {
                         let mut cache = self.balance_cache.lock();
                         cache.insert(
                             entry.id,
                             CachedBalance {
-                                cached_at: Utc::now().timestamp() as f64,
+                                cached_at,
                                 data: balance,
                             },
                         );
                     }
+                    self.token_manager
+                        .set_balance_snapshot(entry.id, remaining, cached_at);
                     success += 1;
                 }
                 Err(e) => {
@@ -2306,6 +2318,7 @@ impl AdminService {
                     // 失效本地缓存
                     let mut cache = self.balance_cache.lock();
                     cache.remove(&id);
+                    self.token_manager.clear_balance_snapshot(id);
                 }
                 Err(e) => {
                     tracing::warn!("一键开启超额：凭据 #{} 失败: {}", id, e);
@@ -2399,6 +2412,7 @@ impl AdminService {
     /// 作废某个凭据的余额缓存并落盘
     fn invalidate_balance_cache(&self, id: u64) {
         self.balance_cache.lock().remove(&id);
+        self.token_manager.clear_balance_snapshot(id);
         self.save_balance_cache();
     }
 

@@ -44,7 +44,7 @@
 - 流式和非流式响应：支持 Anthropic SSE 与 OpenAI SSE 事件格式。
 - **多凭据管理**：OAuth、Builder ID、Social、Enterprise / IdC、企业 SSO（Microsoft Entra ID / Azure AD）、Kiro API Key。
 - 自动 token 刷新：支持刷新后回写 `credentials.json`。
-- **多凭据调度**：`priority` 固定优先级和 `balanced` 均衡分配。
+- **多凭据调度**：`priority` 优先选择新鲜缓存中剩余额度较多的账号（额度相同时按 priority），`balanced` 均衡分配。
 - **故障转移**：凭据失败、额度用尽、账号级 429 风控冷却、token 失效强制刷新。
 - **profileArn 策略**：流式端点按账号类型注入真实 ARN 或 Builder ID 占位 ARN；用量类 / 头部类调用跳过占位 ARN。
 - **端点抽象**：按凭据选择 `ide` 或 `cli` endpoint。
@@ -363,7 +363,7 @@ Admin API 鉴权同样支持：
 | `tlsBackend` | `rustls` | `rustls` 或 `native-tls` |
 | `proxyUrl` | 无 | 全局代理，支持 `http://`、`https://`、`socks5://` |
 | `proxyUsername` / `proxyPassword` | 无 | 全局代理认证 |
-| `loadBalancingMode` | `priority` | `priority` 或 `balanced` |
+| `loadBalancingMode` | `priority` | `priority`（剩余额度优先，额度相同时按 priority）或 `balanced` |
 | `accountThrottleFailover` | `true` | 账号级 429 suspicious activity 时是否冷却并切换凭据 |
 | `accountThrottleCooldownSecs` | `1800` | 账号级风控冷却秒数 |
 | `suspendedDetectionEnabled` | `true` | 是否识别 403 账号封禁文案（`suspended` + `locked your account`）并立即禁用该凭据、不参与自愈 |
@@ -773,7 +773,7 @@ credential.proxyUrl -> config.proxyUrl -> direct
 
 `loadBalancingMode` 支持：
 
-- `priority`：优先使用 priority 数字最小的可用凭据。
+- `priority`：优先使用最近 5 分钟内已成功查询且剩余额度较多的可用凭据；额度相同时使用 `priority` 数字较小的凭据。额度缓存缺失或过期时回退到原有 priority 顺序。
 - `balanced`：在可用凭据之间均衡分配。
 
 故障处理：

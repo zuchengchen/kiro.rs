@@ -1134,6 +1134,8 @@ pub struct MultiTokenManager {
     proxy: Mutex<Option<ProxyConfig>>,
     /// 凭据条目列表
     entries: Mutex<Vec<CredentialEntry>>,
+    /// Admin 服务最近一次成功刷新到的剩余额度快照（不持久化到凭据文件）。
+    balance_snapshots: Mutex<HashMap<u64, BalanceSnapshot>>,
     /// 当前活动凭据 ID
     current_id: Mutex<u64>,
     /// 下一个待分配凭据 ID。进程内单调递增，避免删除账号后新账号复用旧 ID，
@@ -1251,6 +1253,52 @@ fn normalize_self_heal_model(model: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| value.to_ascii_lowercase())
+}
+
+/// 最近一次成功查询到的账号剩余额度。
+///
+/// 余额由 Admin 服务后台刷新，Token 管理器只读取这个轻量快照，避免在每个
+/// 请求上实时调用上游额度接口。快照过期后自动回退到原有 priority 规则。
+#[derive(Debug, Clone, Copy)]
+struct BalanceSnapshot {
+    remaining: f64,
+    cached_at: f64,
+}
+
+/// 余额缓存与账号调度使用同一 TTL；过期数据不能影响账号选择。
+const BALANCE_SNAPSHOT_TTL_SECS: f64 = 300.0;
+
+fn fresh_balance_remaining(
+    snapshots: &HashMap<u64, BalanceSnapshot>,
+    id: u64,
+    now_ts: f64,
+) -> Option<f64> {
+    snapshots
+        .get(&id)
+        .filter(|snapshot| {
+            snapshot.remaining.is_finite()
+                && snapshot.cached_at.is_finite()
+                && now_ts - snapshot.cached_at < BALANCE_SNAPSHOT_TTL_SECS
+        })
+        .map(|snapshot| snapshot.remaining)
+}
+
+/// 比较两个账号的剩余额度，返回适用于 `sort_by` 的顺序：额度较多者在前。
+fn compare_balance_desc(
+    snapshots: &HashMap<u64, BalanceSnapshot>,
+    now_ts: f64,
+    left_id: u64,
+    right_id: u64,
+) -> std::cmp::Ordering {
+    match (
+        fresh_balance_remaining(snapshots, left_id, now_ts),
+        fresh_balance_remaining(snapshots, right_id, now_ts),
+    ) {
+        (Some(left), Some(right)) => right.total_cmp(&left),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
 }
 
 impl MultiTokenManager {
@@ -1394,6 +1442,7 @@ impl MultiTokenManager {
             config,
             proxy: Mutex::new(proxy),
             entries: Mutex::new(entries),
+            balance_snapshots: Mutex::new(HashMap::new()),
             current_id: Mutex::new(initial_id),
             next_id: AtomicU64::new(next_id),
             refresh_lock: TokioMutex::new(()),
@@ -1454,6 +1503,42 @@ impl MultiTokenManager {
     /// 获取配置的引用
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// 写入一个账号最近成功查询到的剩余额度，供 priority 调度使用。
+    ///
+    /// 余额查询属于 Admin 服务职责，因此快照只在内存中共享，不写回凭据文件。
+    /// 非有限数值视为无效并清除旧快照，避免异常响应影响账号选择。
+    pub fn set_balance_snapshot(&self, id: u64, remaining: f64, cached_at: f64) {
+        let mut snapshots = self.balance_snapshots.lock();
+        if remaining.is_finite() && cached_at.is_finite() {
+            snapshots.insert(
+                id,
+                BalanceSnapshot {
+                    remaining,
+                    cached_at,
+                },
+            );
+        } else {
+            snapshots.remove(&id);
+        }
+    }
+
+    /// 清除一个账号的额度快照（删除账号、切换身份或余额失效时调用）。
+    pub fn clear_balance_snapshot(&self, id: u64) {
+        self.balance_snapshots.lock().remove(&id);
+    }
+
+    fn has_fresh_balance_snapshot(&self) -> bool {
+        let now_ts = Utc::now().timestamp() as f64;
+        self.balance_snapshots
+            .lock()
+            .values()
+            .any(|snapshot| {
+                snapshot.remaining.is_finite()
+                    && snapshot.cached_at.is_finite()
+                    && now_ts - snapshot.cached_at < BALANCE_SNAPSHOT_TTL_SECS
+            })
     }
 
     /// 串行执行一次 config.json 读改写，供所有 Admin 运行时配置入口复用。
@@ -1950,7 +2035,8 @@ impl MultiTokenManager {
 
     /// 根据负载均衡模式选择下一个凭据
     ///
-    /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
+    /// - priority 模式：优先选择剩余额度较多的可用凭据；额度相同时按
+    ///   `priority`（数字越小越优先）选择。没有新鲜额度快照时回退到 priority。
     /// - balanced 模式：均衡选择可用凭据
     ///
     /// # 参数
@@ -1960,11 +2046,13 @@ impl MultiTokenManager {
         model: Option<&str>,
         group: Option<&str>,
     ) -> Option<(u64, KiroCredentials)> {
+        let balance_snapshots = self.balance_snapshots.lock().clone();
+        let now_ts = Utc::now().timestamp() as f64;
         let entries = self.entries.lock();
         let now = Instant::now();
 
         // 过滤可用凭据
-        let available: Vec<_> = entries
+        let mut available: Vec<_> = entries
             .iter()
             .filter_map(|e| {
                 if !self.entry_available_for_request(e, model, group, now) {
@@ -1986,22 +2074,50 @@ impl MultiTokenManager {
             "balanced" => {
                 // Least-Used 策略：选择成功次数最少的凭据
                 // 平局时按优先级排序（数字越小优先级越高）
-                let (entry, _) = available.iter().min_by_key(|(e, support)| {
-                    let discovery_rank = usize::from(*support != CachedModelSupport::Confirmed);
-                    (discovery_rank, e.success_count, e.credentials.priority)
-                })?;
-
-                Some((entry.id, entry.credentials.clone()))
+                available.sort_by(|(left, left_support), (right, right_support)| {
+                    let discovery_rank =
+                        usize::from(*left_support != CachedModelSupport::Confirmed);
+                    let right_discovery_rank =
+                        usize::from(*right_support != CachedModelSupport::Confirmed);
+                    discovery_rank
+                        .cmp(&right_discovery_rank)
+                        .then_with(|| left.success_count.cmp(&right.success_count))
+                        .then_with(|| {
+                            left.credentials
+                                .priority
+                                .cmp(&right.credentials.priority)
+                        })
+                        .then_with(|| left.id.cmp(&right.id))
+                });
             }
             _ => {
-                // priority 模式（默认）：选择优先级最高的
-                let (entry, _) = available.iter().min_by_key(|(e, support)| {
-                    let discovery_rank = usize::from(*support != CachedModelSupport::Confirmed);
-                    (discovery_rank, e.credentials.priority)
-                })?;
-                Some((entry.id, entry.credentials.clone()))
+                // priority 模式（默认）：新鲜额度优先，未知额度回退到 priority。
+                available.sort_by(|(left, left_support), (right, right_support)| {
+                    let discovery_rank = usize::from(*left_support != CachedModelSupport::Confirmed);
+                    let right_discovery_rank =
+                        usize::from(*right_support != CachedModelSupport::Confirmed);
+                    discovery_rank
+                        .cmp(&right_discovery_rank)
+                        .then_with(|| {
+                            compare_balance_desc(
+                                &balance_snapshots,
+                                now_ts,
+                                left.id,
+                                right.id,
+                            )
+                        })
+                        .then_with(|| {
+                            left.credentials
+                                .priority
+                                .cmp(&right.credentials.priority)
+                        })
+                        .then_with(|| left.id.cmp(&right.id))
+                });
             }
         }
+
+        let (entry, _) = available.first()?;
+        Some((entry.id, entry.credentials.clone()))
     }
 
     /// 获取 API 调用上下文
@@ -2049,10 +2165,12 @@ impl MultiTokenManager {
 
             let (id, credentials, is_balanced) = {
                 let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
+                let has_fresh_balance = self.has_fresh_balance_snapshot();
 
                 // balanced 模式：每次请求都重新均衡选择，不固定 current_id
-                // priority 模式：优先使用 current_id 指向的凭据
-                let current_hit = if is_balanced {
+                // priority 模式有新鲜额度时也要每次重算，确保额度变化及时生效。
+                // 没有额度快照时保留 current_id 快路径，兼容原有行为。
+                let current_hit = if is_balanced || has_fresh_balance {
                     None
                 } else {
                     let entries = self.entries.lock();
@@ -4138,6 +4256,7 @@ impl MultiTokenManager {
         }
 
         self.remove_model_cache(id);
+        self.clear_balance_snapshot(id);
 
         // 持久化更改
         self.persist_credentials()?;
@@ -6856,6 +6975,71 @@ mod tests {
         assert!(manager.select_next_credential(None, None).is_some());
     }
 
+    #[test]
+    fn priority_mode_prefers_fresh_remaining_balance() {
+        let mut first = grouped_cred("first", &[]);
+        first.priority = 0;
+        let mut second = grouped_cred("second", &[]);
+        second.priority = 1;
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![first, second],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let cached_at = Utc::now().timestamp() as f64;
+        manager.set_balance_snapshot(1, 10.0, cached_at);
+        manager.set_balance_snapshot(2, 100.0, cached_at);
+
+        assert_eq!(
+            manager
+                .select_next_credential(None, None)
+                .map(|(id, _)| id),
+            Some(2),
+            "priority 模式应优先选择剩余额度更多的账号"
+        );
+
+        // 额度相同时恢复原有 priority 规则。
+        manager.set_balance_snapshot(1, 100.0, cached_at);
+        assert_eq!(
+            manager
+                .select_next_credential(None, None)
+                .map(|(id, _)| id),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn stale_balance_snapshot_falls_back_to_priority() {
+        let mut first = grouped_cred("first", &[]);
+        first.priority = 0;
+        let mut second = grouped_cred("second", &[]);
+        second.priority = 1;
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![first, second],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let stale_at = Utc::now().timestamp() as f64 - BALANCE_SNAPSHOT_TTL_SECS - 1.0;
+        manager.set_balance_snapshot(1, 1.0, stale_at);
+        manager.set_balance_snapshot(2, 1000.0, stale_at);
+
+        assert_eq!(
+            manager
+                .select_next_credential(None, None)
+                .map(|(id, _)| id),
+            Some(1),
+            "过期额度不得覆盖原有 priority 顺序"
+        );
+    }
+
     #[tokio::test]
     async fn test_acquire_context_priority_current_respects_model_support() {
         let mut free_cred = grouped_cred("free", &[]);
@@ -6886,6 +7070,40 @@ mod tests {
             opus.id, 2,
             "priority current_id must not bypass Opus subscription filtering"
         );
+    }
+
+    #[tokio::test]
+    async fn priority_acquire_rechecks_balance_after_current_id_changes() {
+        let first = KiroCredentials {
+            access_token: Some("first-token".to_string()),
+            expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
+            priority: 0,
+            ..KiroCredentials::default()
+        };
+        let second = KiroCredentials {
+            access_token: Some("second-token".to_string()),
+            expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
+            priority: 1,
+            ..KiroCredentials::default()
+        };
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![first, second],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let cached_at = Utc::now().timestamp() as f64;
+
+        manager.set_balance_snapshot(1, 10.0, cached_at);
+        manager.set_balance_snapshot(2, 100.0, cached_at);
+        assert_eq!(manager.acquire_context(None, None).await.unwrap().id, 2);
+
+        // current_id 仍指向账号 2，但下一次请求应随额度变化切换到账号 1。
+        manager.set_balance_snapshot(1, 200.0, cached_at);
+        manager.set_balance_snapshot(2, 1.0, cached_at);
+        assert_eq!(manager.acquire_context(None, None).await.unwrap().id, 1);
     }
 
     #[test]
