@@ -483,6 +483,14 @@ fn available_models_url(host: &str, _credentials: &KiroCredentials) -> String {
     format!("https://{}/ListAvailableModels?origin=AI_EDITOR", host)
 }
 
+fn normalize_model_name(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 /// 获取使用额度信息
 pub(crate) async fn get_usage_limits(
     credentials: &KiroCredentials,
@@ -1614,6 +1622,56 @@ impl MultiTokenManager {
         }
     }
 
+    /// Resolve a friendly model name to the internal ID required by the
+    /// CodeWhisperer host. Model discovery shares the existing per-account
+    /// cache; a discovery failure or unknown name uses the conservative
+    /// CodeWhisperer fallback from the official client behavior.
+    pub(crate) async fn resolve_codewhisperer_model_id_for(
+        &self,
+        id: u64,
+        requested: &str,
+    ) -> String {
+        const FALLBACK_MODEL_ID: &str = "claude-sonnet-4.6";
+
+        let models = match self.cached_or_refresh_models_for(id).await {
+            Ok(response) => response.models,
+            Err(error) => {
+                tracing::warn!(
+                    "凭据 #{} CodeWhisperer 模型解析失败，回退 {}: {}",
+                    id,
+                    FALLBACK_MODEL_ID,
+                    error
+                );
+                return FALLBACK_MODEL_ID.to_string();
+            }
+        };
+
+        if let Some(model) = models
+            .iter()
+            .find(|model| model.model_id.eq_ignore_ascii_case(requested))
+        {
+            return model.model_id.clone();
+        }
+
+        let requested_key = normalize_model_name(requested);
+        if let Some(model) = models.iter().find(|model| {
+            model
+                .model_name
+                .as_deref()
+                .is_some_and(|name| normalize_model_name(name) == requested_key)
+        }) {
+            return model.model_id.clone();
+        }
+
+        tracing::warn!(
+            "凭据 #{} 未找到 CodeWhisperer 模型 {:?}，回退 {}",
+            id,
+            requested,
+            FALLBACK_MODEL_ID
+        );
+        FALLBACK_MODEL_ID.to_string()
+    }
+
     fn available_model_credential_ids(&self, group: Option<&str>) -> Vec<u64> {
         let now = Instant::now();
         self.entries
@@ -1846,6 +1904,38 @@ impl MultiTokenManager {
         true
     }
 
+    /// 返回当前请求范围内最早结束的账号冷却秒数。
+    ///
+    /// 向上取整可避免还有不足一秒冷却时对客户端返回 `Retry-After: 0`。
+    fn retry_after_for_throttled_request(
+        &self,
+        entries: &[CredentialEntry],
+        model: Option<&str>,
+        group: Option<&str>,
+        now: Instant,
+    ) -> Option<u64> {
+        entries
+            .iter()
+            .filter(|entry| {
+                !entry.disabled
+                    && credential_matches_request(&entry.credentials, model, group)
+                    && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
+            })
+            .filter_map(|entry| {
+                entry
+                    .throttled_until
+                    .and_then(|until| until.checked_duration_since(now))
+            })
+            .filter(|remaining| !remaining.is_zero())
+            .map(|remaining| {
+                remaining
+                    .as_secs()
+                    .saturating_add(u64::from(remaining.subsec_nanos() > 0))
+                    .max(1)
+            })
+            .min()
+    }
+
     fn has_available_for_request(
         &self,
         entries: &[CredentialEntry],
@@ -2012,9 +2102,15 @@ impl MultiTokenManager {
                         (new_id, new_creds)
                     } else {
                         let entries = self.entries.lock();
-                        if let Some(retry_after) =
-                            self.rpm_retry_after_secs(&entries, model, group, Instant::now())
-                        {
+                        let now = Instant::now();
+                        let retry_after = [
+                            self.rpm_retry_after_secs(&entries, model, group, now),
+                            self.retry_after_for_throttled_request(&entries, model, group, now),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .min();
+                        if let Some(retry_after) = retry_after {
                             return Err(
                                 UpstreamRateLimitError::new(Some(retry_after.to_string())).into()
                             );
@@ -3276,7 +3372,7 @@ impl MultiTokenManager {
     /// token 身份不匹配触发 403，真实 profileArn 只能通过 `ListAvailableProfiles` 获取。
     ///
     /// 行为：
-    /// - API Key 凭据 / 已有真实（非占位符）profileArn → 直接返回，不发起网络请求；
+    /// - 已有真实（非占位符）profileArn → 直接返回，不发起网络请求；
     /// - 否则调用上游 `ListAvailableProfiles`，命中真实 ARN 时写回凭据并持久化；
     /// - 上游无 profile（如纯 BuilderID 账号）→ 返回 `None`，由调用方回退到占位符。
     ///
@@ -3296,11 +3392,6 @@ impl MultiTokenManager {
                 .map(|e| e.credentials.clone())
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
-
-        // API Key 凭据没有 profileArn 概念
-        if credentials.is_api_key_credential() {
-            return Ok(None);
-        }
 
         // 已有真实 ARN（含 Social 共享 ARN）→ 直接用，无需查询
         if let Some(arn) = credentials.profile_arn.as_deref() {
@@ -5500,6 +5591,42 @@ mod tests {
         assert!(g2.disabled, "g1 风控冷却不得复活 g2 凭据");
     }
 
+    #[tokio::test]
+    async fn acquire_context_returns_rate_limit_while_matching_account_is_cooling_down() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("g1-token", &["g1"])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            manager.report_account_throttled_for_request(
+                1,
+                StdDuration::from_secs(60),
+                None,
+                Some("g1"),
+            ),
+            0
+        );
+
+        let error = match manager.acquire_context(None, Some("g1")).await {
+            Ok(_) => panic!("冷却中的唯一账号不应被选中"),
+            Err(error) => error,
+        };
+        let rate_limit = error
+            .downcast_ref::<UpstreamRateLimitError>()
+            .expect("冷却期应保留类型化 429 错误");
+        let retry_after = rate_limit
+            .retry_after()
+            .expect("冷却期应返回 Retry-After")
+            .parse::<u64>()
+            .unwrap();
+        assert!((1..=60).contains(&retry_after));
+    }
+
     #[test]
     fn suspended_reason_survives_restart() {
         use crate::kiro::model::credentials::CredentialsConfig;
@@ -5993,19 +6120,18 @@ mod tests {
     }
 
     #[test]
-    fn test_api_call_uses_effective_api_region() {
-        // 验证 API 调用使用 effective_api_region
+    fn test_api_call_falls_back_to_credential_region() {
+        // 账号只提供 region 时，API 区域也必须从它解析。
         let mut config = Config::default();
         config.region = "us-west-2".to_string();
 
         let mut credentials = KiroCredentials::default();
         credentials.region = Some("eu-west-1".to_string());
 
-        // 凭据.region 不参与 api_region 回退链
         let api_region = credentials.effective_api_region(&config);
         let api_host = format!("q.{}.amazonaws.com", api_region);
 
-        assert_eq!(api_host, "q.us-west-2.amazonaws.com");
+        assert_eq!(api_host, "q.eu-west-1.amazonaws.com");
     }
 
     #[test]

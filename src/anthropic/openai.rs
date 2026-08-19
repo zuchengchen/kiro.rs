@@ -16,9 +16,9 @@ use std::collections::BTreeMap;
 
 use axum::{
     Json,
-    body::{Body, to_bytes},
+    body::{Body, Bytes, to_bytes},
     extract::{Extension, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
@@ -117,6 +117,7 @@ pub async fn post_chat_completions(
     let inner = post_messages(State(state), Extension(key_ctx), Json(anthropic_req)).await;
 
     let status = inner.status();
+    let retry_after = inner.headers().get(header::RETRY_AFTER).cloned();
     let body_bytes = match to_bytes(inner.into_body(), MAX_INNER_BODY).await {
         Ok(b) => b,
         Err(e) => {
@@ -130,11 +131,7 @@ pub async fn post_chat_completions(
 
     // 上游非 2xx：原样透传（Anthropic 错误体已是 {"error":{type,message}} 形状）
     if !status.is_success() {
-        return Response::builder()
-            .status(status)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body_bytes))
-            .unwrap();
+        return passthrough_error_response(status, body_bytes, retry_after);
     }
 
     let anthropic: Value = match serde_json::from_slice(&body_bytes) {
@@ -720,6 +717,24 @@ fn openai_error(status: StatusCode, err_type: &str, message: &str) -> Response {
     (status, Json(body)).into_response()
 }
 
+/// Preserve the retry contract when an OpenAI-compatible handler relays an
+/// error produced by the shared Anthropic pipeline.
+pub(super) fn passthrough_error_response(
+    status: StatusCode,
+    body: Bytes,
+    retry_after: Option<HeaderValue>,
+) -> Response {
+    let mut response = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .expect("static error response headers are valid");
+    if let Some(value) = retry_after {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -839,6 +854,25 @@ mod tests {
 
         let anthropic = openai_to_anthropic(chat_request(None), None).unwrap();
         assert!(anthropic.metadata.is_none());
+    }
+
+    #[tokio::test]
+    async fn error_passthrough_preserves_retry_after() {
+        let response = passthrough_error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            Bytes::from_static(br#"{"error":{"type":"rate_limit_error"}}"#),
+            Some(HeaderValue::from_static("42")),
+        );
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "42");
+        let body = to_bytes(response.into_body(), MAX_INNER_BODY)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["error"]["type"],
+            "rate_limit_error"
+        );
     }
 
     fn base_parsed() -> ParsedResponse {

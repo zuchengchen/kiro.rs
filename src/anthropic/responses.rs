@@ -47,8 +47,8 @@ use uuid::Uuid;
 use super::handlers::post_messages;
 use super::middleware::{AppState, KeyContext};
 use super::openai::{
-    ParsedResponse, collect_text_strings, now_ts, parse_anthropic_message, push_merged,
-    resolve_session_metadata,
+    ParsedResponse, collect_text_strings, now_ts, parse_anthropic_message,
+    passthrough_error_response, push_merged, resolve_session_metadata,
 };
 use super::types::{Message, MessagesRequest, Metadata, OutputConfig, SystemMessage, Tool};
 
@@ -168,6 +168,7 @@ pub async fn post_responses(
     let inner = post_messages(State(state), Extension(key_ctx), Json(anthropic_req)).await;
 
     let status = inner.status();
+    let retry_after = inner.headers().get(header::RETRY_AFTER).cloned();
     let body_bytes = match to_bytes(inner.into_body(), MAX_INNER_BODY).await {
         Ok(b) => b,
         Err(e) => {
@@ -181,11 +182,7 @@ pub async fn post_responses(
 
     // 上游非 2xx：原样透传
     if !status.is_success() {
-        return Response::builder()
-            .status(status)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body_bytes))
-            .unwrap();
+        return passthrough_error_response(status, body_bytes, retry_after);
     }
 
     let anthropic: Value = match serde_json::from_slice(&body_bytes) {

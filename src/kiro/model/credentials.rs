@@ -420,10 +420,11 @@ impl KiroCredentials {
     }
 
     /// 获取有效的 API Region（用于 API 请求）
-    /// 优先级：凭据.api_region > config.api_region > config.region
+    /// 优先级：凭据.api_region > 凭据.region > config.api_region > config.region
     pub fn effective_api_region<'a>(&'a self, config: &'a Config) -> &'a str {
         self.api_region
             .as_deref()
+            .or(self.region.as_deref())
             .unwrap_or(config.effective_api_region())
     }
 
@@ -564,10 +565,10 @@ impl KiroCredentials {
     ///
     /// - 已有显式 profileArn（真实 ARN / Social ARN / BuilderID 占位符）→ 原样返回；
     /// - 尚未填充 → 按登录方式推断默认 ARN（Social → Social ARN，其余 → BuilderID）；
-    /// - API Key 凭据无 profileArn 概念 → 返回 `None`。
+    /// - API Key 凭据仅在显式/自愈解析到 profileArn 后返回该 ARN。
     pub fn streaming_profile_arn(&self) -> Option<String> {
         if self.is_api_key_credential() {
-            return None;
+            return self.profile_arn.clone();
         }
         Some(
             self.profile_arn
@@ -1239,15 +1240,14 @@ mod tests {
     }
 
     #[test]
-    fn test_effective_api_region_ignores_credential_region() {
-        // 凭据.region 不参与 api_region 的回退链
+    fn test_effective_api_region_falls_back_to_credential_region() {
         let mut config = Config::default();
         config.region = "config-region".to_string();
 
         let mut creds = KiroCredentials::default();
         creds.region = Some("cred-region".to_string());
 
-        assert_eq!(creds.effective_api_region(&config), "config-region");
+        assert_eq!(creds.effective_api_region(&config), "cred-region");
     }
 
     #[test]

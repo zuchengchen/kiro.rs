@@ -35,6 +35,12 @@ const MAX_TOTAL_RETRIES: usize = 4;
 /// 代理池条目较多时，避免每个不同代理都常驻一个 reqwest::Client 导致内存无界增长。
 const CLIENT_CACHE_CAP: usize = 64;
 
+/// The fallback must resolve before the outer stream's zero-byte guard fires.
+const FALLBACK_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Failed profile discovery is retried after a bounded negative-cache window.
+const PROFILE_RESOLUTION_NEGATIVE_TTL: Duration = Duration::from_secs(5 * 60);
+
 /// 带容量上限的 HTTP Client 缓存。
 ///
 /// - key 为 effective proxy 配置（None = 直连/全局回退）
@@ -117,12 +123,12 @@ pub struct KiroProvider {
     endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
     /// 默认端点名称（凭据未指定 endpoint 时使用）
     default_endpoint: String,
-    /// 已尝试过 profileArn 解析的凭据 ID（进程内）。
+    /// Failed/empty profileArn discovery attempts, with a five-minute TTL.
     ///
     /// 避免对「无 Enterprise profile」的账号（如纯 BuilderID）在每次请求都重复调用
     /// `ListAvailableProfiles`。命中真实 ARN 的账号会把 ARN 持久化进凭据，之后
     /// 通过 `streaming_profile_arn()` 直接命中，不再进入解析路径。
-    profile_resolution_attempted: Mutex<HashSet<u64>>,
+    profile_resolution_negative_cache: Mutex<HashMap<u64, Instant>>,
 }
 
 impl KiroProvider {
@@ -151,8 +157,8 @@ impl KiroProvider {
         );
         let tls_backend = token_manager.config().tls_backend;
         // 预热：构建全局代理对应的 Client（作为受保护的常驻条目）
-        let initial_client = build_client(proxy.as_ref(), 720, tls_backend)
-            .expect("创建 HTTP 客户端失败");
+        let initial_client =
+            build_client(proxy.as_ref(), 720, tls_backend).expect("创建 HTTP 客户端失败");
         let client_cache = ClientCache::new(proxy.clone(), initial_client, CLIENT_CACHE_CAP);
 
         Self {
@@ -162,7 +168,7 @@ impl KiroProvider {
             tls_backend,
             endpoints,
             default_endpoint,
-            profile_resolution_attempted: Mutex::new(HashSet::new()),
+            profile_resolution_negative_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -179,10 +185,7 @@ impl KiroProvider {
     }
 
     /// 根据凭据选择 endpoint 实现
-    fn endpoint_for(
-        &self,
-        credentials: &KiroCredentials,
-    ) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
+    fn endpoint_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
         let name = credentials
             .endpoint
             .as_deref()
@@ -197,7 +200,7 @@ impl KiroProvider {
     ///
     /// 流式端点强制要求 profileArn；Enterprise / IdC 账号必须先把 BuilderID
     /// 占位符解析为真实 ARN，纯 BuilderID 账号则回退占位符。
-    /// 仅对「OAuth 凭据 + profileArn 缺失或为占位符」的账号触发一次上游
+    /// 仅对「profileArn 缺失或为占位符」的账号触发一次上游
     /// `ListAvailableProfiles` 查询（进程内去重）：
     /// - 命中真实 ARN → 写回 `ctx.credentials.profile_arn` 并由 token_manager 持久化；
     ///   之后该凭据的 `streaming_profile_arn()` 直接命中，不再进入此路径。
@@ -209,9 +212,6 @@ impl KiroProvider {
     ) -> anyhow::Result<()> {
         use crate::kiro::model::credentials::is_placeholder_profile_arn;
 
-        if ctx.credentials.is_api_key_credential() {
-            return Ok(());
-        }
         let needs = match ctx.credentials.profile_arn.as_deref() {
             None => true,
             Some(arn) => is_placeholder_profile_arn(arn),
@@ -219,9 +219,12 @@ impl KiroProvider {
         if !needs {
             return Ok(());
         }
-        // 进程内去重：仅在「拿到上游确定结果」后才标记已尝试，避免一次网络抖动
-        // 把账号永久卡在占位符上（重启前不再重试）。
-        if self.profile_resolution_attempted.lock().contains(&ctx.id) {
+        if self
+            .profile_resolution_negative_cache
+            .lock()
+            .get(&ctx.id)
+            .is_some_and(|attempted_at| attempted_at.elapsed() < PROFILE_RESOLUTION_NEGATIVE_TTL)
+        {
             return Ok(());
         }
         match self
@@ -231,19 +234,27 @@ impl KiroProvider {
         {
             Ok(Some(arn)) => {
                 ctx.credentials.profile_arn = Some(arn);
-                self.profile_resolution_attempted.lock().insert(ctx.id);
+                self.profile_resolution_negative_cache
+                    .lock()
+                    .remove(&ctx.id);
             }
             Ok(None) => {
-                // 上游确认该账号无 Enterprise profile（纯 BuilderID 等）：标记已尝试，
-                // 后续请求回退到占位符逻辑，不再重复查询。
-                self.profile_resolution_attempted.lock().insert(ctx.id);
+                self.profile_resolution_negative_cache
+                    .lock()
+                    .insert(ctx.id, Instant::now());
             }
             Err(e) => {
                 if is_rate_limit_error(&e) {
                     return Err(e);
                 }
-                // 网络/瞬态错误：不标记，下次请求再试；本次按原 profileArn 继续
-                tracing::warn!("凭据 #{} 解析真实 profileArn 失败（按原 profileArn 继续）: {}", ctx.id, e);
+                self.profile_resolution_negative_cache
+                    .lock()
+                    .insert(ctx.id, Instant::now());
+                tracing::warn!(
+                    "凭据 #{} 解析真实 profileArn 失败（按原 profileArn 继续）: {}",
+                    ctx.id,
+                    e
+                );
             }
         }
         Ok(())
@@ -259,7 +270,8 @@ impl KiroProvider {
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, false, sink, group).await
+        self.call_api_with_retry(request_body, false, sink, group)
+            .await
     }
 
     /// 发送流式 API 请求
@@ -269,7 +281,8 @@ impl KiroProvider {
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, true, sink, group).await
+        self.call_api_with_retry(request_body, true, sink, group)
+            .await
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
@@ -579,7 +592,11 @@ impl KiroProvider {
                     if !has_available {
                         anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
                     }
-                    last_error = Some(anyhow::anyhow!("MCP 请求失败（账号封禁）: {} {}", status, body));
+                    last_error = Some(anyhow::anyhow!(
+                        "MCP 请求失败（账号封禁）: {} {}",
+                        status,
+                        body
+                    ));
                     continue;
                 }
 
@@ -693,6 +710,71 @@ impl KiroProvider {
         }))
     }
 
+    async fn prepare_endpoint_api_body(
+        &self,
+        endpoint: &dyn KiroEndpoint,
+        credential_id: u64,
+        request_body: &str,
+        rctx: &RequestContext<'_>,
+    ) -> String {
+        let body = if endpoint.requires_codewhisperer_model_id() {
+            if let Some(requested) = Self::extract_model_from_request(request_body) {
+                let resolved = self
+                    .token_manager
+                    .resolve_codewhisperer_model_id_for(credential_id, &requested)
+                    .await;
+                crate::kiro::endpoint::apply_payload_model_id(request_body, &resolved)
+            } else {
+                request_body.to_string()
+            }
+        } else {
+            request_body.to_string()
+        };
+        endpoint.transform_api_body(&body, rctx)
+    }
+
+    /// Build and send one data-plane request. The returned response still owns
+    /// its streaming body; callers must keep body parsing outside timeout/error
+    /// scopes so a mid-stream error cannot be relabeled as a quota failure.
+    async fn execute_endpoint_api_request(
+        &self,
+        endpoint: &dyn KiroEndpoint,
+        credential_id: u64,
+        credentials: &KiroCredentials,
+        request_body: &str,
+        rctx: &RequestContext<'_>,
+    ) -> anyhow::Result<reqwest::Response> {
+        let url = endpoint.api_url(rctx);
+        let body = self
+            .prepare_endpoint_api_body(endpoint, credential_id, request_body, rctx)
+            .await;
+
+        tracing::debug!("使用端点 [{}] POST {}", endpoint.display_name(), url);
+        tracing::debug!("实际发送请求体: {}", body);
+
+        let base = self
+            .client_for(credentials)?
+            .post(&url)
+            .body(body)
+            .header("content-type", endpoint.content_type())
+            .header("Connection", "close");
+        let request = endpoint
+            .decorate_api(base, rctx)
+            .build()
+            .map_err(|e| anyhow::anyhow!("构建请求失败: {}", e))?;
+
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            for (key, value) in request.headers() {
+                tracing::debug!("  header {}: {}", key, value.to_str().unwrap_or("<binary>"));
+            }
+        }
+
+        self.client_for(credentials)?
+            .execute(request)
+            .await
+            .map_err(Into::into)
+    }
+
     /// 内部方法：带重试逻辑的 API 调用
     ///
     /// 重试策略：
@@ -719,7 +801,11 @@ impl KiroProvider {
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
             // 获取调用上下文（绑定 index、credentials、token）
-            let mut ctx = match self.token_manager.acquire_context(model.as_deref(), group).await {
+            let mut ctx = match self
+                .token_manager
+                .acquire_context(model.as_deref(), group)
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     if is_rate_limit_error(&e) {
@@ -759,12 +845,18 @@ impl KiroProvider {
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
 
-            let endpoint = match self.endpoint_for(&ctx.credentials) {
+            let mut endpoint = match self.endpoint_for(&ctx.credentials) {
                 Ok(e) => e,
                 Err(e) => {
                     Self::emit_attempt(
-                        sink, attempt, ctx.id, "", None, outcome::UNKNOWN,
-                        Some(&e.to_string()), attempt_start,
+                        sink,
+                        attempt,
+                        ctx.id,
+                        "",
+                        None,
+                        outcome::UNKNOWN,
+                        Some(&e.to_string()),
+                        attempt_start,
                     );
                     last_error = Some(e);
                     self.token_manager
@@ -772,7 +864,7 @@ impl KiroProvider {
                     continue;
                 }
             };
-            let endpoint_name = endpoint.name();
+            let mut endpoint_name = endpoint.name();
 
             let rctx = RequestContext {
                 credentials: &ctx.credentials,
@@ -781,28 +873,16 @@ impl KiroProvider {
                 config,
             };
 
-            let url = endpoint.api_url(&rctx);
-            let body = endpoint.transform_api_body(request_body, &rctx);
-
-            tracing::debug!("使用端点 [{}] POST {}", endpoint.name(), url);
-            tracing::debug!("实际发送请求体: {}", body);
-
-            let base = self
-                .client_for(&ctx.credentials)?
-                .post(&url)
-                .body(body)
-                .header("content-type", endpoint.content_type())
-                .header("Connection", "close");
-            let request = endpoint.decorate_api(base, &rctx);
-
-            // 打印实际发送的请求头（RUST_LOG=debug 时输出，便于排查问题）
-            let request = request.build().map_err(|e| anyhow::anyhow!("构建请求失败: {}", e))?;
-            if tracing::enabled!(tracing::Level::DEBUG) {
-                for (k, v) in request.headers() {
-                    tracing::debug!("  header {}: {}", k, v.to_str().unwrap_or("<binary>"));
-                }
-            }
-            let response = match self.client_for(&ctx.credentials)?.execute(request).await {
+            let response = match self
+                .execute_endpoint_api_request(
+                    endpoint.as_ref(),
+                    ctx.id,
+                    &ctx.credentials,
+                    request_body,
+                    &rctx,
+                )
+                .await
+            {
                 Ok(resp) => resp,
                 Err(e) => {
                     tracing::warn!(
@@ -812,12 +892,18 @@ impl KiroProvider {
                         e
                     );
                     Self::emit_attempt(
-                        sink, attempt, ctx.id, endpoint_name, None,
-                        outcome::NETWORK_ERROR, Some(&e.to_string()), attempt_start,
+                        sink,
+                        attempt,
+                        ctx.id,
+                        endpoint_name,
+                        None,
+                        outcome::NETWORK_ERROR,
+                        Some(&e.to_string()),
+                        attempt_start,
                     );
                     // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
                     // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
-                    last_error = Some(e.into());
+                    last_error = Some(e);
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
                     }
@@ -825,15 +911,21 @@ impl KiroProvider {
                 }
             };
 
-            let status = response.status();
-            let rate_limit_error = (status.as_u16() == 429)
+            let mut status = response.status();
+            let mut rate_limit_error = (status.as_u16() == 429)
                 .then(|| UpstreamRateLimitError::from_headers(response.headers()));
 
             // 成功响应
             if status.is_success() {
                 Self::emit_attempt(
-                    sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
-                    outcome::SUCCESS, None, attempt_start,
+                    sink,
+                    attempt,
+                    ctx.id,
+                    endpoint_name,
+                    Some(status.as_u16()),
+                    outcome::SUCCESS,
+                    None,
+                    attempt_start,
                 );
                 self.token_manager
                     .report_success_for_request(ctx.id, model.as_deref());
@@ -843,8 +935,113 @@ impl KiroProvider {
                 });
             }
 
-            // 失败响应：读取 body 用于日志/错误信息
-            let body = response.text().await.unwrap_or_default();
+            // Successful streaming bodies are returned untouched above. Keep
+            // the primary response optional so a 429 can be dropped
+            // immediately instead of waiting for its body before failover.
+            let mut primary_response = Some(response);
+            let mut error_body: Option<String> = None;
+            let mut fallback_exhausted = false;
+
+            // runtime.kiro.dev and *.amazonaws.com use independent limit
+            // buckets. A 429 gets exactly one same-account retry on the paired
+            // bucket before account cooldown/credential failover sees it.
+            if status.as_u16() == 429
+                && let Some(fallback_name) = endpoint.fallback_name()
+                && let Some(fallback_endpoint) = self.endpoints.get(fallback_name).cloned()
+            {
+                // Dropping reqwest::Response cancels/releases its body. The
+                // fallback first-byte budget therefore starts immediately
+                // after the primary response headers arrive.
+                drop(primary_response.take());
+                error_body = Some(format!("Quota exhausted on {}", endpoint.display_name()));
+                tracing::warn!(
+                    "[Kiro] Endpoint {} 429, retry on fallback {} (same account)",
+                    endpoint.display_name(),
+                    fallback_endpoint.display_name()
+                );
+
+                let fallback_result = tokio::time::timeout(
+                    FALLBACK_FIRST_BYTE_TIMEOUT,
+                    self.execute_endpoint_api_request(
+                        fallback_endpoint.as_ref(),
+                        ctx.id,
+                        &ctx.credentials,
+                        request_body,
+                        &rctx,
+                    ),
+                )
+                .await;
+
+                match fallback_result {
+                    Ok(Ok(fallback_response)) => {
+                        let fallback_status = fallback_response.status();
+                        if fallback_status.is_success() {
+                            tracing::info!(
+                                "[Kiro] Fallback endpoint {} succeeded after {} 429",
+                                fallback_endpoint.display_name(),
+                                endpoint.display_name()
+                            );
+                            Self::emit_attempt(
+                                sink,
+                                attempt,
+                                ctx.id,
+                                fallback_endpoint.name(),
+                                Some(fallback_status.as_u16()),
+                                outcome::SUCCESS,
+                                None,
+                                attempt_start,
+                            );
+                            self.token_manager
+                                .report_success_for_request(ctx.id, model.as_deref());
+                            return Ok(KiroCallResult {
+                                response: fallback_response,
+                                credential_id: ctx.id,
+                            });
+                        }
+
+                        let fallback_rate_limit = (fallback_status.as_u16() == 429).then(|| {
+                            UpstreamRateLimitError::from_headers(fallback_response.headers())
+                        });
+                        let fallback_body = fallback_response.text().await.unwrap_or_default();
+
+                        if matches!(fallback_status.as_u16(), 401 | 403) {
+                            // Auth/suspension evidence from the actual request
+                            // must not be hidden behind the primary 429.
+                            endpoint = fallback_endpoint;
+                            endpoint_name = endpoint.name();
+                            status = fallback_status;
+                            rate_limit_error = fallback_rate_limit;
+                            error_body = Some(fallback_body);
+                        } else {
+                            fallback_exhausted = true;
+                            tracing::warn!(
+                                "[Kiro] Fallback endpoint {} also failed ({}), keep quota semantics",
+                                fallback_endpoint.display_name(),
+                                fallback_status.as_u16()
+                            );
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        fallback_exhausted = true;
+                        tracing::warn!("[Kiro] Fallback endpoint request error: {}", error);
+                    }
+                    Err(_) => {
+                        fallback_exhausted = true;
+                        tracing::warn!(
+                            "[Kiro] Fallback endpoint request error: first-byte timeout ({}ms)",
+                            FALLBACK_FIRST_BYTE_TIMEOUT.as_millis()
+                        );
+                    }
+                }
+            }
+
+            let body = match error_body {
+                Some(body) => body,
+                None => match primary_response.take() {
+                    Some(response) => response.text().await.unwrap_or_default(),
+                    None => format!("Quota exhausted on {}", endpoint.display_name()),
+                },
+            };
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
@@ -856,8 +1053,14 @@ impl KiroProvider {
                     body
                 );
                 Self::emit_attempt(
-                    sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
-                    outcome::QUOTA_EXHAUSTED, Some(&body), attempt_start,
+                    sink,
+                    attempt,
+                    ctx.id,
+                    endpoint_name,
+                    Some(status.as_u16()),
+                    outcome::QUOTA_EXHAUSTED,
+                    Some(&body),
+                    attempt_start,
                 );
 
                 let has_available = self.token_manager.report_quota_exhausted_for_request(
@@ -886,8 +1089,14 @@ impl KiroProvider {
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
                 Self::emit_attempt(
-                    sink, attempt, ctx.id, endpoint_name, Some(400),
-                    outcome::BAD_REQUEST, Some(&body), attempt_start,
+                    sink,
+                    attempt,
+                    ctx.id,
+                    endpoint_name,
+                    Some(400),
+                    outcome::BAD_REQUEST,
+                    Some(&body),
+                    attempt_start,
                 );
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
@@ -908,8 +1117,14 @@ impl KiroProvider {
                         body
                     );
                     Self::emit_attempt(
-                        sink, attempt, ctx.id, endpoint_name, Some(403),
-                        outcome::ACCOUNT_SUSPENDED, Some(&body), attempt_start,
+                        sink,
+                        attempt,
+                        ctx.id,
+                        endpoint_name,
+                        Some(403),
+                        outcome::ACCOUNT_SUSPENDED,
+                        Some(&body),
+                        attempt_start,
                     );
 
                     let has_available = self.token_manager.report_suspended_for_request(
@@ -942,8 +1157,14 @@ impl KiroProvider {
                     body
                 );
                 Self::emit_attempt(
-                    sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
-                    outcome::AUTH_FAILED, Some(&body), attempt_start,
+                    sink,
+                    attempt,
+                    ctx.id,
+                    endpoint_name,
+                    Some(status.as_u16()),
+                    outcome::AUTH_FAILED,
+                    Some(&body),
+                    attempt_start,
                 );
 
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
@@ -984,7 +1205,7 @@ impl KiroProvider {
             // 仅当前凭据被针对，故障转移到其它凭据可立即恢复（受配置开关控制）。
             if status.as_u16() == 429
                 && self.token_manager.get_account_throttle_failover()
-                && endpoint.is_account_throttled(&body)
+                && (fallback_exhausted || endpoint.is_account_throttled(&body))
             {
                 let cooldown_secs = self
                     .token_manager
@@ -1000,17 +1221,21 @@ impl KiroProvider {
                     body
                 );
 
-                let remaining = self
-                    .token_manager
-                    .report_account_throttled_for_request(
-                        ctx.id,
-                        cooldown,
-                        model.as_deref(),
-                        group,
-                    );
+                let remaining = self.token_manager.report_account_throttled_for_request(
+                    ctx.id,
+                    cooldown,
+                    model.as_deref(),
+                    group,
+                );
                 Self::emit_attempt(
-                    sink, attempt, ctx.id, endpoint_name, Some(429),
-                    outcome::ACCOUNT_THROTTLED, Some(&body), attempt_start,
+                    sink,
+                    attempt,
+                    ctx.id,
+                    endpoint_name,
+                    Some(429),
+                    outcome::ACCOUNT_THROTTLED,
+                    Some(&body),
+                    attempt_start,
                 );
                 // 账号级风控通常不返回 Retry-After；此时使用本地实际冷却时间，
                 // 让下游网关在同一时段内也停止调度该虚拟账号。
@@ -1019,7 +1244,7 @@ impl KiroProvider {
 
                 // 上游给出明确等待时间时必须立即交给客户端遵守，不能在同一请求中
                 // 提前换号重试。无有效 Retry-After 时仍允许按既有策略故障转移。
-                if must_wait_for_upstream {
+                if must_wait_for_upstream && !fallback_exhausted {
                     return Err(rate_limit_error.into());
                 }
 
@@ -1041,8 +1266,14 @@ impl KiroProvider {
                     body
                 );
                 Self::emit_attempt(
-                    sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
-                    outcome::BAD_REQUEST, Some(&body), attempt_start,
+                    sink,
+                    attempt,
+                    ctx.id,
+                    endpoint_name,
+                    Some(status.as_u16()),
+                    outcome::BAD_REQUEST,
+                    Some(&body),
+                    attempt_start,
                 );
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
@@ -1051,11 +1282,7 @@ impl KiroProvider {
             // 放大客户端等待时间和 Claude 端 Retrying 轮数；快速返回，让客户端下一次调用
             // 重新建连。
             if status.as_u16() == 524 || endpoint.is_gateway_timeout(&body) {
-                tracing::warn!(
-                    "API 请求失败（上游网关超时，不重试）: {} {}",
-                    status,
-                    body
-                );
+                tracing::warn!("API 请求失败（上游网关超时，不重试）: {} {}", status, body);
                 Self::emit_attempt(
                     sink,
                     attempt,
@@ -1080,8 +1307,14 @@ impl KiroProvider {
                     body
                 );
                 Self::emit_attempt(
-                    sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
-                    outcome::TRANSIENT, Some(&body), attempt_start,
+                    sink,
+                    attempt,
+                    ctx.id,
+                    endpoint_name,
+                    Some(status.as_u16()),
+                    outcome::TRANSIENT,
+                    Some(&body),
+                    attempt_start,
                 );
                 last_error = if let Some(rate_limit) = rate_limit_error {
                     if !rate_limit.should_retry_locally() {
@@ -1111,8 +1344,14 @@ impl KiroProvider {
             // 其他 4xx - 通常为请求/配置问题：直接返回，不计入凭据失败
             if status.is_client_error() {
                 Self::emit_attempt(
-                    sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
-                    outcome::BAD_REQUEST, Some(&body), attempt_start,
+                    sink,
+                    attempt,
+                    ctx.id,
+                    endpoint_name,
+                    Some(status.as_u16()),
+                    outcome::BAD_REQUEST,
+                    Some(&body),
+                    attempt_start,
                 );
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
@@ -1126,8 +1365,14 @@ impl KiroProvider {
                 body
             );
             Self::emit_attempt(
-                sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
-                outcome::UNKNOWN, Some(&body), attempt_start,
+                sink,
+                attempt,
+                ctx.id,
+                endpoint_name,
+                Some(status.as_u16()),
+                outcome::UNKNOWN,
+                Some(&body),
+                attempt_start,
             );
             last_error = Some(anyhow::anyhow!(
                 "{} API 请求失败: {} {}",
@@ -1259,6 +1504,173 @@ fn account_rate_limit_with_fallback(
 #[cfg(test)]
 mod rate_limit_tests {
     use super::*;
+    use axum::{Router, http::StatusCode, routing::post};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct MockEndpoint {
+        name: &'static str,
+        url: String,
+        fallback: Option<&'static str>,
+    }
+
+    impl KiroEndpoint for MockEndpoint {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn fallback_name(&self) -> Option<&'static str> {
+            self.fallback
+        }
+
+        fn api_url(&self, _ctx: &RequestContext<'_>) -> String {
+            self.url.clone()
+        }
+
+        fn mcp_url(&self, _ctx: &RequestContext<'_>) -> String {
+            self.url.clone()
+        }
+
+        fn decorate_api(
+            &self,
+            req: reqwest::RequestBuilder,
+            ctx: &RequestContext<'_>,
+        ) -> reqwest::RequestBuilder {
+            req.header("Authorization", format!("Bearer {}", ctx.token))
+        }
+
+        fn decorate_mcp(
+            &self,
+            req: reqwest::RequestBuilder,
+            ctx: &RequestContext<'_>,
+        ) -> reqwest::RequestBuilder {
+            self.decorate_api(req, ctx)
+        }
+
+        fn transform_api_body(&self, body: &str, _ctx: &RequestContext<'_>) -> String {
+            body.to_string()
+        }
+    }
+
+    async fn mock_upstreams(
+        fallback_status: StatusCode,
+        fallback_body: &'static str,
+    ) -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let primary_count = Arc::new(AtomicUsize::new(0));
+        let fallback_count = Arc::new(AtomicUsize::new(0));
+        let primary_counter = Arc::clone(&primary_count);
+        let fallback_counter = Arc::clone(&fallback_count);
+        let app = Router::new()
+            .route(
+                "/primary",
+                post(move || {
+                    let counter = Arc::clone(&primary_counter);
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            r#"{"reason":"USER_REQUEST_RATE_EXCEEDED"}"#,
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/fallback",
+                post(move || {
+                    let counter = Arc::clone(&fallback_counter);
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        (fallback_status, fallback_body)
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{}", address), primary_count, fallback_count)
+    }
+
+    fn provider_for_mock_upstreams(base_url: &str) -> KiroProvider {
+        let credentials = KiroCredentials {
+            id: Some(1),
+            auth_method: Some("api_key".to_string()),
+            kiro_api_key: Some("ksk_test".to_string()),
+            profile_arn: Some(
+                "arn:aws:codewhisperer:us-east-1:123456789012:profile/test".to_string(),
+            ),
+            endpoint: Some("primary".to_string()),
+            ..KiroCredentials::default()
+        };
+        let mut config = crate::model::config::Config::default();
+        config.account_throttle_cooldown_secs = 300;
+        let token_manager =
+            Arc::new(MultiTokenManager::new(config, vec![credentials], None, None, false).unwrap());
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert(
+            "primary".to_string(),
+            Arc::new(MockEndpoint {
+                name: "primary",
+                url: format!("{}/primary", base_url),
+                fallback: Some("fallback"),
+            }),
+        );
+        endpoints.insert(
+            "fallback".to_string(),
+            Arc::new(MockEndpoint {
+                name: "fallback",
+                url: format!("{}/fallback", base_url),
+                fallback: None,
+            }),
+        );
+        KiroProvider::with_proxy(token_manager, None, endpoints, "primary".to_string())
+    }
+
+    const TEST_REQUEST_BODY: &str = r#"{
+        "conversationState": {
+            "currentMessage": {"userInputMessage": {"modelId": "claude-sonnet-4.6"}}
+        }
+    }"#;
+
+    #[tokio::test]
+    async fn primary_429_uses_same_account_fallback_without_outer_retry() {
+        let (base_url, primary_count, fallback_count) =
+            mock_upstreams(StatusCode::OK, "fallback-ok").await;
+        let provider = provider_for_mock_upstreams(&base_url);
+
+        let result = provider
+            .call_api_stream(TEST_REQUEST_BODY, None, None)
+            .await
+            .unwrap();
+        assert_eq!(result.credential_id, 1);
+        assert_eq!(result.response.text().await.unwrap(), "fallback-ok");
+        assert_eq!(primary_count.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn both_buckets_429_cool_down_after_one_fallback_request() {
+        let (base_url, primary_count, fallback_count) = mock_upstreams(
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"reason":"SERVICE_REQUEST_RATE_EXCEEDED"}"#,
+        )
+        .await;
+        let provider = provider_for_mock_upstreams(&base_url);
+
+        let error = match provider
+            .call_api_stream(TEST_REQUEST_BODY, None, None)
+            .await
+        {
+            Ok(_) => panic!("both rate-limit buckets should propagate a typed 429"),
+            Err(error) => error,
+        };
+        let rate_limit = error
+            .downcast_ref::<UpstreamRateLimitError>()
+            .expect("the outer layer must retain rate-limit semantics");
+        assert_eq!(rate_limit.retry_after(), Some("300"));
+        assert_eq!(primary_count.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_count.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn mcp_validation_treats_caller_accepted_errors_as_success() {
@@ -1311,10 +1723,8 @@ mod rate_limit_tests {
 
     #[test]
     fn account_rate_limit_uses_cooldown_when_retry_after_is_missing() {
-        let (error, must_wait) = account_rate_limit_with_fallback(
-            Some(UpstreamRateLimitError::new(None)),
-            300,
-        );
+        let (error, must_wait) =
+            account_rate_limit_with_fallback(Some(UpstreamRateLimitError::new(None)), 300);
 
         assert_eq!(error.retry_after(), Some("300"));
         assert!(!must_wait, "无上游等待值时仍可按账号冷却策略故障转移");

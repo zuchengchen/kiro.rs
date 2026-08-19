@@ -802,21 +802,10 @@ impl AdminService {
             .map_err(|e| self.classify_error(e, id.unwrap_or(0)))
     }
 
-    /// 获取凭据余额（带缓存）
+    /// 获取凭据余额（实时查询上游，并更新共享缓存）
     pub async fn get_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
-        // 先查缓存
-        {
-            let cache = self.balance_cache.lock();
-            if let Some(cached) = cache.get(&id) {
-                let now = Utc::now().timestamp() as f64;
-                if (now - cached.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
-                    tracing::debug!("凭据 #{} 余额命中缓存", id);
-                    return Ok(cached.data.clone());
-                }
-            }
-        }
-
-        // 缓存未命中或已过期，从上游获取
+        // 管理页的手动余额查询始终读上游；结果仍写入缓存，
+        // 供列表概览和 overage 判定等非交互路径使用。
         let balance = self.fetch_balance(id).await?;
 
         // 更新缓存

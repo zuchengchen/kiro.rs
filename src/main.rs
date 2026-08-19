@@ -113,13 +113,29 @@ async fn main() {
         std::time::Duration::from_secs(12 * 3600),
     );
 
-    // 构建端点注册表
+    // Build the four data-plane entries. `ide` and `cli` remain aliases so
+    // existing config/credentials continue to work after the endpoint split.
     let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
     {
-        let ide = IdeEndpoint::new();
-        endpoints.insert(ide.name().to_string(), Arc::new(ide));
-        let cli = CliEndpoint::new();
-        endpoints.insert(cli.name().to_string(), Arc::new(cli));
+        let codewhisperer: Arc<dyn KiroEndpoint> = Arc::new(IdeEndpoint::codewhisperer());
+        endpoints.insert(codewhisperer.name().to_string(), Arc::clone(&codewhisperer));
+        endpoints.insert(
+            kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string(),
+            Arc::clone(&codewhisperer),
+        );
+
+        let amazon_q: Arc<dyn KiroEndpoint> = Arc::new(IdeEndpoint::amazon_q());
+        endpoints.insert(amazon_q.name().to_string(), amazon_q);
+
+        let amazon_q_cli: Arc<dyn KiroEndpoint> = Arc::new(CliEndpoint::new());
+        endpoints.insert(amazon_q_cli.name().to_string(), Arc::clone(&amazon_q_cli));
+        endpoints.insert(
+            kiro::endpoint::cli::CLI_ENDPOINT_NAME.to_string(),
+            amazon_q_cli,
+        );
+
+        let runtime: Arc<dyn KiroEndpoint> = Arc::new(IdeEndpoint::runtime());
+        endpoints.insert(runtime.name().to_string(), runtime);
     }
 
     // 校验默认端点存在

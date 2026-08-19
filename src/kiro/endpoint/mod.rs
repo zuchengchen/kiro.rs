@@ -24,6 +24,21 @@ pub trait KiroEndpoint: Send + Sync {
     /// 端点名称（对应 credentials.endpoint / config.defaultEndpoint 的取值）
     fn name(&self) -> &'static str;
 
+    /// Human-readable upstream name used in rate-limit failover logs.
+    fn display_name(&self) -> &'static str {
+        self.name()
+    }
+
+    /// Independent rate-limit bucket to try once when this endpoint returns 429.
+    fn fallback_name(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Whether this endpoint requires the CodeWhisperer internal model ID.
+    fn requires_codewhisperer_model_id(&self) -> bool {
+        false
+    }
+
     /// API 请求的 Content-Type（默认 application/json）
     fn content_type(&self) -> &'static str {
         "application/json"
@@ -112,6 +127,114 @@ pub struct RequestContext<'a> {
     pub config: &'a Config,
 }
 
+/// Build an endpoint-specific streaming payload from the original request body.
+/// Each call reparses the original JSON so a fallback never inherits mutations
+/// made for the primary endpoint.
+pub(super) fn transform_streaming_payload(
+    body: &str,
+    profile_arn: Option<&str>,
+    origin: &str,
+    strip_cli_state: bool,
+) -> String {
+    let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(body) else {
+        return body.to_string();
+    };
+
+    if let Some(arn) = profile_arn
+        && let Some(root) = payload.as_object_mut()
+    {
+        root.insert(
+            "profileArn".to_string(),
+            serde_json::Value::String(arn.to_string()),
+        );
+    }
+
+    let Some(state) = payload
+        .get_mut("conversationState")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return serde_json::to_string(&payload).unwrap_or_else(|_| body.to_string());
+    };
+
+    if strip_cli_state {
+        state.remove("agentContinuationId");
+        state.remove("agentTaskType");
+    }
+
+    if let Some(message) = state
+        .get_mut("currentMessage")
+        .and_then(|value| value.get_mut("userInputMessage"))
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        message.insert(
+            "origin".to_string(),
+            serde_json::Value::String(origin.to_string()),
+        );
+    }
+
+    if let Some(history) = state
+        .get_mut("history")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for entry in history {
+            if let Some(message) = entry
+                .get_mut("userInputMessage")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                message.insert(
+                    "origin".to_string(),
+                    serde_json::Value::String(origin.to_string()),
+                );
+            }
+        }
+    }
+
+    serde_json::to_string(&payload).unwrap_or_else(|_| body.to_string())
+}
+
+/// Apply a CodeWhisperer internal model ID to the current and historical user
+/// messages in a cloned request body.
+pub(crate) fn apply_payload_model_id(body: &str, model_id: &str) -> String {
+    let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(body) else {
+        return body.to_string();
+    };
+    let Some(state) = payload
+        .get_mut("conversationState")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return serde_json::to_string(&payload).unwrap_or_else(|_| body.to_string());
+    };
+
+    if let Some(message) = state
+        .get_mut("currentMessage")
+        .and_then(|value| value.get_mut("userInputMessage"))
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        message.insert(
+            "modelId".to_string(),
+            serde_json::Value::String(model_id.to_string()),
+        );
+    }
+    if let Some(history) = state
+        .get_mut("history")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for entry in history {
+            if let Some(message) = entry
+                .get_mut("userInputMessage")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                message.insert(
+                    "modelId".to_string(),
+                    serde_json::Value::String(model_id.to_string()),
+                );
+            }
+        }
+    }
+
+    serde_json::to_string(&payload).unwrap_or_else(|_| body.to_string())
+}
+
 /// 触发"额度耗尽 → 禁用并切换"的 reason 取值集合
 ///
 /// - `MONTHLY_REQUEST_COUNT`: 月度请求额度用尽
@@ -119,10 +242,8 @@ pub struct RequestContext<'a> {
 ///
 /// 两类语义都是「该凭据当前计费周期内不能再用」，处理方式一致：
 /// 立刻禁用凭据并故障转移到下一个可用凭据。
-const QUOTA_EXHAUSTED_REASONS: &[&str] = &[
-    "MONTHLY_REQUEST_COUNT",
-    "OVERAGE_REQUEST_LIMIT_EXCEEDED",
-];
+const QUOTA_EXHAUSTED_REASONS: &[&str] =
+    &["MONTHLY_REQUEST_COUNT", "OVERAGE_REQUEST_LIMIT_EXCEEDED"];
 
 /// 默认的"请求额度耗尽"判断逻辑
 ///
@@ -160,8 +281,23 @@ pub fn default_is_bearer_token_invalid(body: &str) -> bool {
 /// 与普通 429（high traffic / rate limit exceeded）的关键差异是
 /// 提到 "suspicious activity" 与具体账号 ID。
 pub fn default_is_account_throttled(body: &str) -> bool {
-    body.contains("suspicious activity")
-        && body.contains("temporary limits")
+    if body.contains("suspicious activity") && body.contains("temporary limits") {
+        return true;
+    }
+
+    const ACCOUNT_RATE_LIMIT_REASONS: &[&str] = &[
+        "USER_REQUEST_RATE_EXCEEDED",
+        "SERVICE_REQUEST_RATE_EXCEEDED",
+    ];
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let top = value.get("reason").and_then(|v| v.as_str());
+    let nested = value.pointer("/error/reason").and_then(|v| v.as_str());
+    [top, nested]
+        .into_iter()
+        .flatten()
+        .any(|reason| ACCOUNT_RATE_LIMIT_REASONS.contains(&reason))
 }
 
 /// 默认的"账号被封禁/停用"判断逻辑
@@ -175,7 +311,19 @@ pub fn default_is_account_throttled(body: &str) -> bool {
 /// 两个短语都命中才判定，避免把偶发 403 误判为封禁。
 pub fn default_is_account_suspended(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
-    lower.contains("suspended") && lower.contains("locked your account")
+    if lower.contains("suspended") && lower.contains("locked your account") {
+        return true;
+    }
+
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let top = value.get("reason").and_then(|v| v.as_str());
+    let nested = value.pointer("/error/reason").and_then(|v| v.as_str());
+    [top, nested]
+        .into_iter()
+        .flatten()
+        .any(|reason| reason.eq_ignore_ascii_case("TEMPORARILY_SUSPENDED"))
 }
 
 /// 默认的上游网关超时判断逻辑。
@@ -269,8 +417,7 @@ mod tests {
     fn test_default_quota_exhausted_substring_does_not_false_match() {
         // 关键字出现在普通字段而非 reason 字段：仍然命中（向后兼容旧行为）
         // 但 reason 字段是其他值时应严格不命中
-        let body =
-            r#"{"message":"some text MONTHLY_REQUEST_COUNT-like phrase","reason":"OTHER"}"#;
+        let body = r#"{"message":"some text MONTHLY_REQUEST_COUNT-like phrase","reason":"OTHER"}"#;
         assert!(!default_is_monthly_request_limit(body));
     }
 
@@ -301,6 +448,13 @@ mod tests {
         assert!(!default_is_account_suspended(
             "we have locked your account temporarily"
         ));
+
+        assert!(default_is_account_suspended(
+            r#"{"reason":"TEMPORARILY_SUSPENDED"}"#
+        ));
+        assert!(default_is_account_suspended(
+            r#"{"error":{"reason":"temporarily_suspended"}}"#
+        ));
     }
 
     #[test]
@@ -312,7 +466,52 @@ mod tests {
             "{\"message\":\"Too many requests\"}"
         ));
         // 仅有一半关键词时也不命中
-        assert!(!default_is_account_throttled("suspicious activity detected"));
+        assert!(!default_is_account_throttled(
+            "suspicious activity detected"
+        ));
+
+        assert!(default_is_account_throttled(
+            r#"{"reason":"USER_REQUEST_RATE_EXCEEDED"}"#
+        ));
+        assert!(default_is_account_throttled(
+            r#"{"error":{"reason":"SERVICE_REQUEST_RATE_EXCEEDED"}}"#
+        ));
+        assert!(!default_is_account_throttled(
+            r#"{"message":"trace mentions USER_REQUEST_RATE_EXCEEDED","reason":"OTHER"}"#
+        ));
+    }
+
+    #[test]
+    fn endpoint_payloads_are_rebuilt_from_the_original_body() {
+        let original = r#"{
+            "conversationState": {
+                "currentMessage": {"userInputMessage": {"origin": "AI_EDITOR", "modelId": "friendly"}},
+                "history": [{"userInputMessage": {"origin": "AI_EDITOR", "modelId": "friendly"}}]
+            }
+        }"#;
+
+        let codewhisperer = apply_payload_model_id(original, "internal-model-id");
+        let runtime = transform_streaming_payload(
+            original,
+            Some("arn:aws:codewhisperer:us-east-1:123:profile/test"),
+            "AI_EDITOR",
+            false,
+        );
+        let codewhisperer: serde_json::Value = serde_json::from_str(&codewhisperer).unwrap();
+        let runtime: serde_json::Value = serde_json::from_str(&runtime).unwrap();
+
+        assert_eq!(
+            codewhisperer["conversationState"]["currentMessage"]["userInputMessage"]["modelId"],
+            "internal-model-id"
+        );
+        assert_eq!(
+            runtime["conversationState"]["currentMessage"]["userInputMessage"]["modelId"],
+            "friendly"
+        );
+        assert_eq!(
+            runtime["conversationState"]["history"][0]["userInputMessage"]["modelId"],
+            "friendly"
+        );
     }
 
     #[test]
@@ -354,7 +553,9 @@ mod tests {
         assert!(!default_is_client_validation_error(
             r#"{"message":"Internal server error"}"#
         ));
-        assert!(!default_is_client_validation_error("connection reset by peer"));
+        assert!(!default_is_client_validation_error(
+            "connection reset by peer"
+        ));
         // 关键回归：reason 关键词偶然出现在普通字段，但真实 reason 是别的值 —— 不应命中
         // （否则会把一个本可重试恢复的真实上游故障误杀）
         assert!(!default_is_client_validation_error(

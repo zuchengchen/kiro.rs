@@ -1,33 +1,75 @@
-//! Kiro IDE 端点
+//! Kiro editor-compatible streaming endpoints.
 //!
-//! 对应 Kiro IDE 客户端目前使用的 AWS CodeWhisperer 端点：
-//! - API: `https://q.{api_region}.amazonaws.com/generateAssistantResponse`
-//! - MCP: `https://q.{api_region}.amazonaws.com/mcp`
-//!
-//! 请求头使用 aws-sdk-js User-Agent 标识。请求体会在根对象上注入 `profileArn`。
+//! CodeWhisperer, Amazon Q, and Kiro Runtime use the same editor payload shape,
+//! but their hosts are backed by independent rate-limit buckets.
 
 use reqwest::RequestBuilder;
 use uuid::Uuid;
 
-use super::{KiroEndpoint, RequestContext};
+use super::{KiroEndpoint, RequestContext, transform_streaming_payload};
 use crate::kiro::kiro_version;
 
-/// Kiro IDE 端点名称
+/// Legacy configuration alias retained for existing installations.
 pub const IDE_ENDPOINT_NAME: &str = "ide";
+pub const CODEWHISPERER_ENDPOINT_NAME: &str = "codewhisperer";
+pub const AMAZON_Q_ENDPOINT_NAME: &str = "amazonq";
+pub const RUNTIME_ENDPOINT_NAME: &str = "runtime";
 
-/// Kiro IDE 端点
-pub struct IdeEndpoint;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditorEndpointKind {
+    CodeWhisperer,
+    AmazonQ,
+    KiroRuntime,
+}
+
+pub struct IdeEndpoint {
+    kind: EditorEndpointKind,
+}
 
 impl IdeEndpoint {
+    /// The legacy `ide` endpoint now starts with the CodeWhisperer bucket.
     pub fn new() -> Self {
-        Self
+        Self::codewhisperer()
     }
 
-    fn api_region<'a>(&self, ctx: &'a RequestContext<'_>) -> &'a str {
-        ctx.credentials.effective_api_region(ctx.config)
+    pub fn codewhisperer() -> Self {
+        Self {
+            kind: EditorEndpointKind::CodeWhisperer,
+        }
     }
 
-    fn host(&self, ctx: &RequestContext<'_>) -> String {
+    pub fn amazon_q() -> Self {
+        Self {
+            kind: EditorEndpointKind::AmazonQ,
+        }
+    }
+
+    pub fn runtime() -> Self {
+        Self {
+            kind: EditorEndpointKind::KiroRuntime,
+        }
+    }
+
+    fn api_region(&self, ctx: &RequestContext<'_>) -> &'static str {
+        normalize_api_region(ctx.credentials.effective_api_region(ctx.config))
+    }
+
+    fn api_host(&self, ctx: &RequestContext<'_>) -> String {
+        let region = self.api_region(ctx);
+        match self.kind {
+            EditorEndpointKind::CodeWhisperer if region == "us-east-1" => {
+                "codewhisperer.us-east-1.amazonaws.com".to_string()
+            }
+            // codewhisperer.eu-central-1.amazonaws.com does not exist; the EU
+            // editor service is carried by q.eu-central-1.amazonaws.com.
+            EditorEndpointKind::CodeWhisperer | EditorEndpointKind::AmazonQ => {
+                format!("q.{}.amazonaws.com", region)
+            }
+            EditorEndpointKind::KiroRuntime => format!("runtime.{}.kiro.dev", region),
+        }
+    }
+
+    fn mcp_host(&self, ctx: &RequestContext<'_>) -> String {
         format!("q.{}.amazonaws.com", self.api_region(ctx))
     }
 
@@ -48,6 +90,27 @@ impl IdeEndpoint {
             ctx.machine_id
         )
     }
+
+    fn common_headers(
+        &self,
+        req: RequestBuilder,
+        ctx: &RequestContext<'_>,
+        host: String,
+    ) -> RequestBuilder {
+        let mut req = req
+            .header("x-amzn-kiro-agent-mode", "vibe")
+            .header("x-amz-user-agent", self.x_amz_user_agent(ctx))
+            .header("user-agent", self.user_agent(ctx))
+            .header("host", host)
+            .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
+            .header("amz-sdk-request", "attempt=1; max=3")
+            .header("Authorization", format!("Bearer {}", ctx.token));
+
+        if let Some(token_type) = ctx.credentials.token_type_header() {
+            req = req.header("TokenType", token_type);
+        }
+        req
+    }
 }
 
 impl Default for IdeEndpoint {
@@ -58,114 +121,187 @@ impl Default for IdeEndpoint {
 
 impl KiroEndpoint for IdeEndpoint {
     fn name(&self) -> &'static str {
-        IDE_ENDPOINT_NAME
+        match self.kind {
+            EditorEndpointKind::CodeWhisperer => CODEWHISPERER_ENDPOINT_NAME,
+            EditorEndpointKind::AmazonQ => AMAZON_Q_ENDPOINT_NAME,
+            EditorEndpointKind::KiroRuntime => RUNTIME_ENDPOINT_NAME,
+        }
+    }
+
+    fn display_name(&self) -> &'static str {
+        match self.kind {
+            EditorEndpointKind::CodeWhisperer => "CodeWhisperer",
+            EditorEndpointKind::AmazonQ => "AmazonQ",
+            EditorEndpointKind::KiroRuntime => "KiroRuntime",
+        }
+    }
+
+    fn fallback_name(&self) -> Option<&'static str> {
+        match self.kind {
+            EditorEndpointKind::KiroRuntime => Some(CODEWHISPERER_ENDPOINT_NAME),
+            EditorEndpointKind::CodeWhisperer | EditorEndpointKind::AmazonQ => {
+                Some(RUNTIME_ENDPOINT_NAME)
+            }
+        }
+    }
+
+    fn requires_codewhisperer_model_id(&self) -> bool {
+        self.kind == EditorEndpointKind::CodeWhisperer
     }
 
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!(
-            "https://q.{}.amazonaws.com/generateAssistantResponse",
-            self.api_region(ctx)
-        )
+        format!("https://{}/generateAssistantResponse", self.api_host(ctx))
     }
 
     fn mcp_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!("https://q.{}.amazonaws.com/mcp", self.api_region(ctx))
+        format!("https://{}/mcp", self.mcp_host(ctx))
     }
 
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
-        let mut req = req
-            .header("x-amzn-codewhisperer-optout", "true")
-            .header("x-amzn-kiro-agent-mode", "vibe")
-            .header("x-amz-user-agent", self.x_amz_user_agent(ctx))
-            .header("user-agent", self.user_agent(ctx))
-            .header("host", self.host(ctx))
-            .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
-            .header("amz-sdk-request", "attempt=1; max=3")
-            .header("Authorization", format!("Bearer {}", ctx.token));
-
-        if let Some(token_type) = ctx.credentials.token_type_header() {
-            req = req.header("tokentype", token_type);
+        let mut req = self.common_headers(req, ctx, self.api_host(ctx)).header(
+            "x-amz-target",
+            "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+        );
+        if self.kind == EditorEndpointKind::KiroRuntime {
+            req = req.header("x-amzn-codewhisperer-optout", "true");
         }
         req
     }
 
     fn decorate_mcp(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
-        let mut req = req
-            .header("x-amz-user-agent", self.x_amz_user_agent(ctx))
-            .header("user-agent", self.user_agent(ctx))
-            .header("host", self.host(ctx))
-            .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
-            .header("amz-sdk-request", "attempt=1; max=3")
-            .header("Authorization", format!("Bearer {}", ctx.token));
-
+        let mut req = self.common_headers(req, ctx, self.mcp_host(ctx));
         if let Some(arn) = ctx.credentials.effective_profile_arn() {
             req = req.header("x-amzn-kiro-profile-arn", arn);
-        }
-        if let Some(token_type) = ctx.credentials.token_type_header() {
-            req = req.header("tokentype", token_type);
         }
         req
     }
 
     fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {
-        inject_profile_arn(body, ctx.credentials.streaming_profile_arn().as_deref())
+        transform_streaming_payload(
+            body,
+            ctx.credentials.streaming_profile_arn().as_deref(),
+            "AI_EDITOR",
+            false,
+        )
     }
 }
 
-/// 将 profile_arn 注入到请求体 JSON 根对象
-fn inject_profile_arn(request_body: &str, profile_arn: Option<&str>) -> String {
-    if let Some(arn) = profile_arn {
-        if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(request_body) {
-            json["profileArn"] = serde_json::Value::String(arn.to_string());
-            if let Ok(body) = serde_json::to_string(&json) {
-                return body;
-            }
-        }
+/// The data plane has only US and EU buckets. The account-level apiRegion wins
+/// before this function is called; all EU regions normalize to eu-central-1.
+pub(super) fn normalize_api_region(region: &str) -> &'static str {
+    if region.eq_ignore_ascii_case("eu-central-1") || region.to_ascii_lowercase().starts_with("eu-")
+    {
+        "eu-central-1"
+    } else {
+        "us-east-1"
     }
-    request_body.to_string()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::inject_profile_arn;
-    use serde_json::Value;
+    use super::*;
+    use crate::kiro::model::credentials::KiroCredentials;
+    use crate::model::config::Config;
 
     #[test]
-    fn test_inject_profile_arn_with_some() {
-        let body = r#"{"conversationState":{"conversationId":"c1"}}"#;
-        let arn = Some("arn:aws:codewhisperer:us-east-1:123:profile/ABC".to_string());
-        let result = inject_profile_arn(body, arn.as_deref());
-        let json: Value = serde_json::from_str(&result).unwrap();
+    fn normalizes_supported_api_regions() {
+        assert_eq!(normalize_api_region("us-east-1"), "us-east-1");
+        assert_eq!(normalize_api_region("ap-southeast-1"), "us-east-1");
+        assert_eq!(normalize_api_region("eu-west-1"), "eu-central-1");
+    }
+
+    #[test]
+    fn endpoint_fallbacks_form_the_expected_ring() {
+        let codewhisperer = IdeEndpoint::codewhisperer();
+        let amazon_q = IdeEndpoint::amazon_q();
+        let runtime = IdeEndpoint::runtime();
+        assert_eq!(codewhisperer.fallback_name(), Some(RUNTIME_ENDPOINT_NAME));
+        assert_eq!(amazon_q.fallback_name(), Some(RUNTIME_ENDPOINT_NAME));
+        assert_eq!(runtime.fallback_name(), Some(CODEWHISPERER_ENDPOINT_NAME));
+        assert!(codewhisperer.requires_codewhisperer_model_id());
+        assert!(!runtime.requires_codewhisperer_model_id());
+    }
+
+    #[test]
+    fn endpoint_urls_follow_us_and_eu_routing_rules() {
+        let config = Config::default();
+        let credentials = KiroCredentials::default();
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "token",
+            machine_id: "machine",
+            config: &config,
+        };
         assert_eq!(
-            json["profileArn"],
-            "arn:aws:codewhisperer:us-east-1:123:profile/ABC"
+            IdeEndpoint::codewhisperer().api_url(&ctx),
+            "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse"
         );
-        assert_eq!(json["conversationState"]["conversationId"], "c1");
+        assert_eq!(
+            IdeEndpoint::amazon_q().api_url(&ctx),
+            "https://q.us-east-1.amazonaws.com/generateAssistantResponse"
+        );
+        assert_eq!(
+            IdeEndpoint::runtime().api_url(&ctx),
+            "https://runtime.us-east-1.kiro.dev/generateAssistantResponse"
+        );
+
+        let mut eu_credentials = KiroCredentials::default();
+        eu_credentials.region = Some("eu-west-1".to_string());
+        let eu_ctx = RequestContext {
+            credentials: &eu_credentials,
+            token: "token",
+            machine_id: "machine",
+            config: &config,
+        };
+        assert_eq!(
+            IdeEndpoint::codewhisperer().api_url(&eu_ctx),
+            "https://q.eu-central-1.amazonaws.com/generateAssistantResponse"
+        );
+        assert_eq!(
+            IdeEndpoint::runtime().api_url(&eu_ctx),
+            "https://runtime.eu-central-1.kiro.dev/generateAssistantResponse"
+        );
     }
 
     #[test]
-    fn test_inject_profile_arn_with_none() {
-        let body = r#"{"conversationState":{"conversationId":"c1"}}"#;
-        let result = inject_profile_arn(body, None);
-        let json: Value = serde_json::from_str(&result).unwrap();
-        assert!(json.get("profileArn").is_none());
-        assert_eq!(json["conversationState"]["conversationId"], "c1");
-    }
+    fn runtime_adds_only_its_required_optout_header() {
+        let config = Config::default();
+        let credentials = KiroCredentials::default();
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "secret-token",
+            machine_id: "machine",
+            config: &config,
+        };
+        let client = reqwest::Client::new();
 
-    #[test]
-    fn test_inject_profile_arn_overwrites_existing() {
-        let body = r#"{"conversationState":{},"profileArn":"old-arn"}"#;
-        let arn = Some("new-arn".to_string());
-        let result = inject_profile_arn(body, arn.as_deref());
-        let json: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(json["profileArn"], "new-arn");
-    }
+        let codewhisperer = IdeEndpoint::codewhisperer();
+        let codewhisperer_request = codewhisperer
+            .decorate_api(client.post(codewhisperer.api_url(&ctx)), &ctx)
+            .build()
+            .unwrap();
+        assert_eq!(
+            codewhisperer_request.headers()["x-amz-target"],
+            "AmazonCodeWhispererStreamingService.GenerateAssistantResponse"
+        );
+        assert!(
+            !codewhisperer_request
+                .headers()
+                .contains_key("x-amzn-codewhisperer-optout")
+        );
 
-    #[test]
-    fn test_inject_profile_arn_invalid_json() {
-        let body = "not-valid-json";
-        let arn = Some("arn:test".to_string());
-        let result = inject_profile_arn(body, arn.as_deref());
-        assert_eq!(result, "not-valid-json");
+        let runtime = IdeEndpoint::runtime();
+        let runtime_request = runtime
+            .decorate_api(client.post(runtime.api_url(&ctx)), &ctx)
+            .build()
+            .unwrap();
+        assert_eq!(
+            runtime_request.headers()["x-amzn-codewhisperer-optout"],
+            "true"
+        );
+        assert_eq!(
+            runtime_request.headers()["authorization"],
+            "Bearer secret-token"
+        );
     }
 }
