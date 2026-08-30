@@ -1,5 +1,6 @@
 /target
-/CLAUDE.md
+# CLAUDE.md 纳入版本控制：记录 fork 拓扑与上游同步约定，
+# 这些信息无法从代码或 git 历史推导，换机器/重新 clone 后必须仍在。
 /AGENTS.md
 /config.json
 /credentials.json
