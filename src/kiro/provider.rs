@@ -119,6 +119,8 @@ pub struct KiroProvider {
     client_cache: Mutex<ClientCache>,
     /// TLS 后端配置
     tls_backend: TlsBackend,
+    /// 上游请求总超时（秒）。启动时从配置读定，供 client_for 建缓存 Client 使用。
+    upstream_timeout_secs: u64,
     /// 端点实现注册表（key: endpoint 名称）
     endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
     /// 默认端点名称（凭据未指定 endpoint 时使用）
@@ -156,9 +158,11 @@ impl KiroProvider {
             default_endpoint
         );
         let tls_backend = token_manager.config().tls_backend;
+        // 启动时读定，避免在 client_for 热路径上反复取配置锁。
+        let upstream_timeout_secs = token_manager.config().upstream_timeout_secs;
         // 预热：构建全局代理对应的 Client（作为受保护的常驻条目）
-        let initial_client =
-            build_client(proxy.as_ref(), 720, tls_backend).expect("创建 HTTP 客户端失败");
+        let initial_client = build_client(proxy.as_ref(), upstream_timeout_secs, tls_backend)
+            .expect("创建 HTTP 客户端失败");
         let client_cache = ClientCache::new(proxy.clone(), initial_client, CLIENT_CACHE_CAP);
 
         Self {
@@ -166,6 +170,7 @@ impl KiroProvider {
             global_proxy: proxy,
             client_cache: Mutex::new(client_cache),
             tls_backend,
+            upstream_timeout_secs,
             endpoints,
             default_endpoint,
             profile_resolution_negative_cache: Mutex::new(HashMap::new()),
@@ -179,7 +184,7 @@ impl KiroProvider {
         if let Some(client) = cache.get(&effective) {
             return Ok(client);
         }
-        let client = build_client(effective.as_ref(), 720, self.tls_backend)?;
+        let client = build_client(effective.as_ref(), self.upstream_timeout_secs, self.tls_backend)?;
         cache.insert(effective, client.clone());
         Ok(client)
     }

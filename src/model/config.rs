@@ -184,6 +184,17 @@ pub struct Config {
     #[serde(default = "default_agent_mode")]
     pub agent_mode: String,
 
+    /// 上游 API 请求的总超时（秒，默认 1800 = 30 分钟）。
+    ///
+    /// 这是 reqwest 客户端的整体超时，覆盖「建连 → 读完整个流式响应」。thinking
+    /// 模型的长回答可以跑十几分钟：实测成功请求最长 706 秒，而此前硬编码的 720 秒
+    /// 上限恰好卡在这条边界上，把已经传输了 600-780KB、接近写完的回答切断。
+    ///
+    /// 超时只是兜底（防止连接永久挂住），请求正常结束即正常返回，因此放宽不会带来
+    /// 额外开销；客户端自身的超时才决定它愿意等多久。
+    #[serde(default = "default_upstream_timeout_secs")]
+    pub upstream_timeout_secs: u64,
+
     /// 全池冷却时的内部等待预算（毫秒，默认 3000）。
     ///
     /// 所有可用凭据都在冷却中时，取号会失败。此前的行为是立刻返回 429 +
@@ -349,6 +360,10 @@ fn default_acquire_wait_budget_ms() -> u64 {
     3_000
 }
 
+fn default_upstream_timeout_secs() -> u64 {
+    30 * 60
+}
+
 fn default_agent_mode() -> String {
     "vibe".to_string()
 }
@@ -451,6 +466,7 @@ impl Default for Config {
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
             acquire_wait_budget_ms: default_acquire_wait_budget_ms(),
+            upstream_timeout_secs: default_upstream_timeout_secs(),
             agent_mode: default_agent_mode(),
             account_rpm_limit_enabled: default_account_rpm_limit_enabled(),
             account_rpm_limit: default_account_rpm_limit(),
@@ -547,6 +563,21 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::Config;
+
+    #[test]
+    fn upstream_timeout_defaults_to_30_minutes() {
+        // 此前硬编码 720s，实测成功请求最长 706s —— 上限贴着真实需求，
+        // 会把接近写完的 thinking 长回答切断。默认放宽到 1800s。
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.upstream_timeout_secs, 1_800);
+        assert_eq!(Config::default().upstream_timeout_secs, 1_800);
+    }
+
+    #[test]
+    fn upstream_timeout_accepts_explicit_value() {
+        let config: Config = serde_json::from_str(r#"{"upstreamTimeoutSecs":600}"#).unwrap();
+        assert_eq!(config.upstream_timeout_secs, 600);
+    }
 
     #[test]
     fn acquire_wait_budget_defaults_for_existing_configs() {
