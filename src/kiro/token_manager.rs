@@ -470,17 +470,62 @@ fn rest_api_region_candidates(sso_region: &str) -> [&'static str; 2] {
     }
 }
 
-fn usage_limits_url(host: &str, _credentials: &KiroCredentials) -> String {
-    // Kiro 0.9.2 accepts these REST calls without profileArn. A resolved ARN is
-    // only for the streaming endpoint and makes this legacy request malformed.
+fn profile_arn_query(profile_arn: Option<&str>) -> String {
+    match profile_arn {
+        Some(arn) => format!("&profileArn={}", urlencoding::encode(arn)),
+        None => String::new(),
+    }
+}
+
+/// 用量类接口的 403 回退候选：每个区域端点先带真实 profileArn 试，再退回不带。
+///
+/// Enterprise / IdC 账号缺 profileArn 会被上游拒（`403 User is not authorized
+/// to make this call.`）；BuilderID 占位符已由 `effective_profile_arn` 过滤，
+/// 这类账号只有「不带」一种形态，行为与加此参数前一致。
+fn usage_api_attempts<'a>(
+    credentials: &'a KiroCredentials,
+    candidates: &[&'static str],
+) -> Vec<(&'static str, Option<&'a str>)> {
+    let mut attempts = Vec::with_capacity(candidates.len() * 2);
+    for region in candidates {
+        if let Some(arn) = credentials.effective_profile_arn() {
+            attempts.push((*region, Some(arn)));
+        }
+        attempts.push((*region, None));
+    }
+    attempts
+}
+
+fn usage_limits_url(host: &str, profile_arn: Option<&str>) -> String {
     format!(
-        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true",
-        host
+        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true{}",
+        host,
+        profile_arn_query(profile_arn)
     )
 }
 
-fn available_models_url(host: &str, _credentials: &KiroCredentials) -> String {
-    format!("https://{}/ListAvailableModels?origin=AI_EDITOR", host)
+fn available_models_url(host: &str, profile_arn: Option<&str>) -> String {
+    format!(
+        "https://{}/ListAvailableModels?origin=AI_EDITOR{}",
+        host,
+        profile_arn_query(profile_arn)
+    )
+}
+
+fn set_user_preference_body(
+    credentials: &KiroCredentials,
+    overage_status: &str,
+) -> serde_json::Value {
+    if let Some(profile_arn) = credentials.effective_profile_arn() {
+        serde_json::json!({
+            "overageConfiguration": { "overageStatus": overage_status },
+            "profileArn": profile_arn,
+        })
+    } else {
+        serde_json::json!({
+            "overageConfiguration": { "overageStatus": overage_status },
+        })
+    }
 }
 
 fn normalize_model_name(value: &str) -> String {
@@ -520,10 +565,12 @@ pub(crate) async fn get_usage_limits(
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
+    let attempts = usage_api_attempts(credentials, &candidates);
+
     let mut last_error: Option<String> = None;
-    for (idx, region) in candidates.iter().enumerate() {
+    for (idx, (region, profile_arn)) in attempts.iter().enumerate() {
         let host = format!("q.{}.amazonaws.com", region);
-        let url = usage_limits_url(&host, credentials);
+        let url = usage_limits_url(&host, *profile_arn);
 
         let mut request = client
             .get(&url)
@@ -554,12 +601,12 @@ pub(crate) async fn get_usage_limits(
             return Err(error.into());
         }
 
-        // 403 且仍有备用端点时，尝试下一个区域端点（Enterprise/IdC 跨区兼容）
-        if status.as_u16() == 403 && idx + 1 < candidates.len() {
+        // 403 时依次回退：带 profileArn → 不带 → 备用区域端点
+        if status.as_u16() == 403 && idx + 1 < attempts.len() {
             tracing::debug!(
-                "getUsageLimits 在 {} 返回 403，尝试备用端点 {}",
+                "getUsageLimits 在 {} 返回 403（profileArn={}），尝试下一候选",
                 region,
-                candidates[idx + 1]
+                profile_arn.is_some()
             );
             last_error = Some(format!("{} {}", status, body_text));
             continue;
@@ -613,10 +660,12 @@ pub(crate) async fn get_available_models(
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
+    let attempts = usage_api_attempts(credentials, &candidates);
+
     let mut last_error: Option<String> = None;
-    for (idx, region) in candidates.iter().enumerate() {
+    for (idx, (region, profile_arn)) in attempts.iter().enumerate() {
         let host = format!("q.{}.amazonaws.com", region);
-        let url = available_models_url(&host, credentials);
+        let url = available_models_url(&host, *profile_arn);
 
         let mut request = client
             .get(&url)
@@ -647,12 +696,12 @@ pub(crate) async fn get_available_models(
             return Err(error.into());
         }
 
-        // 403 且仍有备用端点时，尝试下一个区域端点（Enterprise/IdC 跨区兼容）
-        if status.as_u16() == 403 && idx + 1 < candidates.len() {
+        // 403 时依次回退：带 profileArn → 不带 → 备用区域端点
+        if status.as_u16() == 403 && idx + 1 < attempts.len() {
             tracing::debug!(
-                "ListAvailableModels 在 {} 返回 403，尝试备用端点 {}",
+                "ListAvailableModels 在 {} 返回 403（profileArn={}），尝试下一候选",
                 region,
-                candidates[idx + 1]
+                profile_arn.is_some()
             );
             last_error = Some(format!("{} {}", status, body_text));
             continue;
@@ -802,16 +851,7 @@ pub(crate) async fn set_user_preference(
     let client = build_client(proxy, 60, config.tls_backend)?;
 
     // 构建 body：仅发送真实 profileArn，跳过 BuilderID 占位符
-    let body = if let Some(profile_arn) = credentials.effective_profile_arn() {
-        serde_json::json!({
-            "overageConfiguration": { "overageStatus": overage_status },
-            "profileArn": profile_arn,
-        })
-    } else {
-        serde_json::json!({
-            "overageConfiguration": { "overageStatus": overage_status },
-        })
-    };
+    let body = set_user_preference_body(credentials, overage_status);
 
     let mut last_error: Option<String> = None;
     for (idx, region) in candidates.iter().enumerate() {
@@ -1058,6 +1098,8 @@ pub struct CredentialEntrySnapshot {
     pub masked_api_key: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
+    /// 最近一次查询到的 Kiro 订阅等级；凭据禁用后也应保留展示。
+    pub subscription_title: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
@@ -1084,6 +1126,8 @@ pub struct CredentialEntrySnapshot {
     /// 账号来源渠道（纯备注）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_channel: Option<String>,
+    /// 凭据扩展元数据
+    pub metadata: crate::kiro::model::credentials::CredentialMetadata,
     /// 凭据添加（创建）时间（RFC3339 格式）；旧凭据缺失时为 None
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
@@ -1462,7 +1506,7 @@ impl MultiTokenManager {
         let initial_id = entries
             .iter()
             .filter(|e| !e.disabled)
-            .min_by_key(|e| e.credentials.priority)
+            .min_by_key(|e| (e.credentials.priority, e.id))
             .map(|e| e.id)
             .unwrap_or(0);
 
@@ -1568,18 +1612,6 @@ impl MultiTokenManager {
         self.balance_snapshots.lock().remove(&id);
     }
 
-    fn has_fresh_balance_snapshot(&self) -> bool {
-        let now_ts = Utc::now().timestamp() as f64;
-        self.balance_snapshots
-            .lock()
-            .values()
-            .any(|snapshot| {
-                snapshot.remaining.is_finite()
-                    && snapshot.cached_at.is_finite()
-                    && now_ts - snapshot.cached_at < BALANCE_SNAPSHOT_TTL_SECS
-            })
-    }
-
     /// 串行执行一次 config.json 读改写，供所有 Admin 运行时配置入口复用。
     pub fn update_config_file(&self, updater: impl FnOnce(&mut Config)) -> anyhow::Result<()> {
         use anyhow::Context;
@@ -1645,7 +1677,7 @@ impl MultiTokenManager {
         self.model_refresh_locks.lock().remove(&id);
     }
 
-    fn invalidate_all_model_caches(&self) {
+    pub fn invalidate_all_model_caches(&self) {
         self.model_cache_epoch.fetch_add(1, Ordering::Relaxed);
         self.model_cache.lock().clear();
     }
@@ -1702,7 +1734,17 @@ impl MultiTokenManager {
         let generation = self.model_cache_generation(id);
         let epoch = self.model_cache_epoch.load(Ordering::Relaxed);
         let _permit = self.model_refresh_semaphore.acquire().await?;
-        let (token, credentials) = self.prepare_request_token(id).await?;
+        let (token, mut credentials) = self.prepare_request_token(id).await?;
+
+        // 同 get_usage_limits_for：先解析回填真实 profileArn。
+        match self.resolve_profile_arn_for(id, &token).await {
+            Ok(Some(arn)) => credentials.profile_arn = Some(arn),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!("凭据 #{} 查询模型列表前解析 profileArn 失败: {}", id, error)
+            }
+        }
+
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
         let response =
@@ -2113,50 +2155,41 @@ impl MultiTokenManager {
             "balanced" => {
                 // Least-Used 策略：选择成功次数最少的凭据
                 // 平局时按优先级排序（数字越小优先级越高）
-                available.sort_by(|(left, left_support), (right, right_support)| {
-                    let discovery_rank =
-                        usize::from(*left_support != CachedModelSupport::Confirmed);
-                    let right_discovery_rank =
-                        usize::from(*right_support != CachedModelSupport::Confirmed);
-                    discovery_rank
-                        .cmp(&right_discovery_rank)
-                        .then_with(|| left.success_count.cmp(&right.success_count))
-                        .then_with(|| {
-                            left.credentials
-                                .priority
-                                .cmp(&right.credentials.priority)
-                        })
-                        .then_with(|| left.id.cmp(&right.id))
-                });
+                let (entry, _) = available.iter().min_by_key(|(e, support)| {
+                    let discovery_rank = usize::from(*support != CachedModelSupport::Confirmed);
+                    (
+                        discovery_rank,
+                        e.success_count,
+                        e.credentials.priority,
+                        e.id,
+                    )
+                })?;
+
+                Some((entry.id, entry.credentials.clone()))
             }
             _ => {
-                // priority 模式（默认）：新鲜额度优先，未知额度回退到 priority。
-                available.sort_by(|(left, left_support), (right, right_support)| {
-                    let discovery_rank = usize::from(*left_support != CachedModelSupport::Confirmed);
-                    let right_discovery_rank =
-                        usize::from(*right_support != CachedModelSupport::Confirmed);
-                    discovery_rank
-                        .cmp(&right_discovery_rank)
+                // priority 模式（默认）：priority 数字最小的严格优先，保证后端调度顺序
+                // 与前端预览一致（上游 b0d3926）。模型支持性未确认不参与排序 —— 上游
+                // 明确要求 priority 压过 discovery_rank，未确认的凭据会在实际调用时
+                // 由模型过滤兜住。
+                //
+                // 仅在同一 priority 内部按剩余额度降序做 tie-break：额度快照新鲜时把
+                // 负载导向还有额度的账号，避免同级里先撞满一个再换下一个；额度未知或
+                // 相等时回退 ID 升序，保持顺序稳定可预测。
+                available.sort_by(|(left, _), (right, _)| {
+                    left.credentials
+                        .priority
+                        .cmp(&right.credentials.priority)
                         .then_with(|| {
-                            compare_balance_desc(
-                                &balance_snapshots,
-                                now_ts,
-                                left.id,
-                                right.id,
-                            )
-                        })
-                        .then_with(|| {
-                            left.credentials
-                                .priority
-                                .cmp(&right.credentials.priority)
+                            compare_balance_desc(&balance_snapshots, now_ts, left.id, right.id)
                         })
                         .then_with(|| left.id.cmp(&right.id))
                 });
+
+                let (entry, _) = available.first()?;
+                Some((entry.id, entry.credentials.clone()))
             }
         }
-
-        let (entry, _) = available.first()?;
-        Some((entry.id, entry.credentials.clone()))
     }
 
     /// 获取 API 调用上下文
@@ -2241,84 +2274,48 @@ impl MultiTokenManager {
 
             let selection = 'select: {
                 let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
-                let has_fresh_balance = self.has_fresh_balance_snapshot();
 
-                // balanced 模式：每次请求都重新均衡选择，不固定 current_id
-                // priority 模式有新鲜额度时也要每次重算，确保额度变化及时生效。
-                // 没有额度快照时保留 current_id 快路径，兼容原有行为。
-                let current_hit = if is_balanced || has_fresh_balance {
-                    None
+                // 两种模式都按当前请求重新选择。priority 模式不能复用 current_id，
+                // 否则高优先级凭据从 RPM/冷却恢复后无法在下一次请求立即回切。
+                let mut best = self.select_next_credential(model, group);
+
+                // 没有可用凭据：如果是"自动禁用导致全灭"，做一次受控自愈
+                // （受冷却间隔与连续轮数上限约束，避免持续 403 死循环）。
+                if best.is_none() && self.try_self_heal(model, group) {
+                    best = self.select_next_credential(model, group);
+                }
+
+                let (id, credentials) = if let Some((new_id, new_creds)) = best {
+                    if update_current {
+                        let mut current_id = self.current_id.lock();
+                        *current_id = new_id;
+                    }
+                    (new_id, new_creds)
                 } else {
                     let entries = self.entries.lock();
-                    let current_id = *self.current_id.lock();
                     let now = Instant::now();
-                    let confirmed_available = entries.iter().any(|e| {
-                        !e.disabled
-                            && !e.throttled_until.map(|t| t > now).unwrap_or(false)
-                            && !self.rpm_exceeded(e, now)
-                            && credential_matches_request(&e.credentials, model, group)
-                            && self.cached_model_support(e.id, model)
-                                == CachedModelSupport::Confirmed
-                    });
-                    entries
-                        .iter()
-                        .find(|e| {
-                            let model_support = self.cached_model_support(e.id, model);
-                            e.id == current_id
-                                && !e.disabled
-                                && !e.throttled_until.map(|t| t > now).unwrap_or(false)
-                                && !self.rpm_exceeded(e, now)
-                                && credential_matches_request(&e.credentials, model, group)
-                                && model_support != CachedModelSupport::Unsupported
-                                && (!confirmed_available
-                                    || model_support == CachedModelSupport::Confirmed)
-                        })
-                        .map(|e| (e.id, e.credentials.clone()))
-                };
-
-                let (id, credentials) = if let Some(hit) = current_hit {
-                    hit
-                } else {
-                    // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential(model, group);
-
-                    // 没有可用凭据：如果是"自动禁用导致全灭"，做一次受控自愈
-                    // （受冷却间隔与连续轮数上限约束，避免持续 403 死循环）。
-                    if best.is_none() && self.try_self_heal(model, group) {
-                        best = self.select_next_credential(model, group);
+                    // RPM 打满或账号冷却中（而非全部禁用）时取最早可重试的时间：
+                    // 调用方据此知道这是限流而不是凭据耗尽。
+                    let retry_after = [
+                        self.rpm_retry_after_secs(&entries, model, group, now),
+                        self.retry_after_for_throttled_request(&entries, model, group, now),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .min();
+                    if let Some(retry_after) = retry_after {
+                        // 不在持锁状态下等待：parking_lot 的 guard 跨 await 会让
+                        // future 变成 !Send，且阻塞 OS 线程会连带卡住所有需要
+                        // entries 锁的路径（含 report_* 写回冷却状态）。
+                        // 这里只记录秒数，实际等待放到出锁之后。
+                        pending_wait_secs = Some(retry_after);
+                        break 'select None;
                     }
-
-                    if let Some((new_id, new_creds)) = best {
-                        if update_current {
-                            let mut current_id = self.current_id.lock();
-                            *current_id = new_id;
-                        }
-                        (new_id, new_creds)
-                    } else {
-                        let entries = self.entries.lock();
-                        let now = Instant::now();
-                        let retry_after = [
-                            self.rpm_retry_after_secs(&entries, model, group, now),
-                            self.retry_after_for_throttled_request(&entries, model, group, now),
-                        ]
-                        .into_iter()
-                        .flatten()
-                        .min();
-                        if let Some(retry_after) = retry_after {
-                            // 不在持锁状态下等待：parking_lot 的 guard 跨 await 会让
-                            // future 变成 !Send，且阻塞 OS 线程会连带卡住所有需要
-                            // entries 锁的路径（含 report_* 写回冷却状态）。
-                            // 这里只记录秒数，实际等待放到出锁之后。
-                            pending_wait_secs = Some(retry_after);
-                            break 'select None;
-                        } else {
-                            // 注意：必须在 bail! 之前计算 available_count，
-                            // 因为 available_count() 会尝试获取 entries 锁，
-                            // 而此时我们已经持有该锁，会导致死锁
-                            let available = entries.iter().filter(|e| !e.disabled).count();
-                            anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
-                        }
-                    }
+                    // 注意：必须在 bail! 之前计算 available_count，
+                    // 因为 available_count() 会尝试获取 entries 锁，
+                    // 而此时我们已经持有该锁，会导致死锁
+                    let available = entries.iter().filter(|e| !e.disabled).count();
+                    anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
                 };
 
                 Some((id, credentials, is_balanced))
@@ -2410,7 +2407,7 @@ impl MultiTokenManager {
         if let Some(best) = entries
             .iter()
             .filter(|e| !e.disabled)
-            .min_by_key(|e| e.credentials.priority)
+            .min_by_key(|e| (e.credentials.priority, e.id))
         {
             if best.id != *current_id {
                 tracing::info!(
@@ -2898,7 +2895,7 @@ impl MultiTokenManager {
                     .filter(|entry| {
                         self.entry_available_for_request(entry, model, group, Instant::now())
                     })
-                    .min_by_key(|e| e.credentials.priority)
+                    .min_by_key(|e| (e.credentials.priority, e.id))
                 {
                     *current_id = next.id;
                     tracing::info!(
@@ -2973,7 +2970,7 @@ impl MultiTokenManager {
                 .filter(|entry| {
                     self.entry_available_for_request(entry, model, group, Instant::now())
                 })
-                .min_by_key(|e| e.credentials.priority)
+                .min_by_key(|e| (e.credentials.priority, e.id))
             {
                 *current_id = next.id;
                 tracing::info!(
@@ -3141,7 +3138,7 @@ impl MultiTokenManager {
                 .filter(|entry| {
                     self.entry_available_for_request(entry, model, group, Instant::now())
                 })
-                .min_by_key(|e| e.credentials.priority)
+                .min_by_key(|e| (e.credentials.priority, e.id))
             {
                 *current_id = next.id;
                 tracing::info!(
@@ -3207,7 +3204,7 @@ impl MultiTokenManager {
                 let has_available = if let Some(next) = entries
                     .iter()
                     .filter(|e| !e.disabled)
-                    .min_by_key(|e| e.credentials.priority)
+                    .min_by_key(|e| (e.credentials.priority, e.id))
                 {
                     *current_id = next.id;
                     tracing::info!(
@@ -3263,7 +3260,7 @@ impl MultiTokenManager {
             if let Some(next) = entries
                 .iter()
                 .filter(|e| !e.disabled)
-                .min_by_key(|e| e.credentials.priority)
+                .min_by_key(|e| (e.credentials.priority, e.id))
             {
                 *current_id = next.id;
                 tracing::info!(
@@ -3295,7 +3292,7 @@ impl MultiTokenManager {
         if let Some(next) = entries
             .iter()
             .filter(|e| !e.disabled && e.id != *current_id)
-            .min_by_key(|e| e.credentials.priority)
+            .min_by_key(|e| (e.credentials.priority, e.id))
         {
             *current_id = next.id;
             tracing::info!(
@@ -3395,6 +3392,7 @@ impl MultiTokenManager {
                         None
                     },
                     email: e.credentials.email.clone(),
+                    subscription_title: e.credentials.subscription_title.clone(),
                     success_count: e.success_count,
                     last_used_at: e.last_used_at.clone(),
                     has_proxy: e.credentials.proxy_url.is_some(),
@@ -3409,6 +3407,7 @@ impl MultiTokenManager {
                     endpoint: e.credentials.endpoint.clone(),
                     groups: e.credentials.groups.clone(),
                     source_channel: e.credentials.source_channel.clone(),
+                    metadata: e.credentials.metadata.clone(),
                     created_at: e.credentials.created_at.clone(),
                 })
                 .collect(),
@@ -3711,7 +3710,7 @@ impl MultiTokenManager {
             }
         };
 
-        let credentials = {
+        let mut credentials = {
             let entries = self.entries.lock();
             entries
                 .iter()
@@ -3719,6 +3718,16 @@ impl MultiTokenManager {
                 .map(|e| e.credentials.clone())
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
+
+        // Enterprise / IdC 账号必须带真实 profileArn，先解析回填；
+        // 失败不阻断查询，由 get_usage_limits 内部按候选表回退。
+        match self.resolve_profile_arn_for(id, &token).await {
+            Ok(Some(arn)) => credentials.profile_arn = Some(arn),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!("凭据 #{} 查询用量前解析 profileArn 失败: {}", id, error)
+            }
+        }
 
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
@@ -3968,7 +3977,7 @@ impl MultiTokenManager {
         };
 
         // 重新读取最新的凭据快照（refresh 可能已修改 access_token 之外的字段）
-        let credentials = {
+        let mut credentials = {
             let entries = self.entries.lock();
             entries
                 .iter()
@@ -3976,6 +3985,16 @@ impl MultiTokenManager {
                 .map(|e| e.credentials.clone())
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
+
+        // Enterprise / IdC 账号必须带真实 profileArn，先解析回填；
+        // 解析失败不阻断请求，保留无 ARN 的 BuilderID 兼容路径。
+        match self.resolve_profile_arn_for(id, &token).await {
+            Ok(Some(arn)) => credentials.profile_arn = Some(arn),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!("凭据 #{} 设置用户偏好前解析 profileArn 失败: {}", id, error)
+            }
+        }
 
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
@@ -4114,6 +4133,7 @@ impl MultiTokenManager {
         validated_cred.proxy_username = new_cred.proxy_username;
         validated_cred.proxy_password = new_cred.proxy_password;
         validated_cred.kiro_api_key = new_cred.kiro_api_key;
+        validated_cred.metadata = new_cred.metadata;
         // 记录添加时间：保留导入时携带的原值（如 KAM 迁移），否则以当前时间入库。
         // 此处为所有添加路径（单条添加 / 批量导入 / 登录回调）的唯一收口。
         if validated_cred.created_at.is_none() {
@@ -4186,6 +4206,7 @@ impl MultiTokenManager {
         proxy_password: Option<Option<String>>,
         groups: Option<Vec<String>>,
         source_channel: Option<Option<String>>,
+        metadata: Option<crate::kiro::model::credentials::CredentialMetadata>,
     ) -> anyhow::Result<()> {
         let invalidate_models =
             proxy_url.is_some() || proxy_username.is_some() || proxy_password.is_some();
@@ -4218,6 +4239,9 @@ impl MultiTokenManager {
             if let Some(v) = source_channel {
                 entry.credentials.source_channel =
                     v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            }
+            if let Some(v) = metadata {
+                entry.credentials.metadata = v;
             }
         }
         if invalidate_models {
@@ -6663,7 +6687,9 @@ mod tests {
     }
 
     #[test]
-    fn test_usage_rest_urls_omit_resolved_profile_arn() {
+    fn test_usage_rest_urls_carry_resolved_profile_arn() {
+        // Enterprise / IdC：真实 ARN 必须以 URL 编码形式出现在查询串里，
+        // 否则上游返回 403 "User is not authorized to make this call."
         let credentials = KiroCredentials {
             profile_arn: Some(
                 "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL123".to_string(),
@@ -6671,14 +6697,93 @@ mod tests {
             ..Default::default()
         };
         let host = "q.us-east-1.amazonaws.com";
+        let encoded =
+            "arn%3Aaws%3Acodewhisperer%3Aus-east-1%3A123456789012%3Aprofile%2FREAL123";
 
+        let arn = credentials.effective_profile_arn();
         assert_eq!(
-            usage_limits_url(host, &credentials),
+            usage_limits_url(host, arn),
+            format!(
+                "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true&profileArn={}",
+                encoded
+            )
+        );
+        assert_eq!(
+            available_models_url(host, arn),
+            format!(
+                "https://q.us-east-1.amazonaws.com/ListAvailableModels?origin=AI_EDITOR&profileArn={}",
+                encoded
+            )
+        );
+
+        // 每个区域端点先试带 ARN，403 时回退到不带
+        assert_eq!(
+            usage_api_attempts(&credentials, &["us-east-1", "eu-central-1"]),
+            vec![
+                ("us-east-1", arn),
+                ("us-east-1", None),
+                ("eu-central-1", arn),
+                ("eu-central-1", None),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_usage_rest_urls_omit_builder_id_placeholder() {
+        // BuilderID 占位符不发送：这些账号沿用不带 profileArn 的老式请求
+        use crate::kiro::model::credentials::BUILDER_ID_PROFILE_ARN;
+
+        let credentials = KiroCredentials {
+            profile_arn: Some(BUILDER_ID_PROFILE_ARN.to_string()),
+            ..Default::default()
+        };
+        let host = "q.us-east-1.amazonaws.com";
+
+        // 占位符被过滤，只剩「不带 ARN」一种形态：与加此参数前的行为一致
+        assert_eq!(credentials.effective_profile_arn(), None);
+        assert_eq!(
+            usage_api_attempts(&credentials, &["us-east-1", "eu-central-1"]),
+            vec![("us-east-1", None), ("eu-central-1", None)]
+        );
+        assert_eq!(
+            usage_limits_url(host, None),
             "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true"
         );
         assert_eq!(
-            available_models_url(host, &credentials),
+            available_models_url(host, None),
             "https://q.us-east-1.amazonaws.com/ListAvailableModels?origin=AI_EDITOR"
+        );
+    }
+
+    #[test]
+    fn test_set_user_preference_body_carries_real_profile_arn() {
+        let credentials = KiroCredentials {
+            profile_arn: Some(
+                "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL123".to_string(),
+            ),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            set_user_preference_body(&credentials, "ENABLED"),
+            serde_json::json!({
+                "overageConfiguration": { "overageStatus": "ENABLED" },
+                "profileArn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL123",
+            })
+        );
+
+        // BuilderID 占位符仍不应作为 Enterprise profileArn 外发。
+        let builder_credentials = KiroCredentials {
+            profile_arn: Some(
+                crate::kiro::model::credentials::BUILDER_ID_PROFILE_ARN.to_string(),
+            ),
+            ..Default::default()
+        };
+        assert_eq!(
+            set_user_preference_body(&builder_credentials, "DISABLED"),
+            serde_json::json!({
+                "overageConfiguration": { "overageStatus": "DISABLED" },
+            })
         );
     }
 
@@ -7150,6 +7255,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
 
@@ -7159,8 +7265,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_update_credential_preserves_extensible_metadata() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("token", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let metadata = crate::kiro::model::credentials::CredentialMetadata {
+            kind: crate::kiro::model::credentials::CredentialType::Boom,
+            sale_status: crate::kiro::model::credentials::CredentialSaleStatus::ForSale,
+            extra: std::collections::BTreeMap::from([(
+                "supplier".to_string(),
+                serde_json::Value::String("vendor-a".to_string()),
+            )]),
+        };
+
+        manager
+            .update_credential(1, None, None, None, None, None, None, Some(metadata))
+            .unwrap();
+
+        let snapshot = manager.snapshot();
+        assert_eq!(
+            snapshot.entries[0].metadata.kind,
+            crate::kiro::model::credentials::CredentialType::Boom
+        );
+        assert_eq!(
+            snapshot.entries[0].metadata.sale_status,
+            crate::kiro::model::credentials::CredentialSaleStatus::ForSale
+        );
+        assert_eq!(
+            snapshot.entries[0].metadata.extra.get("supplier"),
+            Some(&serde_json::Value::String("vendor-a".to_string()))
+        );
+    }
+
     #[tokio::test]
-    async fn test_model_routing_prefers_confirmed_cache_over_unknown_current() {
+    async fn test_priority_routing_prefers_priority_over_unknown_model_cache() {
         let mut confirmed = grouped_cred("confirmed", &[]);
         confirmed.priority = 10;
         let manager = MultiTokenManager::new(
@@ -7177,7 +7321,7 @@ mod tests {
             .acquire_context(Some("minimax-m2.5"), None)
             .await
             .unwrap();
-        assert_eq!(context.id, 2);
+        assert_eq!(context.id, 1);
     }
 
     #[tokio::test]
@@ -7313,7 +7457,9 @@ mod tests {
     }
 
     #[test]
-    fn priority_mode_prefers_fresh_remaining_balance() {
+    fn priority_dominates_balance_across_different_priorities() {
+        // priority 是主序：即使账号 2 额度多得多，priority 更高的账号 1 仍先被选中。
+        // 这样后端调度顺序与 Admin UI 的优先级预览保持一致（上游 b0d3926）。
         let mut first = grouped_cred("first", &[]);
         first.priority = 0;
         let mut second = grouped_cred("second", &[]);
@@ -7328,12 +7474,33 @@ mod tests {
 
         assert_eq!(
             manager.select_next_credential(None, None).map(|(id, _)| id),
+            Some(1),
+            "priority 应压过剩余额度"
+        );
+    }
+
+    #[test]
+    fn balance_breaks_ties_within_same_priority() {
+        // 同一 priority 内部才按剩余额度降序：把负载导向还有额度的账号。
+        let mut first = grouped_cred("first", &[]);
+        first.priority = 5;
+        let mut second = grouped_cred("second", &[]);
+        second.priority = 5;
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![first, second], None, None, false)
+                .unwrap();
+
+        let cached_at = Utc::now().timestamp() as f64;
+        manager.set_balance_snapshot(1, 10.0, cached_at);
+        manager.set_balance_snapshot(2, 100.0, cached_at);
+        assert_eq!(
+            manager.select_next_credential(None, None).map(|(id, _)| id),
             Some(2),
-            "priority 模式应优先选择剩余额度更多的账号"
+            "同优先级应选剩余额度更多的账号"
         );
 
-        // 额度相同时恢复原有 priority 规则。
-        manager.set_balance_snapshot(1, 100.0, cached_at);
+        // 额度相等时回退到 ID 升序，保持顺序稳定可预测。
+        manager.set_balance_snapshot(2, 10.0, cached_at);
         assert_eq!(
             manager.select_next_credential(None, None).map(|(id, _)| id),
             Some(1)
@@ -7359,6 +7526,113 @@ mod tests {
             Some(1),
             "过期额度不得覆盖原有 priority 顺序"
         );
+    }
+
+    #[tokio::test]
+    async fn test_priority_mode_ignores_stale_current_id() {
+        let mut first = grouped_cred("first", &[]);
+        first.priority = 0;
+        let mut second = grouped_cred("second", &[]);
+        second.priority = 10;
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![first, second], None, None, false)
+                .unwrap();
+
+        assert!(manager.switch_to_next());
+        assert_eq!(manager.snapshot().current_id, 2);
+
+        let context = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(context.id, 1);
+        assert_eq!(manager.snapshot().current_id, 1);
+    }
+
+    #[tokio::test]
+    async fn test_priority_mode_selects_smallest_priority_in_request_group() {
+        let mut other_group = grouped_cred("other", &["g2"]);
+        other_group.priority = 0;
+        let mut later_in_group = grouped_cred("later", &["g1"]);
+        later_in_group.priority = 20;
+        let mut first_in_group = grouped_cred("first", &["g1"]);
+        first_in_group.priority = 10;
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![other_group, later_in_group, first_in_group],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let context = manager.acquire_context(None, Some("g1")).await.unwrap();
+        assert_eq!(context.id, 3);
+        assert_eq!(manager.snapshot().current_id, 3);
+    }
+
+    #[tokio::test]
+    async fn test_priority_mode_falls_through_at_rpm_limit_and_switches_back() {
+        let mut config = Config::default();
+        config.account_rpm_limit_enabled = true;
+        config.account_rpm_limit = 1;
+
+        let mut first = grouped_cred("first", &[]);
+        first.priority = 0;
+        let mut second = grouped_cred("second", &[]);
+        second.priority = 10;
+        let manager = MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
+
+        let first_context = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(first_context.id, 1);
+
+        let fallback_context = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(fallback_context.id, 2);
+
+        {
+            let mut entries = manager.entries.lock();
+            let expired = Instant::now() - StdDuration::from_secs(RPM_WINDOW_SECS + 1);
+            for timestamp in entries[0].rpm_window.iter_mut() {
+                *timestamp = expired;
+            }
+        }
+
+        let recovered_context = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(recovered_context.id, 1);
+    }
+
+    #[tokio::test]
+    async fn test_priority_mode_switches_back_after_higher_priority_is_enabled() {
+        let mut first = grouped_cred("first", &[]);
+        first.priority = 0;
+        let mut second = grouped_cred("second", &[]);
+        second.priority = 10;
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![first, second], None, None, false)
+                .unwrap();
+
+        manager.set_disabled(1, true).unwrap();
+        let fallback_context = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(fallback_context.id, 2);
+
+        manager.set_disabled(1, false).unwrap();
+        let recovered_context = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(recovered_context.id, 1);
+    }
+
+    #[tokio::test]
+    async fn test_priority_mode_uses_id_to_break_equal_priority_ties() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("first", &[]), grouped_cred("second", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert!(manager.switch_to_next());
+        assert_eq!(manager.snapshot().current_id, 2);
+
+        let context = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(context.id, 1);
     }
 
     #[tokio::test]
@@ -7394,17 +7668,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn priority_acquire_rechecks_balance_after_current_id_changes() {
+    async fn acquire_rechecks_balance_within_same_priority() {
+        // 取号不复用 current_id：同优先级下额度快照变化应在下一次请求立即生效。
         let first = KiroCredentials {
             access_token: Some("first-token".to_string()),
             expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
-            priority: 0,
+            priority: 5,
             ..KiroCredentials::default()
         };
         let second = KiroCredentials {
             access_token: Some("second-token".to_string()),
             expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
-            priority: 1,
+            priority: 5,
             ..KiroCredentials::default()
         };
         let manager =
@@ -7416,7 +7691,7 @@ mod tests {
         manager.set_balance_snapshot(2, 100.0, cached_at);
         assert_eq!(manager.acquire_context(None, None).await.unwrap().id, 2);
 
-        // current_id 仍指向账号 2，但下一次请求应随额度变化切换到账号 1。
+        // 额度反转后下一次请求应切回账号 1，而不是黏在 current_id 上。
         manager.set_balance_snapshot(1, 200.0, cached_at);
         manager.set_balance_snapshot(2, 1.0, cached_at);
         assert_eq!(manager.acquire_context(None, None).await.unwrap().id, 1);
