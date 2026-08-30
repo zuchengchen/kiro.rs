@@ -111,8 +111,13 @@ function FailureRow({
   attempt: TraceAttempt;
 }) {
   const style = outcomeStyle(attempt.outcome);
-  // 整条 trace 后续是否成功了（用别的凭据救回）
+  // 这一跳失败了，但整条 trace 最终成功——客户端没有收到错误。
+  // 救回方式有两种，区分开才能看清是账号池起了作用还是限流桶起了作用：
+  // - 同一凭据：429 后同账号换限流桶重试成功（不消耗重试轮次，常见于单账号池）
+  // - 其他凭据：故障转移到别的账号后成功
   const traceRecovered = rec.finalStatus === "success";
+  const recoveredBySameCredential =
+    attempt.credentialId === rec.finalCredentialId;
   return (
     <div className="rounded-lg border border-border/50 bg-secondary/30 p-3">
       <div className="flex flex-wrap items-center gap-2 text-[13px]">
@@ -132,7 +137,18 @@ function FailureRow({
           </span>
         )}
         {traceRecovered && (
-          <Badge variant="outline">本次请求最终由其他凭据成功</Badge>
+          <Badge
+            variant="outline"
+            title={
+              recoveredBySameCredential
+                ? "该凭据换用其他上游限流桶后重试成功，客户端未收到错误"
+                : `已故障转移到凭据 #${rec.finalCredentialId} 并成功，客户端未收到错误`
+            }
+          >
+            {recoveredBySameCredential
+              ? "本次请求最终成功（同凭据换桶重试）"
+              : `本次请求最终成功（转由凭据 #${rec.finalCredentialId}）`}
+          </Badge>
         )}
         {rec.finalStatus === "interrupted" && (
           <Badge variant="warning">中断</Badge>
