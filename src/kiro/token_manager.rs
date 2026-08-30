@@ -1160,6 +1160,8 @@ pub struct MultiTokenManager {
     account_throttle_failover: AtomicBool,
     /// 账号级风控冷却时长（秒，运行时可修改）
     account_throttle_cooldown_secs: AtomicU64,
+    /// 全池冷却时的内部等待预算（毫秒，运行时可修改；0 表示不等待、立即返回 429）
+    acquire_wait_budget_ms: AtomicU64,
     /// 单账号 RPM 主动限流开关（运行时可修改）
     account_rpm_limit_enabled: AtomicBool,
     /// 单账号每分钟请求次数上限（运行时可修改）
@@ -1195,6 +1197,41 @@ const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 const RPM_WINDOW_SECS: u64 = 60;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
+
+/// 单个客户端请求共享的「全池冷却内部等待」预算。
+///
+/// 全部凭据都在冷却中时取号会失败。此前的行为是立刻返回 429 + `Retry-After`，
+/// 但客户端往往立即重试、而重试同样在毫秒级被拒 —— 一次冷却于是放大成持续的
+/// 429 风暴。本预算允许服务端在短冷却上内部等待并重新选号，把冷却对客户端
+/// 变成一次透明延迟。
+///
+/// 必须由最外层调用方创建并跨多次取号复用：provider 的重试循环与 WebSearch
+/// 多轮循环都会重复取号，各自新建预算会让累计等待放大到 `轮数 × 预算`。
+pub struct AcquireWaitBudget {
+    remaining: StdDuration,
+}
+
+impl AcquireWaitBudget {
+    /// 剩余可用等待时长。
+    pub fn remaining(&self) -> StdDuration {
+        self.remaining
+    }
+
+    /// 申请等待 `wait_secs` 秒，成功则从预算中扣除。
+    ///
+    /// 冷却可能长达 `accountThrottleCooldownSecs`（或 RPM 的 60 秒窗口），远超客户端
+    /// 能接受的等待。只有当所需时长完整落在剩余预算内才批准；否则返回 `None`，
+    /// 由调用方返回带 `Retry-After` 的 429，避免把客户端挂到超时。
+    fn take(&mut self, wait_secs: u64) -> Option<StdDuration> {
+        let needed = StdDuration::from_secs(wait_secs);
+        // needed 为零说明冷却其实已过，不该白等一轮。
+        if needed.is_zero() || needed > self.remaining {
+            return None;
+        }
+        self.remaining = self.remaining.saturating_sub(needed);
+        Some(needed)
+    }
+}
 
 /// API 调用上下文
 ///
@@ -1432,6 +1469,7 @@ impl MultiTokenManager {
         let load_balancing_mode = config.load_balancing_mode.clone();
         let throttle_failover = config.account_throttle_failover;
         let throttle_cooldown_secs = config.account_throttle_cooldown_secs;
+        let acquire_wait_budget_ms = config.acquire_wait_budget_ms;
         let rpm_limit_enabled = config.account_rpm_limit_enabled;
         let rpm_limit = config.account_rpm_limit;
         let suspended_detection_enabled = config.suspended_detection_enabled;
@@ -1454,6 +1492,7 @@ impl MultiTokenManager {
             load_balancing_mode: Mutex::new(load_balancing_mode),
             account_throttle_failover: AtomicBool::new(throttle_failover),
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
+            acquire_wait_budget_ms: AtomicU64::new(acquire_wait_budget_ms),
             account_rpm_limit_enabled: AtomicBool::new(rpm_limit_enabled),
             account_rpm_limit: AtomicU32::new(rpm_limit),
             suspended_detection_enabled: AtomicBool::new(suspended_detection_enabled),
@@ -2130,14 +2169,45 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
+    /// 便捷入口：自建一次性等待预算。
+    ///
+    /// 仅适用于「一次调用即一个请求」的场景。带重试的调用方必须改用
+    /// [`Self::acquire_context_with_budget`] 并共享同一份预算。
+    #[cfg(test)]
     pub async fn acquire_context(
         &self,
         model: Option<&str>,
         group: Option<&str>,
     ) -> anyhow::Result<CallContext> {
-        self.acquire_context_impl(model, group, true)
+        let mut budget = self.new_acquire_wait_budget();
+        self.acquire_context_with_budget(model, group, &mut budget)
+            .await
+    }
+
+    /// 与 [`Self::acquire_context`] 相同，但复用调用方持有的等待预算。
+    ///
+    /// 带重试的调用方（provider 重试循环、WebSearch 多轮循环）应创建一个预算并在
+    /// 全部取号之间共享，使「内部等待」的上限对单个客户端请求成立，而非对每次取号。
+    pub async fn acquire_context_with_budget(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        budget: &mut AcquireWaitBudget,
+    ) -> anyhow::Result<CallContext> {
+        self.acquire_context_impl(model, group, true, budget)
             .await
             .map(|(context, _)| context)
+    }
+
+    /// 创建一次客户端请求共享的内部等待预算。
+    ///
+    /// 必须由最外层调用方持有并在多次取号间复用：`call_api_with_retry` 每轮重试都会
+    /// 重新取号，WebSearch 循环还会多轮调用 provider。若每次取号各自新建预算，
+    /// 单个客户端请求的累计等待会被放大到 `轮数 × 预算`，远超预期上限。
+    pub fn new_acquire_wait_budget(&self) -> AcquireWaitBudget {
+        AcquireWaitBudget {
+            remaining: StdDuration::from_millis(self.get_acquire_wait_budget_ms()),
+        }
     }
 
     /// 获取 API 调用上下文，并返回本次选择是否使用了 balanced 模式。
@@ -2149,10 +2219,13 @@ impl MultiTokenManager {
         model: Option<&str>,
         group: Option<&str>,
         update_current: bool,
+        wait_budget: &mut AcquireWaitBudget,
     ) -> anyhow::Result<(CallContext, bool)> {
         let total = self.total_count_in_group(group);
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
+        // Admin 只读模型发现不应为了额度挂住管理接口：直接按零预算处理。
+        let waits_allowed = update_current;
 
         loop {
             if attempt_count >= max_attempts {
@@ -2163,7 +2236,10 @@ impl MultiTokenManager {
                 );
             }
 
-            let (id, credentials, is_balanced) = {
+            // 本轮选号若因全池冷却失败，记录需要等待的秒数，出锁后再决定是否等待。
+            let mut pending_wait_secs: Option<u64> = None;
+
+            let selection = 'select: {
                 let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
                 let has_fresh_balance = self.has_fresh_balance_snapshot();
 
@@ -2229,19 +2305,46 @@ impl MultiTokenManager {
                         .flatten()
                         .min();
                         if let Some(retry_after) = retry_after {
-                            return Err(
-                                UpstreamRateLimitError::new(Some(retry_after.to_string())).into()
-                            );
+                            // 不在持锁状态下等待：parking_lot 的 guard 跨 await 会让
+                            // future 变成 !Send，且阻塞 OS 线程会连带卡住所有需要
+                            // entries 锁的路径（含 report_* 写回冷却状态）。
+                            // 这里只记录秒数，实际等待放到出锁之后。
+                            pending_wait_secs = Some(retry_after);
+                            break 'select None;
+                        } else {
+                            // 注意：必须在 bail! 之前计算 available_count，
+                            // 因为 available_count() 会尝试获取 entries 锁，
+                            // 而此时我们已经持有该锁，会导致死锁
+                            let available = entries.iter().filter(|e| !e.disabled).count();
+                            anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
                         }
-                        // 注意：必须在 bail! 之前计算 available_count，
-                        // 因为 available_count() 会尝试获取 entries 锁，
-                        // 而此时我们已经持有该锁，会导致死锁
-                        let available = entries.iter().filter(|e| !e.disabled).count();
-                        anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
                     }
                 };
 
-                (id, credentials, is_balanced)
+                Some((id, credentials, is_balanced))
+            };
+
+            // 此处已不持有任何 parking_lot 锁（selection 块结束时全部释放）。
+            let Some((id, credentials, is_balanced)) = selection else {
+                let wait_secs = pending_wait_secs.unwrap_or(0);
+                // 等待窗口超出剩余预算时，仍按原行为把类型化 429 交给客户端，
+                // 由它按 Retry-After 自行安排重试。
+                let wait = if waits_allowed {
+                    wait_budget.take(wait_secs)
+                } else {
+                    None
+                };
+                let Some(wait) = wait else {
+                    return Err(UpstreamRateLimitError::new(Some(wait_secs.to_string())).into());
+                };
+
+                tracing::debug!(
+                    "全池冷却中，内部等待 {:?} 后重新选号（本次请求剩余预算 {:?}）",
+                    wait,
+                    wait_budget.remaining()
+                );
+                tokio::time::sleep(wait).await;
+                continue;
             };
 
             // 尝试获取/刷新 Token
@@ -3778,7 +3881,12 @@ impl MultiTokenManager {
     pub async fn get_available_models_for_current(
         &self,
     ) -> anyhow::Result<(u64, ListAvailableModelsResponse, bool)> {
-        let (context, is_balanced) = self.acquire_context_impl(None, None, false).await?;
+        // Admin 只读查询不参与内部等待（update_current=false 已强制零等待），
+        // 预算实参仅为满足签名。
+        let mut budget = self.new_acquire_wait_budget();
+        let (context, is_balanced) = self
+            .acquire_context_impl(None, None, false, &mut budget)
+            .await?;
         let id = context.id;
         let response = self.refresh_model_cache_for(id, true).await?;
         Ok((id, response, is_balanced))
@@ -4479,6 +4587,7 @@ impl MultiTokenManager {
         &self,
         failover: Option<bool>,
         cooldown_secs: Option<u64>,
+        acquire_wait_budget_ms: Option<u64>,
     ) -> anyhow::Result<()> {
         if let Some(secs) = cooldown_secs {
             // 限定一个合理范围：1 秒到 24 小时
@@ -4486,15 +4595,26 @@ impl MultiTokenManager {
                 anyhow::bail!("冷却时长必须在 1..=86400 秒内: {}", secs);
             }
         }
+        if let Some(ms) = acquire_wait_budget_ms {
+            // 上限 30 秒：再长就会撞上客户端自己的超时，等待反而有害。
+            if ms > 30_000 {
+                anyhow::bail!("内部等待预算必须在 0..=30000 毫秒内: {}", ms);
+            }
+        }
 
         let _update_guard = self.runtime_config_update_lock.lock();
 
         let prev_failover = self.get_account_throttle_failover();
         let prev_cooldown = self.get_account_throttle_cooldown_secs();
+        let prev_wait_budget = self.get_acquire_wait_budget_ms();
         let new_failover = failover.unwrap_or(prev_failover);
         let new_cooldown = cooldown_secs.unwrap_or(prev_cooldown);
+        let new_wait_budget = acquire_wait_budget_ms.unwrap_or(prev_wait_budget);
 
-        if new_failover == prev_failover && new_cooldown == prev_cooldown {
+        if new_failover == prev_failover
+            && new_cooldown == prev_cooldown
+            && new_wait_budget == prev_wait_budget
+        {
             return Ok(());
         }
 
@@ -4502,32 +4622,46 @@ impl MultiTokenManager {
             .store(new_failover, Ordering::Relaxed);
         self.account_throttle_cooldown_secs
             .store(new_cooldown, Ordering::Relaxed);
+        self.acquire_wait_budget_ms
+            .store(new_wait_budget, Ordering::Relaxed);
 
-        if let Err(err) = self.persist_account_throttle_config(new_failover, new_cooldown) {
+        if let Err(err) =
+            self.persist_account_throttle_config(new_failover, new_cooldown, new_wait_budget)
+        {
             // 回滚内存值
             self.account_throttle_failover
                 .store(prev_failover, Ordering::Relaxed);
             self.account_throttle_cooldown_secs
                 .store(prev_cooldown, Ordering::Relaxed);
+            self.acquire_wait_budget_ms
+                .store(prev_wait_budget, Ordering::Relaxed);
             return Err(err);
         }
 
         tracing::info!(
-            "账号级风控配置已更新: failover={}, cooldown_secs={}",
+            "账号级风控配置已更新: failover={}, cooldown_secs={}, acquire_wait_budget_ms={}",
             new_failover,
-            new_cooldown
+            new_cooldown,
+            new_wait_budget
         );
         Ok(())
+    }
+
+    /// 当前的全池冷却内部等待预算（毫秒）。
+    pub fn get_acquire_wait_budget_ms(&self) -> u64 {
+        self.acquire_wait_budget_ms.load(Ordering::Relaxed)
     }
 
     fn persist_account_throttle_config(
         &self,
         failover: bool,
         cooldown_secs: u64,
+        acquire_wait_budget_ms: u64,
     ) -> anyhow::Result<()> {
         self.update_config_file(move |config| {
             config.account_throttle_failover = failover;
             config.account_throttle_cooldown_secs = cooldown_secs;
+            config.acquire_wait_budget_ms = acquire_wait_budget_ms;
         })
     }
 
@@ -5861,6 +5995,208 @@ mod tests {
     }
 
     #[test]
+    fn set_account_throttle_config_rejects_oversized_wait_budget() {
+        let mgr = rpm_test_manager(false, 60);
+        // 超过 30s 上限必须拒绝：再长就会撞上客户端自身超时
+        assert!(
+            mgr.set_account_throttle_config(None, None, Some(30_001))
+                .is_err()
+        );
+        // 边界值可接受
+        assert!(
+            mgr.set_account_throttle_config(None, None, Some(30_000))
+                .is_ok()
+        );
+        // 全部字段缺省时不报错（无变更）
+        assert!(mgr.set_account_throttle_config(None, None, None).is_ok());
+    }
+
+    /// 构造一个持有有效 token（无需网络刷新）的单凭据 manager。
+    fn offline_manager(config: Config) -> MultiTokenManager {
+        let cred = KiroCredentials {
+            access_token: Some("valid-token".to_string()),
+            expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
+            refresh_token: Some("refresh-token-".repeat(4)),
+            ..KiroCredentials::default()
+        };
+        MultiTokenManager::new(config, vec![cred], None, None, false).unwrap()
+    }
+
+    // 注意：`throttled_until` 基于 `std::time::Instant`，不受 tokio 的时间暂停
+    // （`start_paused`）影响。因此凡是需要真正跨过冷却的用例都必须用真实时间，
+    // 冷却时长取 1 秒以控制测试耗时。
+    #[tokio::test]
+    async fn acquire_waits_out_short_cooldown_instead_of_returning_429() {
+        // 唯一账号进入 1 秒冷却，预算 2 秒 → 应内部等待后成功取号，而不是 429。
+        let mut config = Config::default();
+        config.acquire_wait_budget_ms = 2_000;
+        let mgr = offline_manager(config);
+
+        let id = mgr.snapshot().current_id;
+        mgr.report_account_throttled_for_request(id, StdDuration::from_secs(1), None, None);
+
+        let started = Instant::now();
+        let ctx = mgr
+            .acquire_context(None, None)
+            .await
+            .expect("短冷却应被内部等待吸收，而非返回 429");
+
+        assert_eq!(ctx.id, id);
+        // 证明确实等待过而非立即返回
+        assert!(
+            started.elapsed() >= StdDuration::from_secs(1),
+            "应至少等待冷却时长，实际 {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_returns_rate_limit_when_cooldown_exceeds_budget() {
+        // 冷却 300 秒远超 3 秒预算 → 立即返回类型化 429，不把客户端挂住。
+        let mut config = Config::default();
+        config.acquire_wait_budget_ms = 3_000;
+        let mgr = offline_manager(config);
+
+        let id = mgr.snapshot().current_id;
+        mgr.report_account_throttled_for_request(id, StdDuration::from_secs(300), None, None);
+
+        let started = Instant::now();
+        let error = match mgr.acquire_context(None, None).await {
+            Ok(_) => panic!("超预算冷却应返回 429"),
+            Err(error) => error,
+        };
+
+        let rate_limit = error
+            .downcast_ref::<UpstreamRateLimitError>()
+            .expect("应为类型化限流错误，以便映射出 Retry-After");
+        assert_eq!(rate_limit.retry_after(), Some("300"));
+        // 必须立即返回，不能消耗预算去等
+        assert!(started.elapsed() < StdDuration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn acquire_zero_budget_restores_immediate_429() {
+        let mut config = Config::default();
+        config.acquire_wait_budget_ms = 0;
+        let mgr = offline_manager(config);
+
+        let id = mgr.snapshot().current_id;
+        mgr.report_account_throttled_for_request(id, StdDuration::from_secs(1), None, None);
+
+        let started = Instant::now();
+        let error = match mgr.acquire_context(None, None).await {
+            Ok(_) => panic!("预算为 0 时应恢复旧行为：立即 429"),
+            Err(error) => error,
+        };
+        assert!(error.downcast_ref::<UpstreamRateLimitError>().is_some());
+        assert!(started.elapsed() < StdDuration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn shared_budget_is_not_replenished_across_acquisitions() {
+        // 核心不变量：预算属于「一次客户端请求」。provider 重试循环复用同一份预算，
+        // 因此累计等待不会被放大成 重试轮数 × 预算。
+        let mut config = Config::default();
+        config.acquire_wait_budget_ms = 2_000;
+        let mgr = offline_manager(config);
+        let id = mgr.snapshot().current_id;
+
+        let mut budget = mgr.new_acquire_wait_budget();
+
+        // 第一次取号吃掉 1 秒预算
+        mgr.report_account_throttled_for_request(id, StdDuration::from_secs(1), None, None);
+        mgr.acquire_context_with_budget(None, None, &mut budget)
+            .await
+            .expect("首次短冷却应被等待吸收");
+        assert_eq!(budget.remaining(), StdDuration::from_secs(1));
+
+        // 再来一次 2 秒冷却：剩余预算只有 1 秒，必须直接 429 而不是又等 2 秒
+        mgr.report_account_throttled_for_request(id, StdDuration::from_secs(2), None, None);
+        let error = match mgr
+            .acquire_context_with_budget(None, None, &mut budget)
+            .await
+        {
+            Ok(_) => panic!("预算已不足，应返回 429 而非继续等待"),
+            Err(error) => error,
+        };
+        assert!(error.downcast_ref::<UpstreamRateLimitError>().is_some());
+    }
+
+    fn budget_of(ms: u64) -> AcquireWaitBudget {
+        AcquireWaitBudget {
+            remaining: StdDuration::from_millis(ms),
+        }
+    }
+
+    #[test]
+    fn new_acquire_wait_budget_reads_config() {
+        let mgr = rpm_test_manager(false, 60);
+        assert_eq!(
+            mgr.new_acquire_wait_budget().remaining(),
+            StdDuration::from_millis(3_000)
+        );
+    }
+
+    #[test]
+    fn acquire_wait_budget_respects_zero_config() {
+        let mut config = Config::default();
+        config.acquire_wait_budget_ms = 0;
+        let cred = KiroCredentials {
+            id: Some(1),
+            refresh_token: Some("refresh-token-".repeat(4)),
+            access_token: Some("access-token".to_string()),
+            ..KiroCredentials::default()
+        };
+        let mgr = MultiTokenManager::new(config, vec![cred], None, None, true).unwrap();
+        // 预算 0 完全恢复旧行为（立即 429）
+        assert_eq!(mgr.new_acquire_wait_budget().remaining(), StdDuration::ZERO);
+        assert_eq!(mgr.new_acquire_wait_budget().take(1), None);
+    }
+
+    #[test]
+    fn budget_grants_wait_when_cooldown_fits() {
+        // 剩余冷却 2s、预算 3s：内部等待 2s，客户端只感知一次延迟而非 429。
+        let mut budget = budget_of(3_000);
+        assert_eq!(budget.take(2), Some(StdDuration::from_secs(2)));
+        // 扣除后只剩 1s
+        assert_eq!(budget.remaining(), StdDuration::from_secs(1));
+    }
+
+    #[test]
+    fn budget_refuses_when_cooldown_exceeds_remaining() {
+        let mut budget = budget_of(3_000);
+        // 冷却 300s 远超预算：必须立刻返回 429，不能把客户端挂到超时
+        assert_eq!(budget.take(300), None);
+        // 拒绝不应扣预算
+        assert_eq!(budget.remaining(), StdDuration::from_secs(3));
+        // 边界：正好等于预算可用，超出一秒即拒绝
+        assert_eq!(budget.take(4), None);
+        assert_eq!(budget.take(3), Some(StdDuration::from_secs(3)));
+        assert_eq!(budget.remaining(), StdDuration::ZERO);
+    }
+
+    #[test]
+    fn budget_ignores_zero_wait() {
+        // retry_after 为 0 说明冷却已过，不该白等一轮
+        let mut budget = budget_of(3_000);
+        assert_eq!(budget.take(0), None);
+        assert_eq!(budget.remaining(), StdDuration::from_secs(3));
+    }
+
+    #[test]
+    fn budget_is_exhausted_by_repeated_waits_so_loop_terminates() {
+        // 关键不变量：每次批准至少扣 1s，预算单调递减 → 循环必然终止。
+        let mut budget = budget_of(3_000);
+        let mut granted = 0;
+        while budget.take(1).is_some() {
+            granted += 1;
+            assert!(granted <= 3, "预算应在 3 次 1s 等待后耗尽");
+        }
+        assert_eq!(granted, 3);
+        assert_eq!(budget.remaining(), StdDuration::ZERO);
+    }
+
+    #[test]
     fn refresh_rate_limit_does_not_disable_or_increment_failure_count() {
         let manager = MultiTokenManager::new(
             Config::default(),
@@ -5999,8 +6335,9 @@ mod tests {
         assert_eq!(manager.snapshot().current_id, 1);
         manager.report_success(1);
 
+        let mut budget = manager.new_acquire_wait_budget();
         let (context, is_balanced) = manager
-            .acquire_context_impl(None, None, false)
+            .acquire_context_impl(None, None, false, &mut budget)
             .await
             .unwrap();
 
@@ -6981,23 +7318,16 @@ mod tests {
         first.priority = 0;
         let mut second = grouped_cred("second", &[]);
         second.priority = 1;
-        let manager = MultiTokenManager::new(
-            Config::default(),
-            vec![first, second],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![first, second], None, None, false)
+                .unwrap();
 
         let cached_at = Utc::now().timestamp() as f64;
         manager.set_balance_snapshot(1, 10.0, cached_at);
         manager.set_balance_snapshot(2, 100.0, cached_at);
 
         assert_eq!(
-            manager
-                .select_next_credential(None, None)
-                .map(|(id, _)| id),
+            manager.select_next_credential(None, None).map(|(id, _)| id),
             Some(2),
             "priority 模式应优先选择剩余额度更多的账号"
         );
@@ -7005,9 +7335,7 @@ mod tests {
         // 额度相同时恢复原有 priority 规则。
         manager.set_balance_snapshot(1, 100.0, cached_at);
         assert_eq!(
-            manager
-                .select_next_credential(None, None)
-                .map(|(id, _)| id),
+            manager.select_next_credential(None, None).map(|(id, _)| id),
             Some(1)
         );
     }
@@ -7018,23 +7346,16 @@ mod tests {
         first.priority = 0;
         let mut second = grouped_cred("second", &[]);
         second.priority = 1;
-        let manager = MultiTokenManager::new(
-            Config::default(),
-            vec![first, second],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![first, second], None, None, false)
+                .unwrap();
 
         let stale_at = Utc::now().timestamp() as f64 - BALANCE_SNAPSHOT_TTL_SECS - 1.0;
         manager.set_balance_snapshot(1, 1.0, stale_at);
         manager.set_balance_snapshot(2, 1000.0, stale_at);
 
         assert_eq!(
-            manager
-                .select_next_credential(None, None)
-                .map(|(id, _)| id),
+            manager.select_next_credential(None, None).map(|(id, _)| id),
             Some(1),
             "过期额度不得覆盖原有 priority 顺序"
         );
@@ -7086,14 +7407,9 @@ mod tests {
             priority: 1,
             ..KiroCredentials::default()
         };
-        let manager = MultiTokenManager::new(
-            Config::default(),
-            vec![first, second],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![first, second], None, None, false)
+                .unwrap();
         let cached_at = Utc::now().timestamp() as f64;
 
         manager.set_balance_snapshot(1, 10.0, cached_at);

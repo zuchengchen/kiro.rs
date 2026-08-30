@@ -98,7 +98,7 @@ impl IdeEndpoint {
         host: String,
     ) -> RequestBuilder {
         let mut req = req
-            .header("x-amzn-kiro-agent-mode", "vibe")
+            .header("x-amzn-kiro-agent-mode", &ctx.config.agent_mode)
             .header("x-amz-user-agent", self.x_amz_user_agent(ctx))
             .header("user-agent", self.user_agent(ctx))
             .header("host", host)

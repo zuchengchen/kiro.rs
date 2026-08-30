@@ -373,11 +373,17 @@ impl KiroProvider {
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        // 同 call_api_with_retry：等待预算在重试间共享，避免累计放大。
+        let mut wait_budget = self.token_manager.new_acquire_wait_budget();
 
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
             // MCP 调用不涉及模型选择，但必须遵守客户端 Key 的凭据分组隔离。
-            let mut ctx = match self.token_manager.acquire_context(None, group).await {
+            let mut ctx = match self
+                .token_manager
+                .acquire_context_with_budget(None, group, &mut wait_budget)
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     if is_rate_limit_error(&e) {
@@ -797,13 +803,16 @@ impl KiroProvider {
 
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
+        // 全池冷却的内部等待预算按「一次调用」计量并在各次重试间共享，
+        // 否则每轮重试各自新建预算会把累计等待放大到 重试轮数 × 预算。
+        let mut wait_budget = self.token_manager.new_acquire_wait_budget();
 
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
             // 获取调用上下文（绑定 index、credentials、token）
             let mut ctx = match self
                 .token_manager
-                .acquire_context(model.as_deref(), group)
+                .acquire_context_with_budget(model.as_deref(), group, &mut wait_budget)
                 .await
             {
                 Ok(c) => c,

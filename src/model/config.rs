@@ -178,6 +178,24 @@ pub struct Config {
     #[serde(default = "default_account_throttle_cooldown_secs")]
     pub account_throttle_cooldown_secs: u64,
 
+    /// Kiro Agent 模式，用于 `x-amzn-kiro-agent-mode` 请求头（默认 "vibe"）
+    ///
+    /// 官方 IDE 取值为 `vibe`（对话）或 `spec`（规格驱动）。
+    #[serde(default = "default_agent_mode")]
+    pub agent_mode: String,
+
+    /// 全池冷却时的内部等待预算（毫秒，默认 3000）。
+    ///
+    /// 所有可用凭据都在冷却中时，取号会失败。此前的行为是立刻返回 429 +
+    /// `Retry-After`，但客户端通常会立即重试，而重试同样在毫秒级被拒 —— 于是
+    /// 一次冷却会放大成持续的 429 风暴。开启后：若剩余冷却完全落在本预算内，
+    /// 服务端内部等待并重新选号，把短冷却对客户端变成透明的延迟。
+    ///
+    /// 剩余冷却超出预算时仍立即返回 429（带 `Retry-After`），避免把客户端挂到超时。
+    /// 设为 0 可完全恢复旧行为。
+    #[serde(default = "default_acquire_wait_budget_ms")]
+    pub acquire_wait_budget_ms: u64,
+
     /// 是否启用单账号每分钟请求次数（RPM）主动限流（默认 false）。
     ///
     /// 开启后：每个凭据独立维护最近 60 秒的滑动窗口计数，达到 `account_rpm_limit`
@@ -323,6 +341,26 @@ fn default_account_throttle_cooldown_secs() -> u64 {
     30 * 60
 }
 
+fn default_acquire_wait_budget_ms() -> u64 {
+    3_000
+}
+
+fn default_agent_mode() -> String {
+    "vibe".to_string()
+}
+
+/// `agent_mode` 是否可安全用作 HTTP 头值。
+///
+/// 不限定枚举取值（上游可能新增模式），只要求非空且为可见 ASCII —— 这正是
+/// `HeaderValue` 的约束，不满足会让请求构造直接失败。
+fn is_valid_agent_mode(mode: &str) -> bool {
+    !mode.is_empty()
+        && mode.len() <= 64
+        && mode
+            .bytes()
+            .all(|b| b.is_ascii_graphic() || b == b'-' || b == b'_')
+}
+
 fn default_account_rpm_limit_enabled() -> bool {
     false
 }
@@ -408,6 +446,8 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
+            acquire_wait_budget_ms: default_acquire_wait_budget_ms(),
+            agent_mode: default_agent_mode(),
             account_rpm_limit_enabled: default_account_rpm_limit_enabled(),
             account_rpm_limit: default_account_rpm_limit(),
             suspended_detection_enabled: default_suspended_detection_enabled(),
@@ -466,6 +506,16 @@ impl Config {
         if config.update_auto_apply_time.trim().is_empty() {
             config.update_auto_apply_time = default_update_auto_apply_time();
         }
+        // agent_mode 会直接写进 x-amzn-kiro-agent-mode 请求头：空值会发出一个空头，
+        // 上游行为未定义；含非法字符则会让 reqwest 构造请求失败（整条链路 500）。
+        if !is_valid_agent_mode(&config.agent_mode) {
+            tracing::warn!(
+                "agentMode 取值非法（{:?}），回退为默认值 {:?}",
+                config.agent_mode,
+                default_agent_mode()
+            );
+            config.agent_mode = default_agent_mode();
+        }
 
         Ok(config)
     }
@@ -492,6 +542,44 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::Config;
+
+    #[test]
+    fn acquire_wait_budget_defaults_for_existing_configs() {
+        // 已有部署（配置里没这一项）应拿到 3000ms 默认值
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.acquire_wait_budget_ms, 3_000);
+        assert_eq!(Config::default().acquire_wait_budget_ms, 3_000);
+    }
+
+    #[test]
+    fn acquire_wait_budget_accepts_zero_to_restore_old_behavior() {
+        let config: Config = serde_json::from_str(r#"{"acquireWaitBudgetMs":0}"#).unwrap();
+        assert_eq!(config.acquire_wait_budget_ms, 0);
+    }
+
+    #[test]
+    fn agent_mode_defaults_to_vibe() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.agent_mode, "vibe");
+        assert_eq!(Config::default().agent_mode, "vibe");
+
+        let spec: Config = serde_json::from_str(r#"{"agentMode":"spec"}"#).unwrap();
+        assert_eq!(spec.agent_mode, "spec");
+    }
+
+    #[test]
+    fn agent_mode_validation_rejects_unsafe_header_values() {
+        use super::is_valid_agent_mode;
+        assert!(is_valid_agent_mode("vibe"));
+        assert!(is_valid_agent_mode("spec"));
+        // 空值会发出空请求头
+        assert!(!is_valid_agent_mode(""));
+        // 换行/空格/非 ASCII 会让 HeaderValue 构造失败，导致整条链路 500
+        assert!(!is_valid_agent_mode("vibe\r\nX-Evil: 1"));
+        assert!(!is_valid_agent_mode("vibe mode"));
+        assert!(!is_valid_agent_mode("模式"));
+        assert!(!is_valid_agent_mode(&"v".repeat(65)));
+    }
 
     #[test]
     fn model_cache_ttl_defaults_for_existing_configs() {

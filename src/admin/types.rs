@@ -469,6 +469,8 @@ pub struct AccountThrottleConfigResponse {
     pub failover: bool,
     /// 冷却时长（秒）
     pub cooldown_secs: u64,
+    /// 全池冷却时的内部等待预算（毫秒，0 表示立即返回 429）
+    pub acquire_wait_budget_ms: u64,
 }
 
 /// 更新账号级风控故障转移配置
@@ -481,6 +483,10 @@ pub struct SetAccountThrottleConfigRequest {
     /// 冷却时长（秒）；缺省表示不修改，1..=86400
     #[serde(default)]
     pub cooldown_secs: Option<u64>,
+    /// 全池冷却时的内部等待预算（毫秒）；缺省表示不修改，0..=30000。
+    /// 0 表示关闭内部等待，恢复"立即返回 429"的旧行为。
+    #[serde(default)]
+    pub acquire_wait_budget_ms: Option<u64>,
 }
 
 /// 单账号 RPM 限流配置响应

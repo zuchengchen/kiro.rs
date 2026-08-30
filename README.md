@@ -366,6 +366,8 @@ Admin API 鉴权同样支持：
 | `loadBalancingMode` | `priority` | `priority`（剩余额度优先，额度相同时按 priority）或 `balanced` |
 | `accountThrottleFailover` | `true` | 账号级 429 suspicious activity 时是否冷却并切换凭据 |
 | `accountThrottleCooldownSecs` | `1800` | 账号级风控冷却秒数 |
+| `acquireWaitBudgetMs` | `3000` | 全池冷却时的内部等待预算（毫秒）。所有凭据都在冷却中时，若剩余冷却落在此预算内则服务端内部等待并重新选号，避免把一次冷却放大成持续的 429 风暴；超出预算仍立即返回 429 + `Retry-After`。预算按单个客户端请求计量（跨重试共享），设为 `0` 恢复"立即返回 429"的旧行为 |
+| `agentMode` | `vibe` | 写入 `x-amzn-kiro-agent-mode` 的 Agent 模式，官方 IDE 取值为 `vibe` 或 `spec` |
 | `suspendedDetectionEnabled` | `true` | 是否识别 403 账号封禁文案（`suspended` + `locked your account`）并立即禁用该凭据、不参与自愈 |
 | `selfHealEnabled` | `true` | 全部凭据被自动禁用时是否重置失败计数并重新启用（自愈） |
 | `selfHealMinIntervalSecs` | `300` | 两次自愈的最小冷却间隔（秒），打断持续 403 死循环的关键 |

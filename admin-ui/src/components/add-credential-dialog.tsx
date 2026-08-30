@@ -337,15 +337,24 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               <label htmlFor="endpoint" className="text-sm font-medium">
                 端点
               </label>
-              <Input
+              <select
                 id="endpoint"
-                placeholder="留空使用默认端点（如 ide / cli）"
                 value={endpoint}
                 onChange={(e) => setEndpoint(e.target.value)}
                 disabled={isPending}
-              />
+                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <option value="">使用全局默认端点</option>
+                <option value="codewhisperer">CodeWhisperer</option>
+                <option value="runtime">Kiro Runtime</option>
+                <option value="amazonq">AmazonQ</option>
+                <option value="amazonq-cli">AmazonQ CLI</option>
+                <option value="ide">兼容旧配置：ide</option>
+                <option value="cli">兼容旧配置：cli</option>
+              </select>
               <p className="text-xs text-muted-foreground">
-                可选。决定该凭据走哪套 Kiro API。留空使用全局 defaultEndpoint
+                可选。决定该凭据使用的限流桶，各桶配额相互独立。留空使用全局
+                defaultEndpoint
               </p>
             </div>
 
