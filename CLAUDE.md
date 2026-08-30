@@ -96,6 +96,26 @@ cd .. && cargo test          # 当前基线 712 通过
 该目录的 `README.local.md`。要点：候选端口验证 → 归档线上二进制到 `rollback/`
 （保留最近两个 + SHA-256）→ 切换 → 验证 → 写 `deployment-<version>.json`。
 
+**部署目录不是 git 仓库。** 在 `/home/czc/kiro-rs` 里跑 `git rev-parse HEAD` 会
+静默失败（`fatal: not a git repository`），把空字符串写进 `deployment-*.json` 的
+`sourceCommit` —— 而部署记录正是靠这个字段定位回滚版本。这个坑已经踩过两次。
+先在源码目录取值再切过去：
+
+```bash
+COMMIT=$(git rev-parse HEAD)      # 在 /home/czc/projects/workging/kiro.rs
+cd /home/czc/kiro-rs && ...       # 之后才用 $COMMIT
+```
+
+写完务必回读校验，别只看命令成功：
+
+```bash
+python3 -c "import json;d=json.load(open('deployment-<version>.json'));assert d['sourceCommit'];print(d['sourceCommit'])"
+```
+
+同类陷阱：验证「配置项生效」时不能只测默认值——那无法区分「配置真的被读取」和
+「配置被忽略但默认值恰好正确」。要先显式设一个反常值确认行为改变（如把
+`upstreamTimeoutSecs` 设成 3 秒看请求是否被切断），再恢复默认确认恢复正常。
+
 Admin UI 的「可更新」提示查的是硬编码的 `ZyphrZero/kiro.rs` releases
 （`src/admin/binary_update.rs`、`src/admin/service.rs`）。**不要点更新**：它会用
 上游预编译二进制覆盖掉本地定制。容器化部署下自更新本身也不适用（重启即回滚到
