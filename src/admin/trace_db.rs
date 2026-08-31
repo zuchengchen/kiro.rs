@@ -642,10 +642,13 @@ impl TraceStore {
         let conn = self.conn.lock();
         let mut out: std::collections::HashMap<u64, FailureStats> =
             std::collections::HashMap::new();
+        // 关联 traces 取整条请求的最终状态：最终成功的失败跳归入 recovered，
+        // 不进 auth/throttle/other，否则「失败」一栏会把已救回的尝试算成失败。
         let mut stmt = match conn.prepare(
-            "SELECT credential_id, outcome, COUNT(*) FROM trace_attempts \
-             WHERE outcome != 'success' AND credential_id != 0 \
-             GROUP BY credential_id, outcome",
+            "SELECT a.credential_id, a.outcome, t.final_status = 'success', COUNT(*) \
+             FROM trace_attempts a JOIN traces t ON t.trace_id = a.trace_id \
+             WHERE a.outcome != 'success' AND a.credential_id != 0 \
+             GROUP BY a.credential_id, a.outcome, t.final_status = 'success'",
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -657,7 +660,8 @@ impl TraceStore {
             Ok((
                 row.get::<_, i64>(0)? as u64,
                 row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)? as u64,
+                row.get::<_, bool>(2)?,
+                row.get::<_, i64>(3)? as u64,
             ))
         });
         let rows = match rows {
@@ -668,8 +672,12 @@ impl TraceStore {
             }
         };
         for r in rows.flatten() {
-            let (cred, outcome_str, cnt) = r;
+            let (cred, outcome_str, trace_recovered, cnt) = r;
             let s = out.entry(cred).or_default();
+            if trace_recovered {
+                s.recovered += cnt;
+                continue;
+            }
             match outcome_str.as_str() {
                 "auth_failed" => s.auth += cnt,
                 "account_throttled" => s.throttle += cnt,
@@ -681,12 +689,18 @@ impl TraceStore {
 }
 
 /// 按凭据的失败分类计数（鉴权 / 账号风控 / 其他）
+///
+/// 三个分类只统计**最终失败**的请求里的失败跳。最终成功的请求（重试或换桶救回）
+/// 单独计入 `recovered`：那些请求客户端拿到了正常响应、也已计入凭据成功数，
+/// 混进失败分类会让「失败」这一栏严重虚高（实测某凭据 3048 里有 2332 是已救回）。
 #[derive(Debug, Default, Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FailureStats {
     pub auth: u64,
     pub throttle: u64,
     pub other: u64,
+    /// 该凭据失败过、但整条请求最终成功的跳数
+    pub recovered: u64,
 }
 
 /// 共享存储句柄
@@ -1124,5 +1138,31 @@ mod tests {
         // LIKE 元字符被转义：% 不再是通配符，不应匹配任何记录
         assert!(ids("%").is_empty(), "% 应按字面量处理");
         assert!(ids("_").is_empty(), "_ 应按字面量处理");
+    }
+    #[test]
+    fn failure_stats_separates_recovered_hops_from_real_failures() {
+        // 同一个凭据（id=9）在两条 trace 里各失败一跳：
+        // 一条最终成功（重试救回），一条最终失败。失败分类只应统计后者。
+        let store = mem_store();
+        store.insert(&sample(TraceSample {
+            trace_id: "recovered",
+            status: "success",
+            credential_id: 9,
+            model: "m",
+        }));
+        store.insert(&sample(TraceSample {
+            trace_id: "failed",
+            status: "error",
+            credential_id: 9,
+            model: "m",
+        }));
+
+        let stats = store.failure_stats();
+        let s = stats.get(&9).expect("凭据 9 应有统计");
+
+        // 两条 trace 各贡献一个 account_throttled 跳，但只有最终失败的那条进 throttle
+        assert_eq!(s.throttle, 1, "最终成功的跳不应计入失败分类");
+        assert_eq!(s.recovered, 1, "最终成功的跳应计入 recovered");
+        assert_eq!(s.auth, 0);
     }
 }

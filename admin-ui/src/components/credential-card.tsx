@@ -88,8 +88,16 @@ interface CredentialCardProps {
   balance: BalanceResponse | null;
   loadingBalance: boolean;
   onRefreshBalance: () => void;
-  /** 该凭据的失败分类计数（来自 trace 聚合）；无数据时回退 totalFailureCount */
-  failureStats?: { auth: number; throttle: number; other: number };
+  /**
+   * 该凭据的失败分类计数（来自 trace 聚合）；无数据时回退 totalFailureCount。
+   * `recovered` 是失败过但整条请求最终成功的跳数，归在成功一侧展示。
+   */
+  failureStats?: {
+    auth: number;
+    throttle: number;
+    other: number;
+    recovered: number;
+  };
   /** 展示形态：卡片（默认）或紧凑列表行 */
   view?: "card" | "list";
   /** 字段排序开启时禁用拖拽调优先级（隐藏拖拽手柄） */
@@ -404,6 +412,7 @@ export function CredentialCard({
   const [showUpdateTokenDialog, setShowUpdateTokenDialog] = useState(false);
   const [showReloginDialog, setShowReloginDialog] = useState(false);
   const [showFailuresDialog, setShowFailuresDialog] = useState(false);
+  const [showRecoveredDialog, setShowRecoveredDialog] = useState(false);
   const [showModelsDialog, setShowModelsDialog] = useState(false);
   const [showBalanceDialog, setShowBalanceDialog] = useState(false);
   const [connectionExpanded, setConnectionExpanded] = useState(false);
@@ -956,7 +965,7 @@ export function CredentialCard({
             type="button"
             onClick={() => setShowFailuresDialog(true)}
             className="mt-0.5 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-xs font-semibold tabular-nums transition-colors hover:bg-accent"
-            title="鉴权失败 / 风控 / 其他。点击查看日志"
+            title="鉴权失败 / 风控 / 其他，仅统计最终失败的请求（重试救回的计入成功侧）。点击查看日志"
           >
             {failureStats ? (
               <span className="tabular-nums font-mono">
@@ -981,19 +990,31 @@ export function CredentialCard({
           </button>
         </div>
 
-        <div className="w-16 text-center">
+        <div className="w-24 text-center">
           <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/80">
             成功
           </div>
-          <button
-            type="button"
-            onClick={handleResetSuccess}
-            className="mt-0.5 inline-flex items-center gap-1 rounded px-1.5 py-0.5 font-mono text-xs font-semibold tabular-nums transition-colors hover:bg-accent hover:text-primary"
-            title="点击重置成功次数"
-          >
-            {credential.successCount}
-            <RotateCcw className="h-3 w-3 opacity-50" />
-          </button>
+          <div className="mt-0.5 inline-flex items-center gap-1">
+            <button
+              type="button"
+              onClick={handleResetSuccess}
+              className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 font-mono text-xs font-semibold tabular-nums transition-colors hover:bg-accent hover:text-primary"
+              title="点击重置成功次数"
+            >
+              {credential.successCount}
+              <RotateCcw className="h-3 w-3 opacity-50" />
+            </button>
+            {failureStats && failureStats.recovered > 0 && (
+              <button
+                type="button"
+                onClick={() => setShowRecoveredDialog(true)}
+                className="rounded px-1 py-0.5 font-mono text-xs tabular-nums text-emerald-600 transition-colors hover:bg-accent dark:text-emerald-400"
+                title="其中重试或换桶救回的次数：这些请求客户端未收到错误，已计入成功数。点击查看明细"
+              >
+                /{failureStats.recovered}
+              </button>
+            )}
+          </div>
         </div>
       </div>
 
@@ -1562,6 +1583,13 @@ export function CredentialCard({
         onOpenChange={setShowFailuresDialog}
         credentialId={credential.id}
         email={credential.email}
+      />
+      <CredentialFailuresDialog
+        open={showRecoveredDialog}
+        onOpenChange={setShowRecoveredDialog}
+        credentialId={credential.id}
+        email={credential.email}
+        mode="recovered"
       />
       <AvailableModelsDialog
         open={showModelsDialog}

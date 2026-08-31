@@ -646,11 +646,18 @@ export interface TracePage {
   total: number
 }
 
-/** 单凭据失败分类计数（鉴权 / 账号风控 / 其他） */
+/**
+ * 单凭据失败分类计数（鉴权 / 账号风控 / 其他）。
+ *
+ * 三个分类只统计最终失败的请求；重试或换桶救回的跳单独计入 `recovered`
+ * ——那些请求客户端拿到了正常响应，也已计入凭据成功数。
+ */
 export interface FailureStats {
   auth: number
   throttle: number
   other: number
+  /** 该凭据失败过、但整条请求最终成功的跳数 */
+  recovered: number
 }
 
 /** credentialId(字符串) → 失败分类计数 */

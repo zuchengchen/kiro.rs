@@ -14,6 +14,11 @@ interface CredentialFailuresDialogProps {
   onOpenChange: (open: boolean) => void;
   credentialId: number;
   email?: string;
+  /**
+   * `failed`（默认）：只看最终失败的请求，对应卡片「失败」栏。
+   * `recovered`：只看最终成功的请求，对应卡片成功栏里的「已救回」。
+   */
+  mode?: "failed" | "recovered";
 }
 
 /** 失败分类 → 中文标签 + Badge 颜色 */
@@ -56,30 +61,56 @@ export function CredentialFailuresDialog({
   onOpenChange,
   credentialId,
   email,
+  mode = "failed",
 }: CredentialFailuresDialogProps) {
+  const recoveredOnly = mode === "recovered";
   const { data, isLoading } = useTraces(
-    { failedAttemptCredentialId: credentialId, limit: 50 },
+    {
+      failedAttemptCredentialId: credentialId,
+      // 已救回视图只看最终成功的请求；失败视图不限定状态，由下方按最终状态过滤，
+      // 这样两个视图合起来正好覆盖该凭据的全部失败跳，不重不漏。
+      status: recoveredOnly ? "success" : undefined,
+      limit: 50,
+    },
     open,
   );
   const records = data?.records ?? [];
   // 摊平：同一请求里该凭据失败了几跳就显示几条（按时间倒序）
-  const failedHops = records.flatMap((rec) =>
-    rec.attempts
-      .filter((a) => a.credentialId === credentialId && a.outcome !== "success")
-      .map((a) => ({ rec, attempt: a })),
-  );
+  const failedHops = records
+    .filter((rec) =>
+      recoveredOnly ? rec.finalStatus === "success" : rec.finalStatus !== "success",
+    )
+    .flatMap((rec) =>
+      rec.attempts
+        .filter(
+          (a) => a.credentialId === credentialId && a.outcome !== "success",
+        )
+        .map((a) => ({ rec, attempt: a })),
+    );
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-2xl">
         <DialogHeader>
-          <DialogTitle>失败尝试详情</DialogTitle>
+          <DialogTitle>
+            {recoveredOnly ? "已救回的尝试" : "失败尝试详情"}
+          </DialogTitle>
           <DialogDescription>
-            {email || `凭据 #${credentialId}`} 最近失败的
-            <span className="font-medium text-foreground">单次尝试</span>
-            （最多 50 条请求，一个请求失败几跳就列几条）。带「最终成功」标记的表示
-            该请求已重试成功、客户端未收到错误，并已计入成功数——瞬态限流不计入
-            凭据失败数。
+            {recoveredOnly ? (
+              <>
+                {email || `凭据 #${credentialId}`} 上失败过、但整条请求
+                <span className="font-medium text-foreground">最终成功</span>
+                的单次尝试（最多 50 条请求）。客户端未收到错误，这些请求已计入
+                成功数，不计入失败数。
+              </>
+            ) : (
+              <>
+                {email || `凭据 #${credentialId}`} 上
+                <span className="font-medium text-foreground">最终失败</span>
+                请求里的单次尝试（最多 50 条请求，一个请求失败几跳就列几条）。
+                重试或换桶救回的尝试不在此处，见成功栏的「已救回」。
+              </>
+            )}
           </DialogDescription>
         </DialogHeader>
         <div className="max-h-[60vh] space-y-2 overflow-y-auto">
@@ -89,7 +120,9 @@ export function CredentialFailuresDialog({
             </div>
           ) : failedHops.length === 0 ? (
             <div className="py-6 text-center text-sm text-muted-foreground">
-              该凭据暂无失败尝试（trace 关闭或近期无失败）。
+              {recoveredOnly
+                ? "该凭据近期没有被救回的失败尝试。"
+                : "该凭据暂无最终失败的尝试（trace 关闭或近期无失败）。"}
             </div>
           ) : (
             failedHops.map(({ rec, attempt }) => (
