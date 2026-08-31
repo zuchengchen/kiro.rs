@@ -1368,14 +1368,37 @@ impl KiroProvider {
                         body
                     ))
                 };
+
+                // 给当前凭据打一个短冷却，让下一轮取号换到别的凭据。
+                //
+                // 不这样做的话，瞬态分支只重试、不改动任何调度状态，下一轮
+                // select_next_credential 的输入完全没变、必然重新选中同一个凭据：
+                // 实测一次请求 4 跳全撞在同一个号的同一个桶上，而池里另一个号有
+                // 充足额度却一次没被用到。换号后端点也随之重选，等于同时换了桶。
+                //
+                // 冷却时长取本次退避时长：既保证这一跳之后该凭据被跳过，也不会在
+                // 请求结束后继续影响调度。单凭据池同样打冷却，由 AcquireWaitBudget
+                // 的内部等待吸收，不会因此直接失败。
+                let backoff = if status.as_u16() == 429 {
+                    Self::retry_delay_throttle(attempt)
+                } else {
+                    Self::retry_delay(attempt)
+                };
+                let others_available = self
+                    .token_manager
+                    .report_transient_throttle_for_request(
+                        ctx.id,
+                        backoff,
+                        model.as_deref(),
+                        group,
+                    );
+
                 if attempt + 1 < max_retries {
-                    // 429 限流用更长退避给账号配额恢复时间；408/5xx 仍用通用快速退避
-                    let delay = if status.as_u16() == 429 {
-                        Self::retry_delay_throttle(attempt)
-                    } else {
-                        Self::retry_delay(attempt)
-                    };
-                    sleep(delay).await;
+                    // 还有别的凭据可用时立即换号重试，不必等退避：退避是为了给
+                    // 「同一个」凭据的配额留恢复时间，换号则没有等待的理由。
+                    if others_available == 0 {
+                        sleep(backoff).await;
+                    }
                 }
                 continue;
             }

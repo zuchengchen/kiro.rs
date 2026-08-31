@@ -3490,6 +3490,57 @@ impl MultiTokenManager {
         }
     }
 
+    /// 瞬态限流（429/5xx）后给该凭据打一个**短冷却**，让下一轮取号换到别的凭据。
+    ///
+    /// 与 [`Self::report_account_throttled_for_request`] 的区别：
+    /// - 不计 `total_failure_count`（这不是凭据的错，是上游桶在限流）
+    /// - 冷却极短（秒级），只为把本次请求的下一跳挤到其他凭据上
+    ///
+    /// 为什么需要它：瞬态分支原本只重试不动调度状态，于是下一轮 `select_next_credential`
+    /// 的输入完全没变、必然重新选中同一个凭据——实测一次请求 4 跳全撞在同一个号的
+    /// 同一个桶上，而池里另一个号有充足额度却一次没被用到。
+    ///
+    /// 只有一个可用凭据时冷却同样生效，但由 `AcquireWaitBudget` 的内部等待吸收，
+    /// 不会因此直接失败。
+    ///
+    /// 返回打上冷却后仍可用于本请求的凭据数。
+    pub fn report_transient_throttle_for_request(
+        &self,
+        id: u64,
+        cooldown: StdDuration,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> usize {
+        let now = Instant::now();
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            let until = now + cooldown;
+            entry.throttled_until = Some(match entry.throttled_until {
+                Some(prev) if prev > until => prev,
+                _ => until,
+            });
+            tracing::debug!(
+                "凭据 #{} 上游瞬态限流，短冷却 {:?} 以便本次请求换号",
+                id,
+                cooldown
+            );
+        }
+
+        // 与 report_account_throttled_for_request 同样手写过滤条件，而不是复用
+        // entry_available_for_request：后者会取 model_cache 锁，在持有 entries
+        // 锁时叠加第二把锁没有必要，也给未来留下锁序隐患。
+        let after = Instant::now();
+        entries
+            .iter()
+            .filter(|e| {
+                !e.disabled
+                    && !e.throttled_until.map(|t| t > after).unwrap_or(false)
+                    && !self.rpm_exceeded(e, after)
+                    && credential_matches_request(&e.credentials, model, group)
+            })
+            .count()
+    }
+
     /// 手动解除指定凭据的临时冷却（Admin API）
     ///
     /// 即使冷却尚未到期也立即清除，让该凭据重新参与调度。
@@ -6016,6 +6067,72 @@ mod tests {
 
         drop(manager);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn transient_throttle_switches_to_another_credential() {
+        // 核心诉求：高优先级凭据被上游限流后，下一次取号必须换到别的凭据，
+        // 即使那个凭据优先级更低。此前瞬态分支不动调度状态，会连撞同一个号。
+        let first = KiroCredentials {
+            access_token: Some("first-token".to_string()),
+            expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
+            priority: 0,
+            ..KiroCredentials::default()
+        };
+        let second = KiroCredentials {
+            access_token: Some("second-token".to_string()),
+            expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
+            priority: 9, // 明显更低的优先级
+            ..KiroCredentials::default()
+        };
+        let mgr = MultiTokenManager::new(
+            Config::default(),
+            vec![first, second],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // 正常情况下优先选 priority 更高（数字更小）的 #1
+        assert_eq!(mgr.acquire_context(None, None).await.unwrap().id, 1);
+
+        // #1 被瞬态限流 → 仍有 #2 可用
+        let remaining = mgr.report_transient_throttle_for_request(
+            1,
+            StdDuration::from_secs(5),
+            None,
+            None,
+        );
+        assert_eq!(remaining, 1, "打冷却后应还剩 #2 可用");
+
+        // 下一次取号必须换到低优先级的 #2，而不是继续撞 #1
+        assert_eq!(
+            mgr.acquire_context(None, None).await.unwrap().id,
+            2,
+            "高优先级凭据限流后应切到低优先级凭据"
+        );
+
+        // 瞬态限流不是凭据的错：不计失败数、不禁用
+        let snap = mgr.snapshot();
+        let e1 = snap.entries.iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(e1.total_failure_count, 0, "瞬态限流不应计入失败数");
+        assert!(!e1.disabled);
+    }
+
+    #[tokio::test]
+    async fn transient_throttle_on_sole_credential_reports_zero_available() {
+        // 只有一个凭据时冷却同样生效，返回 0 让调用方知道无处可换——
+        // 该等待由 AcquireWaitBudget 吸收，不应直接失败。
+        let mgr = offline_manager(Config::default());
+        let id = mgr.snapshot().current_id;
+        let remaining = mgr.report_transient_throttle_for_request(
+            id,
+            StdDuration::from_secs(1),
+            None,
+            None,
+        );
+        assert_eq!(remaining, 0);
     }
 
     #[test]
