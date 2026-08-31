@@ -1569,22 +1569,16 @@ pub async fn list_traces(
 }
 
 /// GET /api/admin/traces/failure-stats
-/// 按凭据聚合失败次数（鉴权 / 账号风控 / 其他三类），用于卡片分色展示。
-/// 返回 { "<credentialId>": { auth, throttle, other }, ... }
+/// 按凭据聚合失败跳（鉴权 / 账号风控 / 其他三类），用于卡片分色展示。
+/// 三类只统计最终失败的请求；重试或换桶救回的跳单独放在 `recovered`。
+/// 返回 { "<credentialId>": { auth, throttle, other, recovered }, ... }
 pub async fn trace_failure_stats(State(state): State<AdminState>) -> impl IntoResponse {
-    let stats = state.trace_store.failure_stats();
-    let map: std::collections::HashMap<String, serde_json::Value> = stats
+    // 直接序列化 FailureStats（camelCase），避免手工列字段时漏掉新增项。
+    let map: std::collections::HashMap<String, _> = state
+        .trace_store
+        .failure_stats()
         .into_iter()
-        .map(|(id, s)| {
-            (
-                id.to_string(),
-                serde_json::json!({
-                    "auth": s.auth,
-                    "throttle": s.throttle,
-                    "other": s.other,
-                }),
-            )
-        })
+        .map(|(id, s)| (id.to_string(), s))
         .collect();
     Json(map)
 }
