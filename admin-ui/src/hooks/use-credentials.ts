@@ -3,6 +3,7 @@ import {
   getCredentials,
   setCredentialDisabled,
   setCredentialPriority,
+  setCredentialMaxCredits,
   resetCredentialFailure,
   forceRefreshToken,
   clearThrottle,
@@ -130,6 +131,23 @@ export function useSetPriority() {
   return useMutation({
     mutationFn: ({ id, priority }: { id: number; priority: number }) =>
       setCredentialPriority(id, priority),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 设置 / 清除账号的周期积分上限（null = 不限制）
+export function useSetMaxCredits() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      id,
+      maxCycleCredits,
+    }: {
+      id: number
+      maxCycleCredits: number | null
+    }) => setCredentialMaxCredits(id, maxCycleCredits),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },

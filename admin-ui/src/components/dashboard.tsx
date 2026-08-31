@@ -235,6 +235,9 @@ const DEV_PREVIEW_CREDENTIAL: CredentialStatusItem = {
   machineCycleCalls: 402,
   otherMachineCredits: 66,
   otherMachineExact: true,
+  // 预览里展示「已设上限且接近用满」的形态（120.5 / 150 = 80%）
+  maxCycleCredits: 150,
+  creditsExhausted: false,
 };
 
 // 字段排序：'manual' = 服务端顺序（保留拖拽调优先级）；其余字段选中后拖拽自动禁用

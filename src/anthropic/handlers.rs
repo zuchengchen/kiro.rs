@@ -341,6 +341,30 @@ pub(super) fn map_provider_error(err: Error) -> Response {
         return response;
     }
 
+    // 所有账号都用满了管理员设置的周期积分上限：本地策略拒绝。
+    // 必须带 Retry-After —— 丢了客户端会立即重试，把一次上限拒绝放大成持续风暴。
+    if let Some(credit_limit) =
+        err.downcast_ref::<crate::kiro::error::CreditLimitReachedError>()
+    {
+        tracing::warn!(error = %err, "账号积分上限已用满（映射为 429）");
+        let mut response = (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorResponse::new(
+                "rate_limit_error",
+                &credit_limit.to_string(),
+            )),
+        )
+            .into_response();
+        if let Ok(value) = credit_limit
+            .retry_after_secs()
+            .to_string()
+            .parse::<header::HeaderValue>()
+        {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        return response;
+    }
+
     let err_str = err.to_string();
 
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
@@ -2288,6 +2312,41 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(resp.headers().get(header::RETRY_AFTER).is_none());
+    }
+
+    #[test]
+    fn credit_limit_maps_to_429_with_retry_after() {
+        let err = crate::kiro::error::CreditLimitReachedError::new(
+            "所有可用凭据均已达到本周期积分上限".to_string(),
+            Some(600),
+        );
+        let resp = map_provider_error(err.into());
+
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        // 必须带 Retry-After，否则客户端会立即重试
+        assert_eq!(resp.headers().get(header::RETRY_AFTER).unwrap(), "600");
+    }
+
+    #[test]
+    fn credit_limit_without_known_reset_still_sets_retry_after() {
+        let err = crate::kiro::error::CreditLimitReachedError::new("上限已满".to_string(), None);
+        let resp = map_provider_error(err.into());
+
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        // 未知重置时刻时回退到 1 小时，而不是省略头部
+        assert_eq!(resp.headers().get(header::RETRY_AFTER).unwrap(), "3600");
+    }
+
+    #[test]
+    fn credit_limit_clamps_far_future_reset() {
+        // 计费周期可能还剩好几天；Retry-After 压到 1 小时，
+        // 避免周期翻转后客户端仍长时间不回来
+        let err = crate::kiro::error::CreditLimitReachedError::new(
+            "上限已满".to_string(),
+            Some(15 * 86_400),
+        );
+        let resp = map_provider_error(err.into());
+        assert_eq!(resp.headers().get(header::RETRY_AFTER).unwrap(), "3600");
     }
 
     #[tokio::test]

@@ -235,6 +235,24 @@ async fn main() {
             );
         }
     }
+    // 把周期用量推给调度层，供每个账号的 maxCycleCredits 判断使用。
+    //
+    // 必须在播种之后注册：set_usage_sink 会立即推一次当前值，放在播种之前的话推的是
+    // 空表，已超限的账号会漏放请求，直到下一次 add 才被挡住。
+    {
+        let tm = token_manager.clone();
+        // 用 Weak 而不是 Arc：sink 存在 credit_total 内部，持强引用会形成
+        // Arc 自引用循环，counter 永远不会被释放。
+        let ct = std::sync::Arc::downgrade(&credit_total);
+        credit_total.set_usage_sink(std::sync::Arc::new(move |usage| {
+            tm.set_cycle_credit_usage(usage);
+            // 周期重置时刻用于全部超限时的 Retry-After，随用量一起同步
+            if let Some(ct) = ct.upgrade() {
+                tm.set_cycle_reset_times(ct.cycle_reset_map());
+            }
+        }));
+    }
+
     // 账号分组注册表（持久化到 groups.json）。
     // 启动时若文件不存在则首次创建，并把现有凭据 / 客户端 Key 的 groups 字段反向迁移进去，
     // 保证老用户升级后所有已用分组都自动注册，不会因为本次改造而消失。

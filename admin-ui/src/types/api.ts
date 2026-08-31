@@ -127,6 +127,13 @@ export interface CredentialStatusItem {
    * （刚启用统计 / 从历史日志播种），差值只是上界，应展示为「至多」。
    */
   otherMachineExact: boolean
+  /**
+   * 本机每计费周期的积分上限；undefined 表示不限制（默认）。
+   * 达到后该账号被排除出调度，下个计费周期自动恢复。
+   */
+  maxCycleCredits?: number
+  /** 是否已达本周期上限（已被排除出调度） */
+  creditsExhausted: boolean
 }
 
 // 余额响应

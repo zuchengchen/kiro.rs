@@ -811,6 +811,8 @@ impl AdminService {
                     other_machine_exact: machine
                         .map(|m| m.cycle_from_start || m.cycle_calls == 0)
                         .unwrap_or(true),
+                    max_cycle_credits: entry.max_cycle_credits,
+                    credits_exhausted: entry.credits_exhausted,
                 }
             })
             .collect();
@@ -1464,6 +1466,7 @@ impl AdminService {
             proxy_password: req.proxy_password,
             disabled: false, // 新添加的凭据默认启用
             disabled_reason: None,
+            max_cycle_credits: None, // 默认不限制积分
             self_heal_consecutive_rounds: 0,
             self_heal_total_count: 0,
             last_self_heal_at: None,
@@ -1605,6 +1608,25 @@ impl AdminService {
                     .map(|v| if v.is_empty() { None } else { Some(v) }),
                 req.metadata,
             )
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 设置或清除单个凭据的周期积分上限。`None` 表示取消限制。
+    pub fn set_credential_max_credits(
+        &self,
+        id: u64,
+        limit: Option<f64>,
+    ) -> Result<(), AdminServiceError> {
+        if let Some(v) = limit {
+            if !v.is_finite() || v < 0.0 {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "maxCycleCredits 必须是非负数: {}",
+                    v
+                )));
+            }
+        }
+        self.token_manager
+            .set_max_cycle_credits(id, limit)
             .map_err(|e| self.classify_error(e, id))
     }
 

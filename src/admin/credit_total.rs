@@ -18,6 +18,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -97,11 +98,21 @@ pub struct CreditTotalSnapshot {
 /// 共享句柄（Anthropic 路由与 Admin 路由共用同一个实例）
 pub type SharedCreditTotal = std::sync::Arc<CreditTotal>;
 
+/// 用量变化时的通知回调（把周期用量推给调度层，用于积分上限判断）
+///
+/// 用 `Arc` 而不是 `Box`：`notify_usage` 需要先克隆出回调、放掉 `usage_sink` 锁，
+/// 再调用它。持锁调用第三方闭包等于把未知代码放进临界区，回调里任何一条回到本类型的
+/// 路径都会死锁。
+pub type UsageSink = Arc<dyn Fn(HashMap<u64, f64>) + Send + Sync>;
+
 /// 单调累计计数器
 pub struct CreditTotal {
     inner: Mutex<State>,
     /// None 表示纯内存模式（无 cache_dir / 测试）
     path: Option<PathBuf>,
+    /// 周期用量变化时的订阅者。用回调而不是定时轮询：积分上限必须在超限后的
+    /// 下一个请求就生效，轮询间隔内会漏放请求。
+    usage_sink: Mutex<Option<UsageSink>>,
 }
 
 struct State {
@@ -145,7 +156,32 @@ impl CreditTotal {
                 last_save_at: None,
             }),
             path: None,
+            usage_sink: Mutex::new(None),
         }
+    }
+
+    /// 注册周期用量订阅者，并立即推送一次当前值
+    ///
+    /// 立即推送很重要：进程刚启动时调度层的快照是空的，若等第一个请求结束才推送，
+    /// 已经超限的账号会漏放一个请求。
+    pub fn set_usage_sink(&self, sink: UsageSink) {
+        let snapshot = self.cycle_usage_map();
+        sink(snapshot);
+        *self.usage_sink.lock() = Some(sink);
+    }
+
+    /// 把当前周期用量推给订阅者
+    ///
+    /// 必须在释放 `inner` 锁之后调用：`cycle_usage_map` 会再次获取 `inner`，
+    /// 且回调本身要拿调度层的锁，持锁调用等于把两把锁嵌在一起。
+    fn notify_usage(&self) {
+        // 先克隆出回调并立刻放锁：回调内部会调用 cycle_usage_map / cycle_reset_map，
+        // 这些又要拿 inner 锁；持 usage_sink 锁调用它没有直接死锁，但把未知代码留在
+        // 临界区里，将来任何一条回到 set_usage_sink 的路径都会自锁。
+        let Some(sink) = self.usage_sink.lock().clone() else {
+            return;
+        };
+        sink(self.cycle_usage_map());
     }
 
     /// 从 `dir/credit_total.json` 载入；文件缺失或损坏时从 0 起算并允许播种
@@ -237,6 +273,9 @@ impl CreditTotal {
         // loaded 置真：此后不再接受播种，避免重放历史把实时增量冲掉
         state.loaded = true;
         self.save_locked(&mut state, false);
+        drop(state);
+        // 出锁后再推送：积分上限要在下一个请求就生效
+        self.notify_usage();
     }
 
     /// 记录某个凭据本周期的重置时刻（来自余额查询的 `nextResetAt`）
@@ -273,7 +312,29 @@ impl CreditTotal {
         if changed {
             state.dirty = true;
             self.save_locked(&mut state, true);
+            drop(state);
+            // 周期翻转会把用量归零 → 必须让调度层立刻解除限制
+            self.notify_usage();
         }
+    }
+
+    /// 各凭据本周期已消耗积分（id → cycle_credits），供调度层判断积分上限
+    ///
+    /// 与 [`Self::by_credential`] 一样在读取时结算过期周期，保证上限判断不会用旧周期的
+    /// 数字把账号错误地挡住。
+    pub fn cycle_usage_map(&self) -> HashMap<u64, f64> {
+        self.by_credential()
+            .into_iter()
+            .map(|(id, v)| (id, v.cycle_credits))
+            .collect()
+    }
+
+    /// 各凭据的周期重置时刻（id → Unix 秒），用于生成积分上限拒绝时的 `Retry-After`
+    pub fn cycle_reset_map(&self) -> HashMap<u64, f64> {
+        self.by_credential()
+            .into_iter()
+            .filter_map(|(id, v)| v.cycle_reset_at.map(|r| (id, r)))
+            .collect()
     }
 
     /// 全部凭据的累计量（一次加锁取完，避免 N 个凭据 N 次加锁）
@@ -309,6 +370,8 @@ impl CreditTotal {
         state.dirty = true;
         // 立即落盘：删除是低频操作，不值得等去抖窗口
         self.save_locked(&mut state, true);
+        drop(state);
+        self.notify_usage();
     }
 
     /// 首次启用时用现存历史播种

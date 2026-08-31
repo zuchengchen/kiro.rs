@@ -359,6 +359,28 @@ pub async fn delete_credential(
     }
 }
 
+/// POST /api/admin/credentials/:id/max-credits
+/// 设置或清除该账号每计费周期的积分上限。body: { "maxCycleCredits": <number|null> }
+pub async fn set_credential_max_credits(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<super::types::SetCredentialMaxCreditsRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .set_credential_max_credits(id, payload.max_cycle_credits)
+    {
+        Ok(_) => {
+            let msg = match payload.max_cycle_credits {
+                Some(v) => format!("凭据 #{} 周期积分上限已设为 {:.2}", id, v),
+                None => format!("凭据 #{} 已取消积分上限", id),
+            };
+            Json(SuccessResponse::new(msg)).into_response()
+        }
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// PUT /api/admin/credentials/:id
 /// 更新凭据可编辑字段（email、proxy 等）
 pub async fn update_credential(

@@ -19,6 +19,7 @@ import type { RailTone } from './rail'
 export type CredentialState =
   | 'current' // 当前优先，正在服务
   | 'throttled' // 账号级风控冷却中，会自行恢复
+  | 'creditCapped' // 达到管理员设的周期积分上限，下个周期自动恢复
   | 'quotaDisabled' // 因超额被禁用
   | 'quotaExceeded' // 已超额但仍启用
   | 'authFailed' // 鉴权 / token 失效类禁用
@@ -36,6 +37,7 @@ export type DispositionAction =
   | 'enable'
   | 'refreshToken'
   | 'viewFailures'
+  | 'editCreditLimit'
   | 'none'
 
 export interface CredentialDisposition {
@@ -148,6 +150,19 @@ export function getDisposition(
     }
   }
 
+  // 达到管理员设的周期积分上限：已被排除出调度，但下个计费周期自动恢复。
+  // 排在超额之前，因为这是该账号当前"不被选中"的真正原因；也用 cool 而非 warn ——
+  // 这是主动设定的策略生效，不是故障。
+  if (c.creditsExhausted) {
+    return {
+      state: 'creditCapped',
+      tone: 'cool',
+      stateLabel: '已达周期积分上限',
+      actionLabel: '调整上限',
+      action: 'editCreditLimit',
+    }
+  }
+
   if (isQuotaExceeded(balance)) {
     return {
       state: 'quotaExceeded',
@@ -221,7 +236,10 @@ export function countByState(
       case 'refreshFailing':
         counts.healthy += 1
         break
+      // 积分上限与风控冷却归为一类：都是"暂时不参与调度、会自动恢复"，
+      // 不能落到 dead（那会让状态条把主动限流误报成故障账号）
       case 'throttled':
+      case 'creditCapped':
         counts.throttled += 1
         break
       case 'quotaExceeded':
@@ -250,7 +268,7 @@ export function matchesStateFilter(
     case 'healthy':
       return state === 'healthy' || state === 'current' || state === 'refreshFailing'
     case 'throttled':
-      return state === 'throttled'
+      return state === 'throttled' || state === 'creditCapped'
     case 'quota':
       return state === 'quotaExceeded' || state === 'quotaDisabled'
     case 'dead':

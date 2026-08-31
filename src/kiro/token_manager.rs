@@ -1131,6 +1131,12 @@ pub struct CredentialEntrySnapshot {
     /// 凭据添加（创建）时间（RFC3339 格式）；旧凭据缺失时为 None
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
+    /// 本机每计费周期积分上限；None 表示不限制
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cycle_credits: Option<f64>,
+    /// 是否已用满本周期上限（已被排除出调度）
+    #[serde(default)]
+    pub credits_exhausted: bool,
 }
 
 /// 凭据管理器状态快照
@@ -1180,6 +1186,13 @@ pub struct MultiTokenManager {
     entries: Mutex<Vec<CredentialEntry>>,
     /// Admin 服务最近一次成功刷新到的剩余额度快照（不持久化到凭据文件）。
     balance_snapshots: Mutex<HashMap<u64, BalanceSnapshot>>,
+    /// 各账号本计费周期内本机已消耗的积分快照（由 Admin 侧的累计计数器推送）。
+    ///
+    /// 与 `balance_snapshots` 同理：数据归属 Admin 层，这里只读一份内存副本用于
+    /// `max_cycle_credits` 的调度判断，不写回凭据文件。
+    cycle_credit_usage: Mutex<HashMap<u64, f64>>,
+    /// 各账号计费周期的重置时刻（Unix 秒），仅用于生成 `Retry-After`。
+    cycle_reset_times: Mutex<HashMap<u64, f64>>,
     /// 当前活动凭据 ID
     current_id: Mutex<u64>,
     /// 下一个待分配凭据 ID。进程内单调递增，避免删除账号后新账号复用旧 ID，
@@ -1348,6 +1361,21 @@ struct BalanceSnapshot {
 
 /// 余额缓存与账号调度使用同一 TTL；过期数据不能影响账号选择。
 const BALANCE_SNAPSHOT_TTL_SECS: f64 = 300.0;
+
+/// 账号是否已用满本周期积分上限
+///
+/// 拆成自由函数，让「持 entries 锁批量过滤」和「单条判断」共用同一套规则，
+/// 避免两处判定逻辑漂移。`max_cycle_credits` 为 None（默认）时恒为 false。
+fn credits_exhausted(entry: &CredentialEntry, usage: &HashMap<u64, f64>) -> bool {
+    let Some(limit) = entry.credentials.max_cycle_credits else {
+        return false;
+    };
+    // 非法上限视为未设置，避免脏配置把账号永久锁死
+    if !limit.is_finite() || limit < 0.0 {
+        return false;
+    }
+    usage.get(&entry.id).copied().unwrap_or(0.0) >= limit
+}
 
 fn fresh_balance_remaining(
     snapshots: &HashMap<u64, BalanceSnapshot>,
@@ -1525,6 +1553,8 @@ impl MultiTokenManager {
             proxy: Mutex::new(proxy),
             entries: Mutex::new(entries),
             balance_snapshots: Mutex::new(HashMap::new()),
+            cycle_credit_usage: Mutex::new(HashMap::new()),
+            cycle_reset_times: Mutex::new(HashMap::new()),
             current_id: Mutex::new(initial_id),
             next_id: AtomicU64::new(next_id),
             refresh_lock: TokioMutex::new(()),
@@ -1610,6 +1640,67 @@ impl MultiTokenManager {
     /// 清除一个账号的额度快照（删除账号、切换身份或余额失效时调用）。
     pub fn clear_balance_snapshot(&self, id: u64) {
         self.balance_snapshots.lock().remove(&id);
+    }
+
+    /// 全量替换「本周期本机已消耗积分」快照，供 `max_cycle_credits` 判断使用。
+    ///
+    /// 全量替换而非增量更新：计数器在周期翻转时会把某些账号归零，增量更新无法表达
+    /// 「这个账号的用量变小了」。
+    pub fn set_cycle_credit_usage(&self, usage: HashMap<u64, f64>) {
+        *self.cycle_credit_usage.lock() = usage
+            .into_iter()
+            .filter(|(_, v)| v.is_finite() && *v > 0.0)
+            .collect();
+    }
+
+    /// 记录各账号计费周期的重置时刻（Unix 秒），用于生成 `Retry-After`。
+    pub fn set_cycle_reset_times(&self, resets: HashMap<u64, f64>) {
+        *self.cycle_reset_times.lock() = resets
+            .into_iter()
+            .filter(|(_, v)| v.is_finite() && *v > 0.0)
+            .collect();
+    }
+
+    /// 距离最近一个账号的周期重置还有多少秒；无已知重置时刻时返回 None。
+    fn earliest_cycle_reset_in_secs(&self) -> Option<u64> {
+        let now = Utc::now().timestamp() as f64;
+        self.cycle_reset_times
+            .lock()
+            .values()
+            .filter(|&&reset| reset > now)
+            .map(|&reset| (reset - now).ceil() as u64)
+            .min()
+    }
+
+    /// 该账号是否已用满本周期的积分上限
+    ///
+    /// 未设上限（默认）时恒为 false。上限为 0 视为「禁止使用」。
+    fn cycle_credits_exhausted(&self, entry: &CredentialEntry) -> bool {
+        // 提前判空，避免未设上限的常见路径也去拿一次锁
+        if entry.credentials.max_cycle_credits.is_none() {
+            return false;
+        }
+        let usage = self.cycle_credit_usage.lock();
+        credits_exhausted(entry, &usage)
+    }
+
+    /// 设置或清除某个账号的周期积分上限。`None` 表示取消限制。
+    pub fn set_max_cycle_credits(&self, id: u64, limit: Option<f64>) -> anyhow::Result<()> {
+        if let Some(v) = limit {
+            if !v.is_finite() || v < 0.0 {
+                anyhow::bail!("积分上限必须是非负有限数: {}", v);
+            }
+        }
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.max_cycle_credits = limit;
+        }
+        self.persist_credentials()?;
+        Ok(())
     }
 
     /// 串行执行一次 config.json 读改写，供所有 Admin 运行时配置入口复用。
@@ -1925,10 +2016,16 @@ impl MultiTokenManager {
     /// 获取可用凭据数量
     pub fn available_count(&self) -> usize {
         let now = Instant::now();
+        // 先取用量快照再拿 entries 锁：与 entry_available_for_request 的加锁顺序保持一致
+        let usage = self.cycle_credit_usage.lock().clone();
         self.entries
             .lock()
             .iter()
-            .filter(|e| !e.disabled && !e.throttled_until.map(|t| t > now).unwrap_or(false))
+            .filter(|e| {
+                !e.disabled
+                    && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                    && !credits_exhausted(e, &usage)
+            })
             .count()
     }
 
@@ -1945,6 +2042,7 @@ impl MultiTokenManager {
                 .map(|until| until > now)
                 .unwrap_or(false)
             && !self.rpm_exceeded(entry, now)
+            && !self.cycle_credits_exhausted(entry)
             && credential_matches_request(&entry.credentials, model, group)
             && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
     }
@@ -2315,6 +2413,30 @@ impl MultiTokenManager {
                     // 因为 available_count() 会尝试获取 entries 锁，
                     // 而此时我们已经持有该锁，会导致死锁
                     let available = entries.iter().filter(|e| !e.disabled).count();
+                    // 区分「积分上限用满」和「凭据被禁用」：前者是管理员主动设的策略，
+                    // 下个计费周期自动恢复，错误信息必须说清楚，否则会被当成账号故障排查。
+                    //
+                    // cycle_credit_usage 是另一把锁（此处只持有 entries），加锁顺序与
+                    // available_count / snapshot 一致，不构成环路。
+                    let usage = self.cycle_credit_usage.lock();
+                    let exhausted = entries
+                        .iter()
+                        .filter(|e| !e.disabled && credits_exhausted(e, &usage))
+                        .count();
+                    drop(usage);
+                    if exhausted > 0 {
+                        // 用类型化错误上抛，让 handler 映射成 429 + Retry-After。
+                        // 普通 bail! 会落到通用 502，客户端会立刻重试。
+                        return Err(anyhow::Error::new(
+                            crate::kiro::error::CreditLimitReachedError::new(
+                                format!(
+                                    "所有可用凭据均已达到本周期积分上限（{} 个受限 / 启用 {}，共 {}），下个计费周期自动恢复",
+                                    exhausted, available, total
+                                ),
+                                self.earliest_cycle_reset_in_secs(),
+                            ),
+                        ));
+                    }
                     anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
                 };
 
@@ -3336,12 +3458,18 @@ impl MultiTokenManager {
 
     /// 获取管理器状态快照（用于 Admin API）
     pub fn snapshot(&self) -> ManagerSnapshot {
+        // 与 available_count 一致的加锁顺序：先 cycle_credit_usage 再 entries
+        let usage = self.cycle_credit_usage.lock().clone();
         let entries = self.entries.lock();
         let current_id = *self.current_id.lock();
         let now = Instant::now();
         let available = entries
             .iter()
-            .filter(|e| !e.disabled && !e.throttled_until.map(|t| t > now).unwrap_or(false))
+            .filter(|e| {
+                !e.disabled
+                    && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                    && !credits_exhausted(e, &usage)
+            })
             .count();
 
         ManagerSnapshot {
@@ -3409,6 +3537,8 @@ impl MultiTokenManager {
                     source_channel: e.credentials.source_channel.clone(),
                     metadata: e.credentials.metadata.clone(),
                     created_at: e.credentials.created_at.clone(),
+                    max_cycle_credits: e.credentials.max_cycle_credits,
+                    credits_exhausted: credits_exhausted(e, &usage),
                 })
                 .collect(),
             current_id,
@@ -4974,6 +5104,145 @@ mod tests {
             ..KiroCredentials::default()
         };
         MultiTokenManager::new(config, vec![cred], None, None, true).unwrap()
+    }
+
+    /// 构造两个凭据的 manager，用于验证积分上限的排除 / 故障转移行为。
+    fn credit_limit_manager(limits: [Option<f64>; 2]) -> MultiTokenManager {
+        let creds: Vec<KiroCredentials> = limits
+            .iter()
+            .enumerate()
+            .map(|(i, limit)| KiroCredentials {
+                id: Some(i as u64 + 1),
+                refresh_token: Some(format!("refresh-token-{}", "x".repeat(24))),
+                access_token: Some("access-token".to_string()),
+                // 远期过期时间，避免测试里触发 Token 刷新
+                expires_at: Some("2099-01-01T00:00:00Z".to_string()),
+                max_cycle_credits: *limit,
+                ..KiroCredentials::default()
+            })
+            .collect();
+        MultiTokenManager::new(Config::default(), creds, None, None, true).unwrap()
+    }
+
+    #[test]
+    fn no_credit_limit_by_default_keeps_every_account_available() {
+        let mgr = credit_limit_manager([None, None]);
+        // 默认不限制：即便记了用量也不该排除任何账号
+        mgr.set_cycle_credit_usage(HashMap::from([(1, 9_999.0), (2, 9_999.0)]));
+        assert_eq!(mgr.available_count(), 2);
+        assert_eq!(mgr.snapshot().available, 2);
+    }
+
+    #[test]
+    fn reaching_the_limit_excludes_only_that_account() {
+        let mgr = credit_limit_manager([Some(10.0), None]);
+        mgr.set_cycle_credit_usage(HashMap::from([(1, 10.0)]));
+
+        // #1 用满 → 排除；#2 无上限 → 仍可用，请求可故障转移过去
+        assert_eq!(mgr.available_count(), 1);
+        let snap = mgr.snapshot();
+        assert_eq!(snap.available, 1);
+        let e1 = snap.entries.iter().find(|e| e.id == 1).unwrap();
+        let e2 = snap.entries.iter().find(|e| e.id == 2).unwrap();
+        assert!(e1.credits_exhausted, "#1 应标记为已达上限");
+        assert_eq!(e1.max_cycle_credits, Some(10.0));
+        assert!(!e2.credits_exhausted);
+        // 达到上限不等于被禁用：状态要能区分，否则运维会当成账号故障
+        assert!(!e1.disabled);
+    }
+
+    #[test]
+    fn usage_below_the_limit_stays_available() {
+        let mgr = credit_limit_manager([Some(10.0), None]);
+        mgr.set_cycle_credit_usage(HashMap::from([(1, 9.999)]));
+        assert_eq!(mgr.available_count(), 2);
+        assert!(
+            !mgr.snapshot()
+                .entries
+                .iter()
+                .any(|e| e.credits_exhausted)
+        );
+    }
+
+    #[test]
+    fn zero_limit_blocks_the_account_outright() {
+        let mgr = credit_limit_manager([Some(0.0), None]);
+        // 上限 0 且用量 0：0 >= 0 成立 → 直接禁止使用
+        mgr.set_cycle_credit_usage(HashMap::new());
+        assert_eq!(mgr.available_count(), 1);
+        assert!(
+            mgr.snapshot()
+                .entries
+                .iter()
+                .find(|e| e.id == 1)
+                .unwrap()
+                .credits_exhausted
+        );
+    }
+
+    #[test]
+    fn cycle_rollover_restores_availability() {
+        let mgr = credit_limit_manager([Some(10.0), None]);
+        mgr.set_cycle_credit_usage(HashMap::from([(1, 10.0)]));
+        assert_eq!(mgr.available_count(), 1);
+
+        // 周期翻转 → 计数器推来归零后的全量快照 → 账号自动恢复，无需人工干预
+        mgr.set_cycle_credit_usage(HashMap::new());
+        assert_eq!(mgr.available_count(), 2);
+    }
+
+    #[test]
+    fn invalid_limit_is_ignored_rather_than_locking_the_account() {
+        // 脏配置（NaN / 负数）不该把账号永久锁死
+        let mgr = credit_limit_manager([Some(f64::NAN), None]);
+        mgr.set_cycle_credit_usage(HashMap::from([(1, 5.0)]));
+        assert_eq!(mgr.available_count(), 2);
+
+        let mgr = credit_limit_manager([Some(-1.0), None]);
+        mgr.set_cycle_credit_usage(HashMap::from([(1, 5.0)]));
+        assert_eq!(mgr.available_count(), 2);
+    }
+
+    #[test]
+    fn set_max_cycle_credits_validates_and_persists_in_memory() {
+        let mgr = credit_limit_manager([None, None]);
+        assert!(mgr.set_max_cycle_credits(1, Some(25.0)).is_ok());
+        assert_eq!(
+            mgr.snapshot()
+                .entries
+                .iter()
+                .find(|e| e.id == 1)
+                .unwrap()
+                .max_cycle_credits,
+            Some(25.0)
+        );
+
+        // 取消限制
+        assert!(mgr.set_max_cycle_credits(1, None).is_ok());
+        assert_eq!(
+            mgr.snapshot()
+                .entries
+                .iter()
+                .find(|e| e.id == 1)
+                .unwrap()
+                .max_cycle_credits,
+            None
+        );
+
+        // 非法值与不存在的 id 都要报错
+        assert!(mgr.set_max_cycle_credits(1, Some(-5.0)).is_err());
+        assert!(mgr.set_max_cycle_credits(1, Some(f64::NAN)).is_err());
+        assert!(mgr.set_max_cycle_credits(999, Some(1.0)).is_err());
+    }
+
+    #[test]
+    fn set_cycle_credit_usage_drops_garbage_values() {
+        let mgr = credit_limit_manager([Some(10.0), None]);
+        // NaN / 负数用量不该被当成"已用"，否则一次异常上报就永久挡住账号
+        mgr.set_cycle_credit_usage(HashMap::from([(1, f64::NAN)]));
+        assert_eq!(mgr.available_count(), 2);
+        mgr.set_cycle_credit_usage(HashMap::from([(1, -3.0)]));
+        assert_eq!(mgr.available_count(), 2);
     }
 
     #[test]

@@ -521,6 +521,14 @@ pub struct KiroCredentials {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
 
+    /// 本机每个计费周期内可消耗的积分上限。`None`（默认）表示不限制。
+    ///
+    /// 对比的是本机在当前计费周期消耗的积分（`credit_total.json` 的 `cycleCredits`），
+    /// 不是 Kiro 侧该账号的总用量——后者含其他机器的消耗，本机无法控制。
+    /// 达到上限后该账号被排除出调度，下个计费周期自动恢复。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cycle_credits: Option<f64>,
+
     /// 当前凭据连续执行自愈的轮数。成功调用后清零。
     #[serde(default, skip_serializing_if = "is_zero")]
     pub self_heal_consecutive_rounds: u32,
@@ -1198,6 +1206,7 @@ mod tests {
             proxy_password: None,
             disabled: false,
             disabled_reason: None,
+            max_cycle_credits: None,
             self_heal_consecutive_rounds: 0,
             self_heal_total_count: 0,
             last_self_heal_at: None,
@@ -1443,6 +1452,7 @@ mod tests {
             proxy_password: None,
             disabled: false,
             disabled_reason: None,
+            max_cycle_credits: None,
             self_heal_consecutive_rounds: 0,
             self_heal_total_count: 0,
             last_self_heal_at: None,
@@ -1488,6 +1498,7 @@ mod tests {
             proxy_password: None,
             disabled: false,
             disabled_reason: None,
+            max_cycle_credits: None,
             self_heal_consecutive_rounds: 0,
             self_heal_total_count: 0,
             last_self_heal_at: None,
@@ -1616,6 +1627,7 @@ mod tests {
             proxy_password: None,
             disabled: false,
             disabled_reason: None,
+            max_cycle_credits: None,
             self_heal_consecutive_rounds: 0,
             self_heal_total_count: 0,
             last_self_heal_at: None,

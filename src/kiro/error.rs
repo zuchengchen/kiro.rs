@@ -32,6 +32,40 @@ impl UpstreamRateLimitError {
     }
 }
 
+/// 所有候选账号都已用满管理员设置的周期积分上限。
+///
+/// 与上游限流区分开：这是本地策略拒绝，不是 Kiro 侧的 429。但对客户端而言表现应当一致
+/// —— 429 + `Retry-After`，否则客户端会立即重试，把一次上限拒绝放大成持续请求风暴。
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{message}")]
+pub struct CreditLimitReachedError {
+    message: String,
+    /// 距离最近一个账号的计费周期重置还有多少秒
+    retry_after_secs: Option<u64>,
+}
+
+impl CreditLimitReachedError {
+    pub(crate) fn new(message: String, retry_after_secs: Option<u64>) -> Self {
+        Self {
+            message,
+            retry_after_secs,
+        }
+    }
+
+    /// `Retry-After` 头的取值（秒）
+    ///
+    /// 未知重置时刻时回退到 1 小时：既不至于让客户端疯狂重试，也不会因为等太久而
+    /// 错过周期已经翻转的时机（周期翻转后账号会立即恢复可用）。
+    pub fn retry_after_secs(&self) -> u64 {
+        const FALLBACK_RETRY_AFTER_SECS: u64 = 3600;
+        // 上限也压到 1 小时：计费周期可能还剩好几天，直接把 Retry-After 设成
+        // 那么长会让客户端在周期翻转后仍然长时间不回来。
+        self.retry_after_secs
+            .map(|s| s.clamp(1, FALLBACK_RETRY_AFTER_SECS))
+            .unwrap_or(FALLBACK_RETRY_AFTER_SECS)
+    }
+}
+
 fn normalize_retry_after(value: String) -> Option<String> {
     let value = value.trim();
     if value.is_empty() {

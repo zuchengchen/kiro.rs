@@ -68,6 +68,7 @@ import {
   useForceRefreshToken,
   useResetSuccessCount,
   useClearThrottle,
+  useSetMaxCredits,
 } from "@/hooks/use-credentials";
 import { setCredentialOverage, getProxyPool } from "@/api/credentials";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -336,6 +337,181 @@ function MachineUsageRow({ credential }: { credential: CredentialStatusItem }) {
  * `otherMachineExact` 为 false 时（本机计数没覆盖完整周期）标注「至多」，因为此时本机
  * 周期用量偏小，差值只是上界。
  */
+/**
+ * 解析积分上限输入框：空 → null（不限制），合法非负数 → number，其它 → 'invalid'。
+ *
+ * 与客户端 Key 页面的 parseMaxCreditsInput 保持一致的输入约定。
+ */
+function parseMaxCreditsInput(raw: string): number | null | "invalid" {
+  const t = raw.trim();
+  if (t === "") return null;
+  const n = Number(t);
+  if (!Number.isFinite(n) || n < 0) return "invalid";
+  return n;
+}
+
+/**
+ * 「本周期积分上限」行：展示当前上限 + 用量占比，并允许就地修改。
+ *
+ * 上限对比的是本机本周期用量（`machineCycleCredits`），而不是账号在 Kiro 侧的总用量
+ * —— 后者含其他机器的消耗，本机管不了，拿它做阈值会误伤。
+ */
+function CreditLimitRow({
+  credential,
+  preview,
+  onEdit,
+}: {
+  credential: CredentialStatusItem;
+  preview?: boolean;
+  onEdit: () => void;
+}) {
+  const limit = credential.maxCycleCredits;
+  const used = credential.machineCycleCredits;
+  const ratio = limit != null && limit > 0 ? (used / limit) * 100 : 0;
+  const exhausted = credential.creditsExhausted;
+  return (
+    <div className="flex items-baseline justify-between gap-2 border-t border-border/30 pt-1.5 text-[11px] font-mono">
+      <span
+        className="text-muted-foreground"
+        title="本机每个计费周期最多消耗多少积分。达到后该账号暂停调度，下个周期自动恢复。"
+      >
+        周期上限
+      </span>
+      <span className="flex items-baseline gap-1.5">
+        {limit == null ? (
+          <span className="text-muted-foreground/60">不限制</span>
+        ) : (
+          <span
+            className={cn(
+              "tabular-nums",
+              exhausted
+                ? "text-destructive font-semibold"
+                : ratio >= 80
+                  ? "text-amber-600 dark:text-amber-400"
+                  : "text-foreground/90",
+            )}
+            title={`本周期已用 ${used} / 上限 ${limit}`}
+          >
+            {formatCredits(used)}
+            <span className="text-muted-foreground"> / {formatCredits(limit)}</span>
+            {limit > 0 && (
+              <span className="text-muted-foreground/70">
+                {" "}
+                ({ratio.toFixed(0)}%)
+              </span>
+            )}
+          </span>
+        )}
+        {!preview && (
+          <button
+            type="button"
+            onClick={onEdit}
+            className="rounded px-1 text-[11px] text-muted-foreground underline-offset-2 transition-colors hover:bg-accent hover:text-foreground hover:underline"
+          >
+            {limit == null ? "设置" : "修改"}
+          </button>
+        )}
+      </span>
+    </div>
+  );
+}
+
+/** 设置账号周期积分上限的对话框（卡片视图与列表视图共用） */
+function CreditLimitDialog({
+  credential,
+  open,
+  onOpenChange,
+}: {
+  credential: CredentialStatusItem;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const setMaxCredits = useSetMaxCredits();
+  const limit = credential.maxCycleCredits;
+  const [draft, setDraft] = useState("");
+
+  // 每次打开都用当前值初始化，避免上次取消后残留旧草稿
+  useEffect(() => {
+    if (open) setDraft(limit != null ? String(limit) : "");
+  }, [open, limit]);
+
+  const submit = async () => {
+    const parsed = parseMaxCreditsInput(draft);
+    if (parsed === "invalid") {
+      toast.error("积分上限必须是非负数");
+      return;
+    }
+    if (parsed === (limit ?? null)) {
+      onOpenChange(false);
+      return;
+    }
+    try {
+      await setMaxCredits.mutateAsync({
+        id: credential.id,
+        maxCycleCredits: parsed,
+      });
+      toast.success(
+        parsed == null
+          ? "已取消积分上限"
+          : `积分上限已设为 ${parsed} credit / 周期`,
+      );
+      onOpenChange(false);
+    } catch (e) {
+      toast.error(extractErrorMessage(e));
+    }
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-[440px]">
+        <DialogHeader>
+          <DialogTitle>设置积分上限</DialogTitle>
+          <DialogDescription>
+            限制本机每个计费周期最多通过该账号消耗多少积分。达到上限后该账号暂停参与调度，
+            请求自动转到其他可用账号；下个计费周期自动恢复，无需手动操作。
+          </DialogDescription>
+        </DialogHeader>
+        <div className="space-y-3">
+          <div className="space-y-1.5">
+            <label className="text-[12px] text-muted-foreground">
+              每周期积分上限（留空 = 不限制）
+            </label>
+            <Input
+              autoFocus
+              type="number"
+              min={0}
+              step="any"
+              value={draft}
+              placeholder="不限制"
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void submit();
+              }}
+            />
+          </div>
+          <div className="rounded-md bg-secondary/40 px-2.5 py-2 text-[11px] text-muted-foreground">
+            本周期本机已消耗{" "}
+            <span className="font-mono tabular-nums text-foreground">
+              {formatCredits(credential.machineCycleCredits)}
+            </span>{" "}
+            credit。
+            <br />
+            上限只统计经本机转发的消耗，不含该账号在其他机器上的用量。
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)}>
+            取消
+          </Button>
+          <Button disabled={setMaxCredits.isPending} onClick={() => void submit()}>
+            {setMaxCredits.isPending ? "保存中…" : "保存"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 function CycleSplitRows({ credential }: { credential: CredentialStatusItem }) {
   const other = credential.otherMachineCredits;
   if (other === undefined) return null;
@@ -500,6 +676,7 @@ export function CredentialCard({
   const [showUpdateTokenDialog, setShowUpdateTokenDialog] = useState(false);
   const [showReloginDialog, setShowReloginDialog] = useState(false);
   const [showFailuresDialog, setShowFailuresDialog] = useState(false);
+  const [showCreditLimitDialog, setShowCreditLimitDialog] = useState(false);
   const [showRecoveredDialog, setShowRecoveredDialog] = useState(false);
   const [showModelsDialog, setShowModelsDialog] = useState(false);
   const [showBalanceDialog, setShowBalanceDialog] = useState(false);
@@ -697,6 +874,9 @@ export function CredentialCard({
         break;
       case "viewFailures":
         setShowFailuresDialog(true);
+        break;
+      case "editCreditLimit":
+        setShowCreditLimitDialog(true);
         break;
       case "none":
         break;
@@ -1168,6 +1348,24 @@ export function CredentialCard({
             </span>
           </div>
         )}
+        {/* 周期积分上限：仅在已设置时占用列表行的空间 */}
+        {credential.maxCycleCredits != null && (
+          <div
+            className={cn(
+              "flex items-baseline justify-between gap-2 text-[10px] font-mono tabular-nums",
+              credential.creditsExhausted
+                ? "text-destructive"
+                : "text-muted-foreground/70",
+            )}
+            title={`本周期上限 ${credential.maxCycleCredits} credit，达到后暂停调度`}
+          >
+            <span>周期上限</span>
+            <span>
+              {formatCredits(credential.machineCycleCredits)} /{" "}
+              {formatCredits(credential.maxCycleCredits)}
+            </span>
+          </div>
+        )}
       </div>
 
       <div className="hidden w-28 shrink-0 truncate text-right text-xs md:block">
@@ -1512,6 +1710,12 @@ export function CredentialCard({
               <MachineUsageRow credential={credential} />
               {/* 本机 / 其他机器拆分：需要余额里的账号总量，未查询时自动隐藏 */}
               <CycleSplitRows credential={credential} />
+              {/* 管理员可设的周期积分上限；默认不限制 */}
+              <CreditLimitRow
+                credential={credential}
+                preview={preview}
+                onEdit={() => setShowCreditLimitDialog(true)}
+              />
             </div>
 
             {/* Connection Details 手风琴展开面板 */}
@@ -1712,6 +1916,11 @@ export function CredentialCard({
         credentialId={credential.id}
         email={credential.email}
         mode="recovered"
+      />
+      <CreditLimitDialog
+        credential={credential}
+        open={showCreditLimitDialog}
+        onOpenChange={setShowCreditLimitDialog}
       />
       <AvailableModelsDialog
         open={showModelsDialog}

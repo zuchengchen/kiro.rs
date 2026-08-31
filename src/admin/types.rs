@@ -113,6 +113,11 @@ pub struct CredentialStatusItem {
     /// false 表示本机的周期计数没有覆盖整个周期（刚启用本功能 / 从历史日志播种），
     /// 此时差值只是**上界**，前端需展示为「至多」。
     pub other_machine_exact: bool,
+    /// 本机每计费周期的积分上限；None（默认）表示不限制
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_cycle_credits: Option<f64>,
+    /// 是否已达本周期上限（已被排除出调度，下个周期自动恢复）
+    pub credits_exhausted: bool,
 }
 
 /// 单个凭据 metadata 字段的可展示信息。
@@ -133,6 +138,15 @@ pub struct CredentialMetadataDetail {
 }
 
 // ============ 操作请求 ============
+
+/// 设置单个凭据的周期积分上限。`maxCycleCredits: null` 表示取消限制。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCredentialMaxCreditsRequest {
+    /// 每计费周期的积分上限；`None` / null 表示不限制
+    #[serde(default)]
+    pub max_cycle_credits: Option<f64>,
+}
 
 /// 启用/禁用凭据请求
 #[derive(Debug, Deserialize)]

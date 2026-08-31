@@ -142,6 +142,18 @@ export async function setCredentialPriority(
   return data
 }
 
+// 设置 / 清除该账号每计费周期的积分上限（null = 不限制）
+export async function setCredentialMaxCredits(
+  id: number,
+  maxCycleCredits: number | null
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    `/credentials/${id}/max-credits`,
+    { maxCycleCredits }
+  )
+  return data
+}
+
 // 重置失败计数
 export async function resetCredentialFailure(
   id: number
