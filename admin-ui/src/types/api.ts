@@ -104,6 +104,29 @@ export interface CredentialStatusItem {
   balanceUpdatedAt?: number
   /** 凭据添加（创建）时间（RFC3339 格式）；旧凭据缺失时为 undefined */
   createdAt?: string
+  /**
+   * 本机通过该凭据累计消耗的积分。
+   *
+   * 与 `balance.currentUsage` 不同：后者是 Kiro 侧该账号的总用量（含在别的机器、
+   * 别的客户端上的消耗），这里只统计经本台 kiro.rs 转发的部分。
+   */
+  machineCredits: number
+  /** 本机通过该凭据累计转发的请求数 */
+  machineCalls: number
+  /** 本机在当前计费周期内消耗的积分（与 balance.currentUsage 同周期） */
+  machineCycleCredits: number
+  /** 本机在当前计费周期内转发的请求数 */
+  machineCycleCalls: number
+  /**
+   * 其他机器在当前计费周期消耗的积分 = currentUsage − machineCycleCredits。
+   * 余额未查询时为 undefined。
+   */
+  otherMachineCredits?: number
+  /**
+   * otherMachineCredits 是否精确。false 表示本机的周期计数未覆盖整个周期
+   * （刚启用统计 / 从历史日志播种），差值只是上界，应展示为「至多」。
+   */
+  otherMachineExact: boolean
 }
 
 // 余额响应
@@ -510,6 +533,14 @@ export interface StatsFilter {
 }
 
 export interface OverviewStats {
+  /** 本机全周期累计积分（不受统计窗口/日志保留期影响） */
+  machineCredits: number
+  /** 本机全周期累计请求数 */
+  machineCalls: number
+  /** 开始计数的时刻（RFC3339），null 表示尚无记录 */
+  machineSince: string | null
+  /** 最后一次累加的时刻（RFC3339） */
+  machineUpdatedAt: string | null
   todayCalls: number
   todayInputTokens: number
   todayOutputTokens: number

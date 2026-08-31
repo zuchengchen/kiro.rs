@@ -11,6 +11,7 @@ use axum::{
 };
 
 use crate::admin::client_keys::{KeyAuth, SharedClientKeyManager};
+use crate::admin::credit_total::SharedCreditTotal;
 use crate::admin::trace_db::{SharedTraceStore, TraceKeySource};
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
 use crate::common::auth;
@@ -46,6 +47,8 @@ pub struct AppState {
     pub usage_recorder: Option<SharedRecorder>,
     /// 用量聚合器
     pub usage_aggregator: Option<SharedAggregator>,
+    /// 本机全周期累计积分（不受用量日志保留期影响）
+    pub credit_total: Option<SharedCreditTotal>,
     /// 中转层缓存计量（基于 cache_control 断点的内存缓存）
     pub cache_meter: Option<SharedCacheMeter>,
     /// 请求链路追踪存储（SQLite，可选）
@@ -66,6 +69,7 @@ impl AppState {
             client_keys: None,
             usage_recorder: None,
             usage_aggregator: None,
+            credit_total: None,
             cache_meter: None,
             trace_store: None,
         }
@@ -87,6 +91,12 @@ impl AppState {
         self.client_keys = client_keys;
         self.usage_recorder = recorder;
         self.usage_aggregator = aggregator;
+        self
+    }
+
+    /// 注入本机累计积分计数器
+    pub fn with_credit_total(mut self, total: Option<SharedCreditTotal>) -> Self {
+        self.credit_total = total;
         self
     }
 

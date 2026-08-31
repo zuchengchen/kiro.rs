@@ -137,6 +137,12 @@ export function OverviewPage() {
           />
         }
       />
+      <MachineCreditCard
+        credits={overview?.machineCredits ?? 0}
+        calls={overview?.machineCalls ?? 0}
+        since={overview?.machineSince ?? null}
+        updatedAt={overview?.machineUpdatedAt ?? null}
+      />
       <StatsCards
         activeCredentials={overview?.activeCredentials ?? 0}
         activeKeys={overview?.activeClientKeys ?? 0}
@@ -257,6 +263,64 @@ function aggregateSeries(data: TimeSeriesPoint[]): RangeStats {
       outputTokens: acc.outputTokens + p.outputTokens,
     }),
     { calls: 0, credits: 0, errors: 0, inputTokens: 0, outputTokens: 0 },
+  )
+}
+
+function formatTimestamp(value: string | null): string | null {
+  if (!value) return null
+  const d = new Date(value)
+  if (Number.isNaN(d.getTime())) return null
+  return d.toLocaleString('zh-CN', { hour12: false })
+}
+
+/**
+ * 本机累计消耗的积分。
+ *
+ * 与下方按时间窗聚合的卡片不同，这里是持久化到 credit_total.json 的单调计数，
+ * 不受统计窗口切换和 usage_log 保留期清理影响。
+ */
+function MachineCreditCard({
+  credits,
+  calls,
+  since,
+  updatedAt,
+}: {
+  credits: number
+  calls: number
+  since: string | null
+  updatedAt: string | null
+}) {
+  const sinceText = formatTimestamp(since)
+  const updatedText = formatTimestamp(updatedAt)
+  return (
+    <Card className="mb-6">
+      <CardContent className="p-4 sm:p-5">
+        <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <Coins className="h-4 w-4 shrink-0 text-muted-foreground" />
+              <span className="text-[13px] font-medium">本机累计消耗积分</span>
+            </div>
+            <div className="mt-1 text-[11px] text-muted-foreground">
+              这台机器上 kiro.rs 转发的全部请求，按上游计费口径累计
+            </div>
+            <div className="mt-3 flex items-end gap-2">
+              <span className="truncate text-3xl font-semibold tracking-tight tabular-nums sm:text-4xl">
+                {formatCredits(credits)}
+              </span>
+              <span className="pb-1 text-[12px] text-muted-foreground">credit</span>
+            </div>
+          </div>
+          <div className="shrink-0 space-y-1 text-[11px] text-muted-foreground sm:text-right">
+            <div>
+              累计请求 <span className="tabular-nums text-foreground">{formatNumber(calls)}</span>
+            </div>
+            {sinceText && <div>起算于 {sinceText}</div>}
+            {updatedText && <div>最后更新 {updatedText}</div>}
+          </div>
+        </div>
+      </CardContent>
+    </Card>
   )
 }
 

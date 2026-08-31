@@ -1298,7 +1298,13 @@ pub async fn stats_overview(State(state): State<AdminState>) -> impl IntoRespons
     let active_keys = state.client_keys.active_count() as u64;
     let snapshot = state.service.get_all_credentials();
     let active_credentials = snapshot.credentials.iter().filter(|c| !c.disabled).count() as u64;
+    // 本机全周期累计（独立于 31 天聚合窗口与 usage_log 保留期）
+    let machine = state.credit_total.snapshot();
     let response = serde_json::json!({
+        "machineCredits": machine.credits,
+        "machineCalls": machine.calls,
+        "machineSince": machine.since,
+        "machineUpdatedAt": machine.updated_at,
         "todayCalls": overview.today_calls,
         "todayInputTokens": overview.today_input_tokens,
         "todayOutputTokens": overview.today_output_tokens,

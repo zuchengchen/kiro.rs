@@ -169,6 +169,83 @@ fn parse_usage_log_filename(name: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(body, "%Y-%m-%d").ok()
 }
 
+/// 现存 JSONL 里的 credit 合计（用于首次初始化累计计数器）
+#[derive(Debug, Default, Clone)]
+pub struct HistoricalCredits {
+    pub credits: f64,
+    pub calls: u64,
+    /// 最早一条记录的时间戳（RFC3339）
+    pub earliest_ts: Option<String>,
+    /// 按上游凭据分摊；不含 credential_id == 0（未走到上游）的记录
+    pub by_credential: HashMap<u64, crate::admin::credit_total::CredentialCredits>,
+}
+
+/// 扫描 `dir` 下**所有** `usage_log.*.jsonl` 累计 credit
+///
+/// 与 [`UsageAggregator::rebuild_from_logs`] 不同，这里不按 31 天截断——目标是给
+/// 全周期计数器一个尽可能大的初始下界。仍然受日志保留期限制：更早的文件已被清理，
+/// 所以这只是下界，不是真实历史全量。
+pub fn scan_historical_credits(dir: &Path) -> HistoricalCredits {
+    let dir_buf;
+    let dir = if dir.as_os_str().is_empty() {
+        dir_buf = PathBuf::from(".");
+        dir_buf.as_path()
+    } else {
+        dir
+    };
+    let mut out = HistoricalCredits::default();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(it) => it,
+        Err(_) => return out,
+    };
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if parse_usage_log_filename(&name).is_none() {
+            continue;
+        }
+        let Ok(file) = File::open(entry.path()) else {
+            continue;
+        };
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(rec) = serde_json::from_str::<UsageRecord>(&line) else {
+                continue;
+            };
+            out.calls += 1;
+            let credits = if rec.credits.is_finite() && rec.credits > 0.0 {
+                rec.credits
+            } else {
+                0.0
+            };
+            out.credits += credits;
+            if rec.credential_id != 0 {
+                let per = out.by_credential.entry(rec.credential_id).or_default();
+                per.calls += 1;
+                per.credits += credits;
+                match &per.since {
+                    Some(cur) if cur.as_str() <= rec.ts.as_str() => {}
+                    _ => per.since = Some(rec.ts.clone()),
+                }
+                match &per.updated_at {
+                    Some(cur) if cur.as_str() >= rec.ts.as_str() => {}
+                    _ => per.updated_at = Some(rec.ts.clone()),
+                }
+            }
+            // 字典序在 RFC3339 同偏移下等价于时间序；混合偏移时可能选偏，
+            // 只影响展示用的「起算时间」，不影响累计值
+            match &out.earliest_ts {
+                Some(cur) if cur.as_str() <= rec.ts.as_str() => {}
+                _ => out.earliest_ts = Some(rec.ts.clone()),
+            }
+        }
+    }
+    out
+}
+
 /// 单个时间桶的统计
 #[derive(Debug, Default, Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]

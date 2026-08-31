@@ -31,6 +31,8 @@ pub struct AdminState {
     pub client_keys: SharedClientKeyManager,
     /// 用量聚合器（与 anthropic 路由共享）
     pub usage_aggregator: SharedAggregator,
+    /// 本机全周期累计积分（与 anthropic 路由共享）
+    pub credit_total: super::credit_total::SharedCreditTotal,
     /// 请求链路追踪存储（与 anthropic 路由共享）
     pub trace_store: SharedTraceStore,
     /// 账号分组注册表（持久化到 groups.json）
@@ -51,9 +53,17 @@ impl AdminState {
             service: Arc::new(service),
             client_keys,
             usage_aggregator,
+            // 默认纯内存：调用方用 with_credit_total 换成与 API 路由共享的持久实例
+            credit_total: Arc::new(super::credit_total::CreditTotal::new()),
             trace_store,
             groups,
         }
+    }
+
+    /// 注入与 API 路由共享的累计积分计数器
+    pub fn with_credit_total(mut self, total: super::credit_total::SharedCreditTotal) -> Self {
+        self.credit_total = total;
+        self
     }
 }
 

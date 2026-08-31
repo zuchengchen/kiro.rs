@@ -53,7 +53,13 @@ import type {
   BalanceResponse,
   ProxyPoolEntry,
 } from "@/types/api";
-import { maskProxyUrl, extractErrorMessage, overageFailureMessage, cn } from "@/lib/utils";
+import {
+  maskProxyUrl,
+  extractErrorMessage,
+  overageFailureMessage,
+  formatCredits,
+  cn,
+} from "@/lib/utils";
 import {
   useSetDisabled,
   useSetPriority,
@@ -282,6 +288,88 @@ function CardSectionTitle({
       {Icon && <Icon className="h-3.5 w-3.5 opacity-70" />}
       {children}
     </h3>
+  );
+}
+
+/**
+ * 本机通过该凭据消耗的积分。
+ *
+ * 刻意与上方的「已用 / 上限」分开：那是 Kiro 侧该账号的总用量（可能包含在别的机器
+ * 或 Kiro IDE 里的消耗），这一行只算经本台 kiro.rs 转发的部分，两者不应混读。
+ */
+function MachineUsageRow({ credential }: { credential: CredentialStatusItem }) {
+  const { machineCredits, machineCalls } = credential;
+  const used = machineCredits > 0 || machineCalls > 0;
+  return (
+    <div className="flex items-baseline justify-between gap-2 border-t border-border/30 pt-1.5 text-[11px] font-mono">
+      <span
+        className="text-muted-foreground"
+        title="仅统计经本台 kiro.rs 转发的消耗（全周期累计）；上方「已用」是 Kiro 侧该账号本计费周期的总用量"
+      >
+        本机消耗
+      </span>
+      {used ? (
+        <span className="tabular-nums">
+          <span className="font-semibold text-foreground">
+            {formatCredits(machineCredits)}
+          </span>
+          <span className="text-muted-foreground"> credit</span>
+          <span className="text-muted-foreground/70">
+            {" · "}
+            {machineCalls.toLocaleString("zh-CN")} 次
+          </span>
+        </span>
+      ) : (
+        <span className="text-muted-foreground/60">本机未使用过</span>
+      )}
+    </div>
+  );
+}
+
+/**
+ * 本计费周期内「本机 / 其他机器」的用量拆分。
+ *
+ * 其他机器 = 账号本周期总用量 − 本机本周期用量，所以只有查过余额才能给出。刻意用
+ * 周期口径而不是全周期累计：上游 `currentUsage` 每个计费周期归零，拿全周期累计去减
+ * 会得到负数或严重偏大的差值。
+ *
+ * `otherMachineExact` 为 false 时（本机计数没覆盖完整周期）标注「至多」，因为此时本机
+ * 周期用量偏小，差值只是上界。
+ */
+function CycleSplitRows({ credential }: { credential: CredentialStatusItem }) {
+  const other = credential.otherMachineCredits;
+  if (other === undefined) return null;
+  const exact = credential.otherMachineExact;
+  return (
+    <div className="space-y-0.5 border-t border-border/30 pt-1.5 text-[11px] font-mono">
+      <div className="flex items-baseline justify-between gap-2">
+        <span className="text-muted-foreground">本周期 · 本机</span>
+        <span className="tabular-nums text-foreground/90">
+          {formatCredits(credential.machineCycleCredits)}
+          <span className="text-muted-foreground/70">
+            {" · "}
+            {credential.machineCycleCalls.toLocaleString("zh-CN")} 次
+          </span>
+        </span>
+      </div>
+      <div className="flex items-baseline justify-between gap-2">
+        <span
+          className="text-muted-foreground"
+          title={
+            exact
+              ? "账号本周期总用量减去本机用量，即在别的机器或 Kiro IDE 上的消耗"
+              : "本机的周期统计尚未覆盖整个计费周期（刚启用统计或数据来自历史日志），因此这里是上界"
+          }
+        >
+          本周期 · 其他机器
+          {!exact && <span className="text-amber-600 dark:text-amber-400"> ≤</span>}
+        </span>
+        <span className="tabular-nums text-foreground/90">
+          {!exact && <span className="text-muted-foreground">至多 </span>}
+          {formatCredits(other)}
+        </span>
+      </div>
+    </div>
   );
 }
 
@@ -1051,6 +1139,35 @@ export function CredentialCard({
             余额未查询
           </div>
         )}
+        {/* 本机消耗与余额查询状态无关，始终展示 */}
+        <div
+          className="mt-1 flex items-baseline justify-between gap-2 text-[10px] font-mono tabular-nums text-muted-foreground/70"
+          title="仅统计经本台 kiro.rs 转发的消耗（全周期累计），不含该账号在别处的用量"
+        >
+          <span>本机</span>
+          <span>
+            {credential.machineCredits > 0 || credential.machineCalls > 0
+              ? `${formatCredits(credential.machineCredits)} credit · ${credential.machineCalls.toLocaleString("zh-CN")} 次`
+              : "未使用"}
+          </span>
+        </div>
+        {/* 其他机器：需要余额里的账号总量才能相减，未查询时不显示 */}
+        {credential.otherMachineCredits !== undefined && (
+          <div
+            className="flex items-baseline justify-between gap-2 text-[10px] font-mono tabular-nums text-muted-foreground/70"
+            title={
+              credential.otherMachineExact
+                ? "本计费周期内在别的机器或 Kiro IDE 上的消耗"
+                : "本机周期统计未覆盖整个计费周期，此处为上界"
+            }
+          >
+            <span>其他机器</span>
+            <span>
+              {!credential.otherMachineExact && "≤ "}
+              {formatCredits(credential.otherMachineCredits)} credit
+            </span>
+          </div>
+        )}
       </div>
 
       <div className="hidden w-28 shrink-0 truncate text-right text-xs md:block">
@@ -1390,6 +1507,11 @@ export function CredentialCard({
                   </Button>
                 </div>
               )}
+
+              {/* 本机消耗：本地统计，与余额查询无关，所以放在 balance 分支之外 */}
+              <MachineUsageRow credential={credential} />
+              {/* 本机 / 其他机器拆分：需要余额里的账号总量，未查询时自动隐藏 */}
+              <CycleSplitRows credential={credential} />
             </div>
 
             {/* Connection Details 手风琴展开面板 */}

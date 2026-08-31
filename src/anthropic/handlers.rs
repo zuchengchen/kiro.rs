@@ -52,6 +52,7 @@ pub(crate) struct UsageRecordHook {
     pub recorder: Option<SharedRecorder>,
     pub aggregator: Option<SharedAggregator>,
     pub client_keys: Option<SharedClientKeyManager>,
+    pub credit_total: Option<crate::admin::credit_total::SharedCreditTotal>,
     pub key_id: u64,
     pub model: String,
     pub started_at: Instant,
@@ -63,6 +64,7 @@ impl UsageRecordHook {
             recorder: state.usage_recorder.clone(),
             aggregator: state.usage_aggregator.clone(),
             client_keys: state.client_keys.clone(),
+            credit_total: state.credit_total.clone(),
             key_id,
             model,
             started_at: Instant::now(),
@@ -101,6 +103,11 @@ impl UsageRecordHook {
         }
         if let Some(a) = &self.aggregator {
             a.ingest(&rec);
+        }
+        // 全周期累计：与聚合器分开落盘，不受 usage_log 保留期裁剪影响。
+        // 错误请求同样计入调用次数——上游已经计过费的失败（例如流中断）不应漏算。
+        if let Some(t) = &self.credit_total {
+            t.add(rec.credential_id, rec.credits);
         }
         if status == "success" && self.key_id != 0 {
             if let Some(m) = &self.client_keys {

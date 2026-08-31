@@ -317,6 +317,8 @@ pub struct AdminService {
     trace_store: Option<crate::admin::trace_db::SharedTraceStore>,
     /// 用量日志记录器（用于日志治理：保留天数运行时可改）
     usage_recorder: Option<crate::admin::usage_stats::SharedRecorder>,
+    /// 本机累计积分（删除凭据时需要一并丢弃它的分摊值）
+    credit_total: Option<crate::admin::credit_total::SharedCreditTotal>,
 }
 
 /// Social 登录会话状态
@@ -677,6 +679,7 @@ impl AdminService {
             social_sessions: Arc::new(Mutex::new(HashMap::new())),
             trace_store: None,
             usage_recorder: None,
+            credit_total: None,
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -718,6 +721,15 @@ impl AdminService {
         self
     }
 
+    /// 注入本机累计积分计数器（凭据状态里回填「本机已消耗」，删除时清理分摊值）
+    pub fn with_credit_total(
+        mut self,
+        credit_total: Option<crate::admin::credit_total::SharedCreditTotal>,
+    ) -> Self {
+        self.credit_total = credit_total;
+        self
+    }
+
     /// 获取所有凭据状态
     pub fn get_all_credentials(&self) -> CredentialsStatusResponse {
         let snapshot = self.token_manager.snapshot();
@@ -736,6 +748,13 @@ impl AdminService {
         };
         let now_ts = Utc::now().timestamp() as f64;
 
+        // 同理一次性取完累计积分的分摊表，避免每个凭据各加一次锁
+        let machine_credits = self
+            .credit_total
+            .as_ref()
+            .map(|t| t.by_credential())
+            .unwrap_or_default();
+
         let mut credentials: Vec<CredentialStatusItem> = snapshot
             .entries
             .into_iter()
@@ -746,6 +765,13 @@ impl AdminService {
                     .map(|c| (Some(c.data.clone()), Some(c.cached_at)))
                     .unwrap_or((None, None));
                 let metadata = credential_metadata_details(&entry.metadata, &metadata_schema);
+                let machine = machine_credits.get(&entry.id);
+                let cycle_credits = machine.map(|m| m.cycle_credits).unwrap_or(0.0);
+                // 其他机器 = 账号本周期总用量 − 本机本周期用量。夹到 ≥ 0：本机开始计数的
+                // 时间晚于本周期起点时，两者口径不完全对齐，差值可能为负。
+                let other_machine_credits = balance
+                    .as_ref()
+                    .map(|b| (b.current_usage - cycle_credits).max(0.0));
 
                 CredentialStatusItem {
                     id: entry.id,
@@ -776,6 +802,15 @@ impl AdminService {
                     balance,
                     balance_updated_at,
                     created_at: entry.created_at,
+                    machine_credits: machine.map(|m| m.credits).unwrap_or(0.0),
+                    machine_calls: machine.map(|m| m.calls).unwrap_or(0),
+                    machine_cycle_credits: cycle_credits,
+                    machine_cycle_calls: machine.map(|m| m.cycle_calls).unwrap_or(0),
+                    other_machine_credits,
+                    // 没有本机周期数据时（从未用过该号）差值就是账号总量，本身是精确的
+                    other_machine_exact: machine
+                        .map(|m| m.cycle_from_start || m.cycle_calls == 0)
+                        .unwrap_or(true),
                 }
             })
             .collect();
@@ -945,6 +980,11 @@ impl AdminService {
         // 管理页的手动余额查询始终读上游；结果仍写入缓存，
         // 供列表概览和 overage 判定等非交互路径使用。
         let balance = self.fetch_balance(id).await?;
+
+        // 记录计费周期边界，供「本机 / 其他机器」拆分使用
+        if let Some(credit_total) = &self.credit_total {
+            credit_total.note_cycle_reset(id, balance.next_reset_at);
+        }
 
         // 更新缓存
         let cached_at = Utc::now().timestamp() as f64;
@@ -1157,6 +1197,9 @@ impl AdminService {
             }
             match self.fetch_balance(entry.id).await {
                 Ok(balance) => {
+                    if let Some(credit_total) = &self.credit_total {
+                        credit_total.note_cycle_reset(entry.id, balance.next_reset_at);
+                    }
                     let cached_at = Utc::now().timestamp() as f64;
                     let remaining = balance.remaining;
                     {
@@ -1576,6 +1619,11 @@ impl AdminService {
 
         if let Some(trace_store) = &self.trace_store {
             trace_store.delete_for_credential(id);
+        }
+
+        // 丢弃累计积分的分摊值：id 会被后来的新凭据复用，留着会让新账号继承前任的数字
+        if let Some(credit_total) = &self.credit_total {
+            credit_total.forget_credential(id);
         }
 
         Ok(())

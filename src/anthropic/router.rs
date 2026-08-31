@@ -10,6 +10,7 @@ use axum::{
 };
 
 use crate::admin::client_keys::SharedClientKeyManager;
+use crate::admin::credit_total::SharedCreditTotal;
 use crate::admin::trace_db::SharedTraceStore;
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
 use crate::kiro::provider::KiroProvider;
@@ -44,6 +45,7 @@ pub fn create_router_with_provider(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -56,6 +58,7 @@ pub fn create_router(
     client_keys: Option<SharedClientKeyManager>,
     usage_recorder: Option<SharedRecorder>,
     usage_aggregator: Option<SharedAggregator>,
+    credit_total: Option<SharedCreditTotal>,
     cache_meter: Option<SharedCacheMeter>,
     trace_store: Option<SharedTraceStore>,
 ) -> Router {
@@ -66,6 +69,7 @@ pub fn create_router(
         client_keys,
         usage_recorder,
         usage_aggregator,
+        credit_total,
         cache_meter,
         trace_store,
     )
@@ -80,6 +84,7 @@ pub fn create_router_with_shared_provider(
     client_keys: Option<SharedClientKeyManager>,
     usage_recorder: Option<SharedRecorder>,
     usage_aggregator: Option<SharedAggregator>,
+    credit_total: Option<SharedCreditTotal>,
     cache_meter: Option<SharedCacheMeter>,
     trace_store: Option<SharedTraceStore>,
 ) -> Router {
@@ -88,6 +93,7 @@ pub fn create_router_with_shared_provider(
         state = state.with_shared_kiro_provider(provider);
     }
     state = state.with_usage(client_keys, usage_recorder, usage_aggregator);
+    state = state.with_credit_total(credit_total);
     state = state.with_cache_meter(cache_meter);
     state = state.with_trace_store(trace_store);
 

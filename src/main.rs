@@ -220,6 +220,21 @@ async fn main() {
     let usage_aggregator = std::sync::Arc::new(admin::UsageAggregator::new());
     usage_aggregator.rebuild_from_logs(&cache_dir);
 
+    // 本机全周期累计积分。聚合器只留 31 天、usage_log 也会被清理，所以单独维护一个
+    // 单调计数器持久化到 credit_total.json。首次运行（文件不存在）时用现存 JSONL
+    // 播种，老部署升级后不会显示成 0。
+    let credit_total = std::sync::Arc::new(admin::CreditTotal::load(&cache_dir));
+    {
+        let hist = admin::usage_stats::scan_historical_credits(&cache_dir);
+        if hist.calls > 0 {
+            credit_total.seed_if_new(
+                hist.credits,
+                hist.calls,
+                hist.earliest_ts,
+                hist.by_credential,
+            );
+        }
+    }
     // 账号分组注册表（持久化到 groups.json）。
     // 启动时若文件不存在则首次创建，并把现有凭据 / 客户端 Key 的 groups 字段反向迁移进去，
     // 保证老用户升级后所有已用分组都自动注册，不会因为本次改造而消失。
@@ -268,6 +283,19 @@ async fn main() {
         });
     }
 
+    // 累计积分兜底落盘：add() 自带 3 秒去抖，正常流量下已经写过；这里覆盖
+    // 「最后一个请求之后就没有流量」的尾部增量，避免容器被 kill 时丢掉。
+    {
+        let total = credit_total.clone();
+        tokio::spawn(async move {
+            let interval = std::time::Duration::from_secs(30);
+            loop {
+                tokio::time::sleep(interval).await;
+                total.flush();
+            }
+        });
+    }
+
     if let Some(initial_key) = configured_api_key.as_ref() {
         client_key_manager.sync_system_key(
             "默认密钥".to_string(),
@@ -290,6 +318,7 @@ async fn main() {
         Some(client_key_manager.clone()),
         Some(usage_recorder.clone()),
         Some(usage_aggregator.clone()),
+        Some(credit_total.clone()),
         Some(cache_meter.clone()),
         trace_store.clone(),
     );
@@ -313,7 +342,8 @@ async fn main() {
                     .with_log_governance(
                         Some(admin_trace_store.clone()),
                         Some(usage_recorder.clone()),
-                    );
+                    )
+                    .with_credit_total(Some(credit_total.clone()));
             let admin_state = admin::AdminState::new(
                 admin_key,
                 admin_service,
@@ -321,7 +351,8 @@ async fn main() {
                 usage_aggregator.clone(),
                 admin_trace_store,
                 group_manager.clone(),
-            );
+            )
+            .with_credit_total(credit_total.clone());
 
             // 启动余额后台刷新调度器（每 5 分钟一次，与缓存 TTL 对齐）
             admin_state

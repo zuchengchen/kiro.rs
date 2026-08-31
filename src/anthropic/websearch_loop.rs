@@ -2052,10 +2052,12 @@ mod tests {
     #[tokio::test]
     async fn receiver_disconnect_settles_accumulated_usage_once() {
         let aggregator = Arc::new(crate::admin::usage_stats::UsageAggregator::new());
+        let credit_total = Arc::new(crate::admin::CreditTotal::new());
         let hook = UsageRecordHook {
             recorder: None,
             aggregator: Some(aggregator.clone()),
             client_keys: None,
+            credit_total: Some(credit_total.clone()),
             key_id: 0,
             model: "test-model".to_string(),
             started_at: std::time::Instant::now(),
@@ -2085,6 +2087,11 @@ mod tests {
         assert_eq!(overview.today_input_tokens, 3);
         assert_eq!(overview.today_output_tokens, 5);
         assert_eq!(overview.today_credits, 0.75);
+
+        // 全周期计数器与聚合器同源结算：断连的失败请求也要计入本机累计
+        let machine = credit_total.snapshot();
+        assert_eq!(machine.calls, 1);
+        assert_eq!(machine.credits, 0.75);
     }
 
     #[tokio::test]

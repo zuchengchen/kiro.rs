@@ -91,6 +91,28 @@ pub struct CredentialStatusItem {
     /// 凭据添加（创建）时间（RFC3339 格式）；旧凭据缺失时为 None
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
+    /// 本机（这台跑 kiro.rs 的机器）通过该凭据累计消耗的积分
+    ///
+    /// 与 `balance.current_usage` 不同：后者是 Kiro 侧该账号的总用量（含在别处、别的
+    /// 机器上的消耗），这里只统计经本进程转发的部分。从未用过时为 0。
+    pub machine_credits: f64,
+    /// 本机通过该凭据累计转发的请求数
+    pub machine_calls: u64,
+    /// 本机在**当前计费周期内**消耗的积分（与 `balance.current_usage` 同周期，可直接相减）
+    pub machine_cycle_credits: f64,
+    /// 本机在当前计费周期内转发的请求数
+    pub machine_cycle_calls: u64,
+    /// 其他机器在当前计费周期消耗的积分 = `current_usage - machine_cycle_credits`
+    ///
+    /// 余额未查询时为 None（没有账号总量可减）。夹到 ≥ 0：本机计数晚于账号开通时，
+    /// 差值可能算出负数。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub other_machine_credits: Option<f64>,
+    /// `other_machine_credits` 是否精确
+    ///
+    /// false 表示本机的周期计数没有覆盖整个周期（刚启用本功能 / 从历史日志播种），
+    /// 此时差值只是**上界**，前端需展示为「至多」。
+    pub other_machine_exact: bool,
 }
 
 /// 单个凭据 metadata 字段的可展示信息。

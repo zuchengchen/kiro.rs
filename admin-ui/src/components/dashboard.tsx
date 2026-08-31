@@ -227,6 +227,14 @@ const DEV_PREVIEW_CREDENTIAL: CredentialStatusItem = {
     overageEnabled: false,
   },
   createdAt: "2026-08-01T10:30:00Z",
+  // 刻意小于 balance.currentUsage：预览里也体现「本机只是该账号用量的一部分」
+  machineCredits: 42.75,
+  machineCalls: 863,
+  // 本周期：本机 120.5 + 其他机器 66.0 = balance.currentUsage 186.5
+  machineCycleCredits: 120.5,
+  machineCycleCalls: 402,
+  otherMachineCredits: 66,
+  otherMachineExact: true,
 };
 
 // 字段排序：'manual' = 服务端顺序（保留拖拽调优先级）；其余字段选中后拖拽自动禁用
