@@ -73,9 +73,13 @@ export function CredentialFailuresDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-2xl">
         <DialogHeader>
-          <DialogTitle>失败日志详情</DialogTitle>
+          <DialogTitle>失败尝试详情</DialogTitle>
           <DialogDescription>
-            {email || `凭据 #${credentialId}`} 最近的失败记录（最多 50 条请求）
+            {email || `凭据 #${credentialId}`} 最近失败的
+            <span className="font-medium text-foreground">单次尝试</span>
+            （最多 50 条请求，一个请求失败几跳就列几条）。带「最终成功」标记的表示
+            该请求已重试成功、客户端未收到错误，并已计入成功数——瞬态限流不计入
+            凭据失败数。
           </DialogDescription>
         </DialogHeader>
         <div className="max-h-[60vh] space-y-2 overflow-y-auto">
@@ -85,7 +89,7 @@ export function CredentialFailuresDialog({
             </div>
           ) : failedHops.length === 0 ? (
             <div className="py-6 text-center text-sm text-muted-foreground">
-              该凭据暂无失败记录（trace 关闭或近期无失败）。
+              该凭据暂无失败尝试（trace 关闭或近期无失败）。
             </div>
           ) : (
             failedHops.map(({ rec, attempt }) => (
@@ -111,13 +115,34 @@ function FailureRow({
   attempt: TraceAttempt;
 }) {
   const style = outcomeStyle(attempt.outcome);
-  // 这一跳失败了，但整条 trace 最终成功——客户端没有收到错误。
-  // 救回方式有两种，区分开才能看清是账号池起了作用还是限流桶起了作用：
-  // - 同一凭据：429 后同账号换限流桶重试成功（不消耗重试轮次，常见于单账号池）
-  // - 其他凭据：故障转移到别的账号后成功
+  // 这一跳失败了，但整条 trace 最终成功——客户端没有收到错误，该请求也已计入
+  // 凭据的 successCount（瞬态 429 不进 totalFailureCount）。
+  //
+  // 救回方式分三种，区分开才能看清到底是什么在起作用：
+  // - 同凭据同桶重试：上游瞬时限流，退避后同一入口就恢复了
+  // - 同凭据换桶：429 后在另一个限流桶重发成功（桶配额独立）
+  // - 转其他凭据：故障转移到别的账号后成功（需要账号池有可用目标）
   const traceRecovered = rec.finalStatus === "success";
-  const recoveredBySameCredential =
-    attempt.credentialId === rec.finalCredentialId;
+  const sameCredential = attempt.credentialId === rec.finalCredentialId;
+  // 最终成功那一跳的端点：用来判断是否真的换了桶。
+  const successEndpoint = rec.attempts.find((a) => a.outcome === "success")
+    ?.endpoint;
+  const switchedBucket =
+    successEndpoint != null && successEndpoint !== attempt.endpoint;
+
+  let recoveryLabel: string;
+  let recoveryHint: string;
+  if (!sameCredential) {
+    recoveryLabel = `本次请求最终成功（转由凭据 #${rec.finalCredentialId}）`;
+    recoveryHint = `已故障转移到凭据 #${rec.finalCredentialId} 并成功，客户端未收到错误`;
+  } else if (switchedBucket) {
+    recoveryLabel = `本次请求最终成功（同凭据换桶 → ${successEndpoint}）`;
+    recoveryHint = `该凭据改走 ${successEndpoint} 限流桶后成功，客户端未收到错误`;
+  } else {
+    recoveryLabel = "本次请求最终成功（同凭据同桶重试）";
+    recoveryHint =
+      "上游瞬时限流，退避后在同一入口重试成功，客户端未收到错误";
+  }
   return (
     <div className="rounded-lg border border-border/50 bg-secondary/30 p-3">
       <div className="flex flex-wrap items-center gap-2 text-[13px]">
@@ -137,17 +162,8 @@ function FailureRow({
           </span>
         )}
         {traceRecovered && (
-          <Badge
-            variant="outline"
-            title={
-              recoveredBySameCredential
-                ? "该凭据换用其他上游限流桶后重试成功，客户端未收到错误"
-                : `已故障转移到凭据 #${rec.finalCredentialId} 并成功，客户端未收到错误`
-            }
-          >
-            {recoveredBySameCredential
-              ? "本次请求最终成功（同凭据换桶重试）"
-              : `本次请求最终成功（转由凭据 #${rec.finalCredentialId}）`}
+          <Badge variant="outline" title={recoveryHint}>
+            {recoveryLabel}
           </Badge>
         )}
         {rec.finalStatus === "interrupted" && (
