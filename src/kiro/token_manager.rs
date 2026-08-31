@@ -3490,6 +3490,27 @@ impl MultiTokenManager {
         }
     }
 
+    /// 除 `exclude_id` 外，是否还有能服务本请求的凭据。
+    ///
+    /// 用于决定「瞬态限流后是否值得打冷却换号」：没有别的凭据时打冷却只会让下一轮
+    /// 取号失败、把本可重试的请求变成立即 429。
+    pub fn has_other_available_for_request(
+        &self,
+        exclude_id: u64,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> bool {
+        let now = Instant::now();
+        let entries = self.entries.lock();
+        entries.iter().any(|e| {
+            e.id != exclude_id
+                && !e.disabled
+                && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                && !self.rpm_exceeded(e, now)
+                && credential_matches_request(&e.credentials, model, group)
+        })
+    }
+
     /// 瞬态限流（429/5xx）后给该凭据打一个**短冷却**，让下一轮取号换到别的凭据。
     ///
     /// 与 [`Self::report_account_throttled_for_request`] 的区别：
@@ -6118,6 +6139,41 @@ mod tests {
         let e1 = snap.entries.iter().find(|e| e.id == 1).unwrap();
         assert_eq!(e1.total_failure_count, 0, "瞬态限流不应计入失败数");
         assert!(!e1.disabled);
+    }
+
+    #[tokio::test]
+    async fn has_other_available_gates_the_cooldown() {
+        // 回归防护：单凭据池必须报告「无处可换」，provider 据此跳过打冷却。
+        // 打了冷却会让下一轮取号全池失败、立即 429，实测使本地拒绝从 0% 涨到 48%。
+        let sole = offline_manager(Config::default());
+        let sole_id = sole.snapshot().current_id;
+        assert!(
+            !sole.has_other_available_for_request(sole_id, None, None),
+            "单凭据池不应报告有其他可用凭据"
+        );
+
+        // 双凭据池：另一个可用 → 允许打冷却换号
+        let first = KiroCredentials {
+            access_token: Some("a".to_string()),
+            expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
+            ..KiroCredentials::default()
+        };
+        let second = KiroCredentials {
+            access_token: Some("b".to_string()),
+            expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
+            ..KiroCredentials::default()
+        };
+        let pair =
+            MultiTokenManager::new(Config::default(), vec![first, second], None, None, false)
+                .unwrap();
+        assert!(pair.has_other_available_for_request(1, None, None));
+
+        // #2 也进冷却后，#1 就无处可换了
+        pair.report_transient_throttle_for_request(2, StdDuration::from_secs(30), None, None);
+        assert!(
+            !pair.has_other_available_for_request(1, None, None),
+            "另一个凭据在冷却中时应视为无处可换"
+        );
     }
 
     #[tokio::test]

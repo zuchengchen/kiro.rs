@@ -1376,27 +1376,37 @@ impl KiroProvider {
                 // 实测一次请求 4 跳全撞在同一个号的同一个桶上，而池里另一个号有
                 // 充足额度却一次没被用到。换号后端点也随之重选，等于同时换了桶。
                 //
-                // 冷却时长取本次退避时长：既保证这一跳之后该凭据被跳过，也不会在
-                // 请求结束后继续影响调度。单凭据池同样打冷却，由 AcquireWaitBudget
-                // 的内部等待吸收，不会因此直接失败。
+                // 冷却时长取本次退避时长：保证这一跳之后该凭据被跳过，且不会在
+                // 请求结束后继续影响调度。
                 let backoff = if status.as_u16() == 429 {
                     Self::retry_delay_throttle(attempt)
                 } else {
                     Self::retry_delay(attempt)
                 };
-                let others_available = self
-                    .token_manager
-                    .report_transient_throttle_for_request(
+
+                // 只有确实存在别的可用凭据时才打冷却。否则打了冷却会让下一轮取号
+                // 失败（全池不可用 → 立即 429），把本可同号重试的请求直接判死：
+                // 实测单凭据池下这样做会让「未联系上游就被本地拒绝」的比例从 0%
+                // 涨到 48%。内部等待预算（默认 3s）也吸收不了 429 退避的累计时长
+                // （1+2+4=7s），指望它兜住是错的。
+                let can_switch = self.token_manager.has_other_available_for_request(
+                    ctx.id,
+                    model.as_deref(),
+                    group,
+                );
+                if can_switch {
+                    self.token_manager.report_transient_throttle_for_request(
                         ctx.id,
                         backoff,
                         model.as_deref(),
                         group,
                     );
+                }
 
                 if attempt + 1 < max_retries {
-                    // 还有别的凭据可用时立即换号重试，不必等退避：退避是为了给
-                    // 「同一个」凭据的配额留恢复时间，换号则没有等待的理由。
-                    if others_available == 0 {
+                    // 能换号就立即重试：退避是为了给「同一个」凭据的配额留恢复时间，
+                    // 换到别的凭据没有等待的理由。无处可换时照常退避。
+                    if !can_switch {
                         sleep(backoff).await;
                     }
                 }
