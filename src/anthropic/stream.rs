@@ -5465,7 +5465,8 @@ mod tests {
             prompt_total_est: 100,
         };
 
-        assert_eq!(ctx.resolved_usage(), (40, 20, 20));
+        // total=80 → read 钉死 80% = 64；真实覆盖（50/100 → 40）低于它，以 64 为准。
+        assert_eq!(ctx.resolved_usage(), (16, 0, 64));
         assert_eq!(ctx.resolved_output_tokens(), 9);
     }
 

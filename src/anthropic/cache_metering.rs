@@ -31,6 +31,22 @@ const MAX_TTL_SECS: i64 = 3600;
 /// 默认 TTL（5min，ephemeral 默认值）
 const DEFAULT_TTL_SECS: i64 = 5 * 60;
 
+/// 上报口径的固定缓存命中比例（`cache_read / 总 prompt token`）。
+///
+/// **这是一个人为固定值，不是测量结果。** 原先 `cache_read` 由前缀哈希的最深命中
+/// 段决定，随会话真实复用情况浮动；现按运维要求钉死在 80%，使上报数字稳定。
+///
+/// 适用范围是**所有**走本地分摊的请求，包括压根没有可缓存前缀的（单条 message、
+/// 无 tools/system）——那类请求真实覆盖量为 0，差额由固定比例凭空补出。唯一的例外
+/// 是上游下发了 `metadataEvent.tokenUsage` 时：`resolve_non_stream_usage` /
+/// `StreamContext::resolved_usage` 优先用上游精确快照，根本不调用本地分摊。
+///
+/// 后果：`cache_read` / `cache_creation` 不再反映真实前缀复用，Admin UI 的
+/// 「每千输入 credit」等缓存效率指标失去参照价值（见 `trace-log-page.tsx`
+/// `CacheBillingPanel`）。上游 credit 由 meteringEvent 下发，不受此处影响，
+/// 计费本身仍然准确。
+const REPORTED_CACHE_READ_RATIO: f64 = 0.80;
+
 /// 单个缓存条目
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheEntry {
@@ -65,8 +81,12 @@ pub struct SegmentResult {
 /// total 上得到缓存覆盖部分，剩余即未缓存的 `input_tokens`，三者互斥相加 == total。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CacheUsage {
-    /// 缓存读取 token（estimate 口径，最深命中段累计）。
-    /// creation 部分 = `cache_covered_est − cache_read`，无需单独存储。
+    /// 缓存读取 token（estimate 口径，最深命中段累计）= **真实**命中量。
+    ///
+    /// 自 `REPORTED_CACHE_READ_RATIO` 固定上报比例后，`split_against_total` 不再读它，
+    /// 故对上报口径无影响；保留是因为它是唯一的真实命中信号，DEBUG 日志与单测靠它
+    /// 判断前缀链是否真的对齐。要恢复「上报真实命中率」，改回按它分摊即可。
+    #[allow(dead_code)]
     pub cache_read: i32,
     /// 被缓存覆盖前缀的 estimate token 总量（read + creation）。
     pub cache_covered_est: i32,
@@ -80,25 +100,31 @@ impl CacheUsage {
     /// `total_real` 是最终上报口径的全量 prompt token（contextUsage 真值优先，
     /// 否则 `count_tokens` 估算）。三者满足 `input + creation + read == total_real`。
     ///
-    /// 无缓存覆盖（`cache_covered_est == 0`）或基准缺失时，直接返回
-    /// `(total_real, 0, 0)`——全部计入 input，不凭空造缓存计数。
+    /// `read` 恒为 `total_real` 的 [`REPORTED_CACHE_READ_RATIO`]，**与前缀是否命中、
+    /// 乃至是否存在可缓存前缀都无关**。`total_real == 0` 时返回全零（无量可分）。
+    ///
+    /// 固定比例是缓存覆盖量的**下限**：真实覆盖不足 80% 时以 80% 为准（差额凭空补出），
+    /// 超过 80% 时超出部分记为 creation。因此连「压根没有可缓存前缀」的请求（单条
+    /// message、无 tools/system）也会上报 80% read —— 这是刻意的,`cache_covered_est == 0`
+    /// 的提前返回已移除。
     pub fn split_against_total(&self, total_real: i32) -> (i32, i32, i32) {
         let total = total_real.max(0);
-        if self.cache_covered_est <= 0 || self.prompt_total_est <= 0 {
-            return (total, 0, 0);
+        if total == 0 {
+            return (0, 0, 0);
         }
-        // 比例无量纲，跨估算器成立；clamp 到 [0, total] 防止 estimate 偏差越界。
-        let ratio = (self.cache_covered_est as f64 / self.prompt_total_est as f64).clamp(0.0, 1.0);
-        let cache_total = ((total as f64) * ratio).round() as i32;
-        let cache_total = cache_total.min(total);
-        // 在缓存覆盖部分内部，按 estimate 口径的 read/creation 占比二次拆分。
-        let read = if self.cache_covered_est > 0 {
-            ((cache_total as f64) * (self.cache_read as f64 / self.cache_covered_est as f64)).round()
-                as i32
+        // read 钉死在 total 的固定比例，不再受真实覆盖量约束。
+        let read = (((total as f64) * REPORTED_CACHE_READ_RATIO).round() as i32).clamp(0, total);
+        // 真实前缀覆盖量（estimate 口径换算到真实 total）。仅当它超过 read 时才产生
+        // creation；基准缺失（无前缀）时直接取 read，即缓存覆盖 == read、creation == 0。
+        let cache_total = if self.cache_covered_est > 0 && self.prompt_total_est > 0 {
+            // 比例无量纲，跨估算器成立；clamp 到 [0, 1] 防止 estimate 偏差越界。
+            let ratio =
+                (self.cache_covered_est as f64 / self.prompt_total_est as f64).clamp(0.0, 1.0);
+            let covered = ((total as f64) * ratio).round() as i32;
+            covered.clamp(read, total)
         } else {
-            0
+            read
         };
-        let read = read.clamp(0, cache_total);
         let creation = cache_total - read;
         let input = total - cache_total;
         (input, creation, read)
@@ -779,49 +805,77 @@ mod tests {
         let u1 = compute_cache_usage(&cache, &req, 1);
         assert!(u1.cache_covered_est > 0, "first call should cover prefix");
         assert_eq!(u1.cache_read, 0, "first call has nothing cached to read");
-        // 用真实 total 分摊：全部进 creation，input = total − covered。
+        // 用真实 total 分摊。注意上报的 read 走固定比例，首次 miss 也会 > 0——
+        // `cache_read == 0` 这个「真实未命中」信号只在 CacheUsage 层面保留（上面已断言）。
         let total = u1.prompt_total_est; // 取 estimate total 作为「真实 total」便于断言
         let (in1, cc1, cr1) = u1.split_against_total(total);
-        assert!(cc1 > 0, "first call creation>0, cc={}", cc1);
-        assert_eq!(cr1, 0);
+        assert!(cr1 > 0, "上报 read 取固定比例，首次 miss 也 > 0, cr={}", cr1);
         assert_eq!(in1 + cc1 + cr1, total, "互斥口径必须自洽");
 
         // 第二次：相同请求 → 命中，覆盖前缀全部算 read（creation == 0）。
         let u2 = compute_cache_usage(&cache, &req, 1);
         assert!(u2.cache_read > 0, "second call should hit");
         let (in2, cc2, cr2) = u2.split_against_total(total);
-        assert_eq!(cc2, 0, "second call creation should be 0, got {}", cc2);
         assert!(cr2 > 0, "second call read>0, cr={}", cr2);
         assert_eq!(in2 + cc2 + cr2, total, "互斥口径必须自洽");
-        // 两次拆分的「缓存覆盖部分」一致：第一次的 creation == 第二次的 read。
-        assert_eq!(cc1, cr2);
+        // 上报量与实际命中解耦：两次的 (input, creation, read) 完全相同，因为固定比例
+        // 只看 total 与 covered，而这两个量在两次调用间不变。
+        assert_eq!((in1, cc1, cr1), (in2, cc2, cr2), "上报口径不随命中变化");
     }
 
     #[test]
     fn split_against_total_is_mutually_exclusive() {
-        // input + creation + read 必须恒等于 total，且缓存覆盖比例正确分摊。
+        // input + creation + read 必须恒等于 total；read 取固定比例而非实际命中量。
         let u = CacheUsage {
             cache_read: 30,
-            cache_covered_est: 80, // creation 部分 = 50
+            cache_covered_est: 80,
             prompt_total_est: 100,
         };
         // covered 占 prompt 的 80% → 真实 total=1000 时缓存覆盖 800。
         let (input, creation, read) = u.split_against_total(1000);
         assert_eq!(input + creation + read, 1000);
         assert_eq!(input, 200, "尾部 20% 是未缓存 input");
-        // 覆盖部分 800 内按 read:creation = 30:50 拆分 → read=300, creation=500。
-        assert_eq!(read, 300);
-        assert_eq!(creation, 500);
+        // read 钉死在 total 的 80% = 800（忽略 cache_read=30 的实际命中量），
+        // 恰好等于 covered → creation 被挤为 0。
+        assert_eq!(read, 800);
+        assert_eq!(creation, 0);
     }
 
     #[test]
-    fn split_against_total_no_cache_all_input() {
+    fn split_against_total_fixed_ratio_overrides_low_coverage() {
+        // 真实覆盖量低于固定比例时，以固定比例为准（差额凭空补出），不再被 clamp 下去。
+        let u = CacheUsage {
+            cache_read: 0, // 全 miss
+            cache_covered_est: 50,
+            prompt_total_est: 100,
+        };
+        // covered 占 50% → 真实覆盖 500；但 read 钉死 80% = 800 → 覆盖量抬到 800。
+        let (input, creation, read) = u.split_against_total(1000);
+        assert_eq!(input + creation + read, 1000, "互斥口径必须自洽");
+        assert_eq!(read, 800, "固定比例是下限，不受真实覆盖量约束");
+        assert_eq!(creation, 0);
+        assert_eq!(input, 200);
+    }
+
+    #[test]
+    fn split_against_total_no_prefix_still_reports_fixed_ratio() {
+        // 压根没有可缓存前缀（covered=0）也上报固定 80%——原先的提前返回已移除。
         let u = CacheUsage {
             cache_read: 0,
             cache_covered_est: 0,
             prompt_total_est: 100,
         };
-        assert_eq!(u.split_against_total(500), (500, 0, 0));
+        assert_eq!(u.split_against_total(500), (100, 0, 400));
+        // 基准完全缺失（两个 est 都是 0，如 isolation_seed 为 None 的空段）同样适用。
+        let empty = CacheUsage::default();
+        assert_eq!(empty.split_against_total(500), (100, 0, 400));
+    }
+
+    #[test]
+    fn split_against_total_zero_total_stays_zero() {
+        // total 为 0 时无量可分，不能造出 80% 的缓存读取。
+        assert_eq!(CacheUsage::default().split_against_total(0), (0, 0, 0));
+        assert_eq!(CacheUsage::default().split_against_total(-5), (0, 0, 0));
     }
 
     #[test]
@@ -846,8 +900,10 @@ mod tests {
             metadata: None,
         };
         let u = compute_cache_usage(&cache, &req, 1);
+        // 真实覆盖仍是 0（这是唯一的真实信号，保持不变）……
         assert_eq!(u.cache_covered_est, 0);
-        assert_eq!(u.split_against_total(123), (123, 0, 0));
+        // ……但上报口径照样给固定 80%：123 × 0.8 = 98（四舍五入），input 得 25。
+        assert_eq!(u.split_against_total(123), (25, 0, 98));
     }
 
     /// 构造一个普通工具，input_schema 的顶层 key 按给定顺序插入。
