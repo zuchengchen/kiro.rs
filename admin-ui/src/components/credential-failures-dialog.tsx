@@ -67,26 +67,22 @@ export function CredentialFailuresDialog({
   const { data, isLoading } = useTraces(
     {
       failedAttemptCredentialId: credentialId,
-      // 已救回视图只看最终成功的请求；失败视图不限定状态，由下方按最终状态过滤，
-      // 这样两个视图合起来正好覆盖该凭据的全部失败跳，不重不漏。
+      // 两个视图都在服务端按最终状态过滤。失败视图若不带 status，返回的 50 条里
+      // 会混入大量已救回的请求（实测 50 条里 31 条最终成功），前端过滤后只剩十几条，
+      // 看起来像“失败记录很少”。onlyFailed 让服务端只回最终失败的 trace。
       status: recoveredOnly ? "success" : undefined,
+      onlyFailed: recoveredOnly ? undefined : true,
       limit: 50,
     },
     open,
   );
   const records = data?.records ?? [];
   // 摊平：同一请求里该凭据失败了几跳就显示几条（按时间倒序）
-  const failedHops = records
-    .filter((rec) =>
-      recoveredOnly ? rec.finalStatus === "success" : rec.finalStatus !== "success",
-    )
-    .flatMap((rec) =>
-      rec.attempts
-        .filter(
-          (a) => a.credentialId === credentialId && a.outcome !== "success",
-        )
-        .map((a) => ({ rec, attempt: a })),
-    );
+  const failedHops = records.flatMap((rec) =>
+    rec.attempts
+      .filter((a) => a.credentialId === credentialId && a.outcome !== "success")
+      .map((a) => ({ rec, attempt: a })),
+  );
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
