@@ -66,9 +66,9 @@ patch version number`），所以三个版本文件里写的是 semver build met
 
 | 文件 | 值 |
 |---|---|
-| `Cargo.toml` | `0.8.0+8` |
-| `Cargo.lock`（kiro-rs 自身条目） | `0.8.0+8` |
-| `admin-ui/package.json` | `0.8.0+8` |
+| `Cargo.toml` | `0.8.0+9` |
+| `Cargo.lock`（kiro-rs 自身条目） | `0.8.0+9` |
+| `admin-ui/package.json` | `0.8.0+9` |
 
 `display_version()`（`src/admin/service.rs`）在对外暴露时把 `+8` 还原成 `.8`，
 Admin UI 显示 `v0.8.0.8`。`parse_semver_core()` 返回 `[u32; 4]`，两种形式都解析
