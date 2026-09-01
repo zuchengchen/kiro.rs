@@ -426,21 +426,63 @@ fn compare_semver(current: &str, latest: &str) -> std::cmp::Ordering {
     parse_semver_core(current).cmp(&parse_semver_core(latest))
 }
 
-/// 解析 semver 三段数字，解析失败的段作 0；用于 latest tag 的稳定排序。
-fn parse_semver_core(value: &str) -> [u32; 3] {
-    let core = value
-        .trim_start_matches('v')
-        .split(|c: char| c == '-' || c == '+')
+/// 解析版本号为四段数字，解析失败的段作 0；用于 latest tag 的稳定排序。
+///
+/// 第四段是**本仓库定制迭代号**，来自 build metadata（`+N`）。Cargo 不接受四段
+/// 版本号（`0.8.0.8` 直接报 `unexpected character '.' after patch version
+/// number`），所以 `Cargo.toml` 里写 `0.8.0+8`，对外显示时由
+/// [`display_version`] 还原成 `0.8.0.8`。
+///
+/// 上游只发三段 tag（`v0.7.0` … `v0.8.0`，从未带 `+`），其 build metadata 段解析
+/// 为 0，因此：
+///   - 我们 `0.8.0+8` = `[0,8,0,8]` > 上游 `0.8.0` = `[0,8,0,0]` → 不提示更新
+///   - 上游发 `0.8.8` = `[0,8,8,0]` > `[0,8,0,8]` → 正常提示更新
+///
+/// `-` 之后的 prerelease 仍整段忽略（`0.3.1-rc.1` 与 `0.3.1` 等价），保持原语义。
+/// 内部形式（`0.8.0+8`）与显示形式（`0.8.0.8`）都必须解析成同一个 `[0,8,0,8]`，
+/// 否则 `compare_semver` 拿到显示形式时会把第四段丢掉。
+fn parse_semver_core(value: &str) -> [u32; 4] {
+    let trimmed = value.trim_start_matches('v');
+    // 先切 build metadata：`+` 之后是定制迭代号，取第一段数字。
+    let mut plus_parts = trimmed.splitn(2, '+');
+    let before_plus = plus_parts.next().unwrap_or("");
+    let build_from_plus = plus_parts
         .next()
-        .unwrap_or("");
-    let mut out = [0u32; 3];
-    for (i, part) in core.splitn(3, '.').enumerate() {
-        if i >= 3 {
+        .and_then(|b| b.split('.').next())
+        .and_then(|n| n.parse::<u32>().ok());
+    // prerelease 整段丢弃，只留数字段。
+    let core = before_plus.split('-').next().unwrap_or("");
+    let mut out = [0u32; 4];
+    // 最多取四段：第四段是点号形式的定制迭代号（显示形式 `0.8.0.8`）。
+    for (i, part) in core.splitn(4, '.').enumerate() {
+        if i >= 4 {
             break;
         }
         out[i] = part.parse::<u32>().unwrap_or(0);
     }
+    // `+N` 优先于点号第四段：内部形式是权威来源。
+    if let Some(b) = build_from_plus {
+        out[3] = b;
+    }
     out
+}
+
+/// 把内部版本号换成对外显示形式：`0.8.0+8` → `0.8.0.8`。
+///
+/// 只处理 build metadata 为纯数字的情况（我们的定制迭代号）；其它形态原样返回，
+/// 避免把上游可能出现的 `+build.5.commit` 之类拼成误导性的点号版本。
+fn display_version(value: &str) -> String {
+    match value.split_once('+') {
+        Some((core, build)) if !build.is_empty() && build.bytes().all(|b| b.is_ascii_digit()) => {
+            format!("{core}.{build}")
+        }
+        _ => value.to_string(),
+    }
+}
+
+/// 当前版本的对外显示形式（`CARGO_PKG_VERSION` 经 [`display_version`] 归一）。
+fn current_display_version() -> String {
+    display_version(env!("CARGO_PKG_VERSION"))
 }
 
 /// 当前构建类型。在线更新走"下载 GitHub Releases 二进制 + 进程退出由
@@ -1964,7 +2006,7 @@ impl AdminService {
         cleanup_other_staged(&exe, &version);
 
         // 记录当前版本作为「上一版本」，供前端展示「回退」按钮
-        let previous_version = env!("CARGO_PKG_VERSION").to_string();
+        let previous_version = current_display_version();
         super::binary_update::install_binary(&exe, &staged)?;
 
         let prev_label = format!("v{}", previous_version);
@@ -2110,7 +2152,7 @@ impl AdminService {
                     return info;
                 }
                 UpdateCheckInfo {
-                    current_version: env!("CARGO_PKG_VERSION").to_string(),
+                    current_version: current_display_version(),
                     latest_version: String::new(),
                     has_update: false,
                     build_type: BUILD_TYPE.to_string(),
@@ -2162,7 +2204,7 @@ impl AdminService {
             AdminServiceError::InternalError(format!("解析 GitHub release 失败: {}", e))
         })?;
 
-        let current = env!("CARGO_PKG_VERSION").to_string();
+        let current = current_display_version();
         let latest_version = release.tag_name.trim().trim_start_matches('v').to_string();
         let has_update =
             !latest_version.is_empty() && compare_semver(&current, &latest_version).is_lt();
@@ -3900,6 +3942,47 @@ mod tests {
         assert_eq!(compare_semver("v0.3.1", "0.3.1"), Ordering::Equal);
         assert_eq!(compare_semver("1.0.0", "0.99.99"), Ordering::Greater);
         assert_eq!(compare_semver("0.3.1-rc.1", "0.3.1"), Ordering::Equal);
+    }
+
+    #[test]
+    fn custom_iteration_ranks_above_upstream_baseline() {
+        use std::cmp::Ordering;
+        // 我们的定制迭代高于同基线的上游版本 → Admin UI 不提示更新。
+        assert_eq!(compare_semver("0.8.0+8", "0.8.0"), Ordering::Greater);
+        // 上游 patch 前进时仍要提示更新，定制迭代号不能盖住它。
+        assert_eq!(compare_semver("0.8.0+8", "0.8.8"), Ordering::Less);
+        assert_eq!(compare_semver("0.8.0+8", "0.8.1"), Ordering::Less);
+        assert_eq!(compare_semver("0.8.0+8", "0.9.0"), Ordering::Less);
+        // 同基线内定制迭代号自身可比较。
+        assert_eq!(compare_semver("0.8.0+8", "0.8.0+9"), Ordering::Less);
+        assert_eq!(compare_semver("0.8.0+10", "0.8.0+9"), Ordering::Greater);
+    }
+
+    #[test]
+    fn internal_and_display_version_parse_identically() {
+        // 显示形式会回流进 compare_semver（current_version 已是显示形式），
+        // 两种写法必须解析成同一个四元组，否则第四段会被 splitn 吞掉。
+        assert_eq!(parse_semver_core("0.8.0+8"), [0, 8, 0, 8]);
+        assert_eq!(parse_semver_core("0.8.0.8"), [0, 8, 0, 8]);
+        assert_eq!(parse_semver_core("v0.8.0.8"), [0, 8, 0, 8]);
+        // 上游三段：第四段为 0。
+        assert_eq!(parse_semver_core("0.8.0"), [0, 8, 0, 0]);
+        assert_eq!(parse_semver_core("0.8.8"), [0, 8, 8, 0]);
+        // prerelease 仍整段忽略。
+        assert_eq!(parse_semver_core("0.8.0-rc.1"), [0, 8, 0, 0]);
+        // 非数字 build metadata（上游若出现）不参与，不会误当成迭代号。
+        assert_eq!(parse_semver_core("0.8.0+build.abc"), [0, 8, 0, 0]);
+    }
+
+    #[test]
+    fn display_version_restores_dotted_form() {
+        assert_eq!(display_version("0.8.0+8"), "0.8.0.8");
+        assert_eq!(display_version("0.8.0+12"), "0.8.0.12");
+        // 上游纯三段原样返回。
+        assert_eq!(display_version("0.8.0"), "0.8.0");
+        // 非纯数字 build metadata 不拼点号，避免造出误导性版本号。
+        assert_eq!(display_version("0.8.0+build.5"), "0.8.0+build.5");
+        assert_eq!(display_version("0.8.0+"), "0.8.0+");
     }
 
     #[test]

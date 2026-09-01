@@ -1,6 +1,11 @@
 [package]
 name = "kiro-rs"
-version = "0.8.0"
+# 定制版本号：上游基线 0.8.0 + 本仓库第 8 次定制迭代。
+# Cargo 不接受四段版本号（`0.8.0.8` → "unexpected character '.' after patch
+# version number"），所以这里用 semver 的 build metadata 表达第四段，Admin UI
+# 经 `display_version` 还原成 `0.8.0.8` 显示。合并上游时这一行会冲突：保留上游
+# 的三段基线，把 `+N` 接回去即可。
+version = "0.8.0+8"
 edition = "2024"
 
 [features]

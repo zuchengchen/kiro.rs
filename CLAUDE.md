@@ -56,6 +56,36 @@ git push origin main-czc
 3. **`AcquireWaitBudget` 必须由最外层调用方创建并跨重试共享**。每次取号各自
    新建预算会把单请求累计等待放大到 `轮数 × 预算`（WebSearch 6 轮 × 4 次重试）。
 
+## 版本号：`0.8.0.8` = 上游基线 + 定制迭代号
+
+第四段是本仓库的定制迭代号，前三段永远是我们所基于的上游基线。这样上游发到
+`0.8.8` 也不会和我们的编号撞车。
+
+**Cargo 不接受四段版本号**（`0.8.0.8` 直接报 `unexpected character '.' after
+patch version number`），所以三个版本文件里写的是 semver build metadata 形式：
+
+| 文件 | 值 |
+|---|---|
+| `Cargo.toml` | `0.8.0+8` |
+| `Cargo.lock`（kiro-rs 自身条目） | `0.8.0+8` |
+| `admin-ui/package.json` | `0.8.0+8` |
+
+`display_version()`（`src/admin/service.rs`）在对外暴露时把 `+8` 还原成 `.8`，
+Admin UI 显示 `v0.8.0.8`。`parse_semver_core()` 返回 `[u32; 4]`，两种形式都解析
+成同一个 `[0,8,0,8]` —— 显示形式会回流进 `compare_semver`（`current_version`
+已是显示形式），两者必须一致，否则第四段被 `splitn` 吞掉。
+
+更新提示的语义因此是对的：我们 `[0,8,0,8]` > 上游 `0.8.0` = `[0,8,0,0]`，不提示；
+上游发 `0.8.1`/`0.8.8`/`0.9.0` 时前三段更大，正常提示。上游历史 tag 全是纯三段
+（`v0.7.0` … `v0.8.0`），从未带 `+`，所以第四段解析为 0 不会误判。
+
+**升级定制迭代号时三个文件一起改**，只改 `Cargo.toml` 会让 `Cargo.lock` 和
+`package.json` 落后。合并上游时这三行都会冲突：保留上游的三段基线，把 `+N` 接
+回去；基线变了（如上游到 0.9.0）则迭代号归 1。
+
+image tag 和 `deployment-*.json` 沿用同一个编号（`kiro-rs:0.8.0.8`）。历史上
+`0.8.1`–`0.8.8` 那批部署记录是旧的两段式本地编号，留着不动，它们是历史追溯点。
+
 ## Tag 约定
 
 - 只用 `deploy/<version>`，对应 `/home/czc/kiro-rs/deployment-*.json` 的部署点。
