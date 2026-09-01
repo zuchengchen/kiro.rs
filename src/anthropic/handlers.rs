@@ -2102,7 +2102,7 @@ mod tests {
         let overview = aggregator.overview();
         assert_eq!(overview.today_calls, 1);
         assert_eq!(overview.today_errors, 1);
-        // 无 provider 快照 → 走本地分摊，11 个输入 token 里 80%（9）记为缓存读取，
+        // 无 provider 快照 → 走本地分摊，11 个输入 token 里 85%（9，四舍五入）记为缓存读取，
         // 只剩 2 计入 input。统计口径下 input_tokens 因此不再等于总输入。
         assert_eq!(overview.today_input_tokens, 2);
         assert_eq!(overview.today_output_tokens, 7);
@@ -2578,16 +2578,16 @@ mod tests {
             prompt_total_est: 100,
         };
 
-        // total=80 → read 钉死 80% = 64；真实覆盖（50/100 → 40）低于它，以 64 为准，
-        // creation=0，input=16。
+        // total=80 → read 钉死 85% = 68；真实覆盖（50/100 → 40）低于它，以 68 为准，
+        // creation=0，input=12。
         assert_eq!(
             resolve_non_stream_usage(100, Some(80), 9, cache_usage, None),
-            (16, 9, 0, 64)
+            (12, 9, 0, 68)
         );
-        // 无 contextUsage → 退回估算 total=100；无缓存基准也照样上报 80% = 80。
+        // 无 contextUsage → 退回估算 total=100；无缓存基准也照样上报 85% = 85。
         assert_eq!(
             resolve_non_stream_usage(100, None, -9, Default::default(), None),
-            (20, 0, 0, 80)
+            (15, 0, 0, 85)
         );
     }
 
