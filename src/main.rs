@@ -412,10 +412,12 @@ async fn main() {
             )
             .with_credit_total(credit_total.clone());
 
-            // 启动余额后台刷新调度器（每 5 分钟一次，与缓存 TTL 对齐）
+            // 启动余额后台刷新调度器（每 5 分钟一次）。调度用的额度快照有效期按这个间隔推导
             admin_state
                 .service
-                .start_balance_refresher(std::time::Duration::from_secs(300));
+                .start_balance_refresher(std::time::Duration::from_secs(
+                    kiro::token_manager::BALANCE_REFRESH_INTERVAL_SECS,
+                ));
 
             // 启动代理池健康检查调度器（每 5 分钟一次）
             admin_state

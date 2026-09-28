@@ -1404,8 +1404,17 @@ struct BalanceSnapshot {
     cached_at: f64,
 }
 
-/// 余额缓存与账号调度使用同一 TTL；过期数据不能影响账号选择。
-const BALANCE_SNAPSHOT_TTL_SECS: f64 = 300.0;
+/// 后台余额刷新的间隔，main 用它启动 `start_balance_refresher`
+pub(crate) const BALANCE_REFRESH_INTERVAL_SECS: u64 = 300;
+
+/// 额度快照参与调度的有效期：两个刷新周期。过期数据不能影响账号选择。
+///
+/// 不能等于刷新间隔。刷新器是「逐个查完一轮再睡 300s」，一轮本身要几秒（生产 8 个账号
+/// 5.7s，账号越多越长），每个快照到下一次被刷新时实际已存在 300s + 一轮耗时。TTL 取 300s
+/// 时，每个账号每个周期都有几秒被当成「无额度数据」排到所有账号之后，而生产上所有账号
+/// 同 priority，这个排序就是实际的选号依据。两个周期也能容忍一次刷新失败，不会因为
+/// 一次查询出错就把账号降级一整个周期。
+const BALANCE_SNAPSHOT_TTL_SECS: f64 = 2.0 * BALANCE_REFRESH_INTERVAL_SECS as f64;
 
 /// 账号是否已用满本周期积分上限
 ///
@@ -8594,6 +8603,29 @@ mod tests {
         assert_eq!(
             manager.select_next_credential(None, None).map(|(id, _)| id),
             Some(1)
+        );
+    }
+
+    /// 刷新器是「查完一轮再睡一个间隔」：快照在下一次被刷新前已存在「间隔 + 一轮耗时」，
+    /// 这段时间内它仍必须参与排序，否则每个周期都有几秒被排到所有账号之后
+    #[test]
+    fn balance_snapshot_stays_fresh_until_the_next_refresh_pass() {
+        let mut first = grouped_cred("first", &[]);
+        first.priority = 5;
+        let mut second = grouped_cred("second", &[]);
+        second.priority = 5;
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![first, second], None, None, false)
+                .unwrap();
+
+        let now = Utc::now().timestamp() as f64;
+        // #2 额度多，但快照是上一轮刷新留下的：间隔 300s + 一轮 60s 前
+        manager.set_balance_snapshot(1, 10.0, now);
+        manager.set_balance_snapshot(2, 100.0, now - BALANCE_REFRESH_INTERVAL_SECS as f64 - 60.0);
+        assert_eq!(
+            manager.select_next_credential(None, None).map(|(id, _)| id),
+            Some(2),
+            "等待下一轮刷新期间，旧快照仍应按额度参与排序"
         );
     }
 
