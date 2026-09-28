@@ -2164,8 +2164,12 @@ fn create_buffered_sse_stream(
                             }
                             Some(Err(e)) => {
                                 tracing::error!("读取响应流失败: {}", e);
-                                // 发生错误，完成处理并返回所有事件
-                                let all_events = ctx.finish_and_get_all_events();
+                                // 上游中途断流：返回已缓冲的内容并以 error 事件收尾，与 live 路径
+                                // 一致。不能用 end_turn + message_stop，否则截断的回答看起来是完整的。
+                                let all_events = ctx.finish_with_error(
+                                    "upstream_error",
+                                    "Upstream response stream was interrupted",
+                                );
                                 let (i, o, cc, cr, credits) = ctx.final_usage();
                                 hook.record(credential_id, i, o, cc, cr, credits, "error");
                                 // 缓冲模式 chunk 读取失败：上游中途断流

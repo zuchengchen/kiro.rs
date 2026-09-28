@@ -2681,20 +2681,45 @@ impl BufferedStreamContext {
         let final_events = self.inner.generate_final_events();
         self.event_buffer.extend(final_events);
 
-        // 更正 message_start 事件中的 input_tokens 与 cache_* 字段
+        self.patch_message_start_usage(final_input_tokens, cache_creation, cache_read);
+        std::mem::take(&mut self.event_buffer)
+    }
+
+    /// 上游中途断流时返回已缓冲的事件，并以 Anthropic `error` 事件收尾
+    ///
+    /// 与 live 流式路径的断流处理一致：不能像 [`Self::finish_and_get_all_events`] 那样发
+    /// `message_delta(end_turn)` + `message_stop`，否则被截断的回答在客户端看来是正常完成的。
+    pub fn finish_with_error(&mut self, error_type: &str, message: &str) -> Vec<SseEvent> {
+        if !self.initial_events_generated {
+            let initial_events = self.inner.generate_initial_events();
+            self.event_buffer.extend(initial_events);
+            self.initial_events_generated = true;
+        }
+        let (input_tokens, cache_creation, cache_read) = self.inner.resolved_usage();
+        let error_events = self.inner.generate_error_events(error_type, message);
+        self.event_buffer.extend(error_events);
+        self.patch_message_start_usage(input_tokens, cache_creation, cache_read);
+        std::mem::take(&mut self.event_buffer)
+    }
+
+    /// 用最终用量更正缓冲中 message_start 的 input_tokens 与 cache_* 字段
+    fn patch_message_start_usage(
+        &mut self,
+        input_tokens: i32,
+        cache_creation: i32,
+        cache_read: i32,
+    ) {
         for event in &mut self.event_buffer {
             if event.event == "message_start" {
                 if let Some(message) = event.data.get_mut("message") {
                     if let Some(usage) = message.get_mut("usage") {
-                        usage["input_tokens"] = serde_json::json!(final_input_tokens);
+                        usage["input_tokens"] = serde_json::json!(input_tokens);
                         usage["cache_creation_input_tokens"] = serde_json::json!(cache_creation);
                         usage["cache_read_input_tokens"] = serde_json::json!(cache_read);
                     }
                 }
             }
         }
-
-        std::mem::take(&mut self.event_buffer)
     }
 
     /// 取出最终用量（在 finish_and_get_all_events 之后调用）
@@ -5525,5 +5550,39 @@ mod tests {
             .unwrap()
             .data["usage"];
         assert_eq!(delta_usage["output_tokens"], json!(11));
+    }
+
+    /// 缓冲模式（/cc/v1）上游断流：必须以 error 收尾，不能伪装成正常完成
+    #[test]
+    fn buffered_stream_interruption_ends_with_error_not_message_stop() {
+        use crate::kiro::model::events::AssistantResponseEvent;
+
+        let mut ctx = BufferedStreamContext::new(
+            "gpt-5.6-luna",
+            100,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let mut partial = AssistantResponseEvent::default();
+        partial.content = "partial answer".to_string();
+        ctx.process_and_buffer(&Event::AssistantResponse(partial));
+        let events = ctx.finish_with_error("upstream_error", "stream interrupted");
+
+        assert!(
+            events
+                .iter()
+                .all(|e| e.event != "message_delta" && e.event != "message_stop"),
+            "断流后不能发 message_delta / message_stop：{:?}",
+            events.iter().map(|e| &e.event).collect::<Vec<_>>()
+        );
+        assert_eq!(events.last().unwrap().event, "error");
+        assert_eq!(events[0].event, "message_start");
+        // 已开的文本块要先关上，再发 error
+        let stop = events
+            .iter()
+            .position(|e| e.event == "content_block_stop")
+            .expect("open text block must be closed");
+        assert!(stop < events.len() - 1);
     }
 }
