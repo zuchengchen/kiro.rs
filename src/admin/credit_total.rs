@@ -280,12 +280,19 @@ impl CreditTotal {
 
     /// 记录某个凭据本周期的重置时刻（来自余额查询的 `nextResetAt`）
     ///
-    /// 首次得知重置时刻时同时把周期计数清零并标记 `cycle_from_start`：从这一刻起本机记的
-    /// 就是完整周期了。之后每次刷新余额只做「到期则翻转」的判断。
+    /// 首次得知重置时刻时只记下边界：本周期已过去的部分无法追溯，`cycle_from_start` 不变。
+    /// 之后上游给出更晚的重置点即视为周期翻转，归零并标记 `cycle_from_start`。
+    ///
+    /// 已经过去的重置时刻一律忽略。上游在周期翻转后可能还会返回旧的 `nextDateReset`；
+    /// `roll_cycle_if_due` 已按这个时刻归零过一次并清空了边界，再把它记回来，下一次读取
+    /// 会立刻再归零一次，把翻转后记下的新周期用量抹掉，并且每次余额刷新都会重复一遍。
     pub fn note_cycle_reset(&self, credential_id: u64, reset_at: Option<f64>) {
         let Some(reset_at) = reset_at.filter(|v| v.is_finite() && *v > 0.0) else {
             return;
         };
+        if reset_at <= now_unix() {
+            return;
+        }
         let mut state = self.inner.lock();
         let per = state.by_credential.entry(credential_id).or_default();
         let changed = match per.cycle_reset_at {
@@ -730,11 +737,21 @@ mod tests {
         assert!((per[&7].credits - 2.25).abs() < 1e-12);
     }
 
+    /// 把边界直接设成已过去的时刻，模拟「记下重置点之后时间走过了它」
+    fn set_passed_boundary(total: &CreditTotal, id: u64, past: f64) {
+        total
+            .inner
+            .lock()
+            .by_credential
+            .entry(id)
+            .or_default()
+            .cycle_reset_at = Some(past);
+    }
+
     #[test]
     fn passing_the_reset_point_rolls_the_cycle_on_read() {
         let total = CreditTotal::new();
         let past = now_unix() - 10.0;
-        total.note_cycle_reset(7, Some(past));
         // 先攒一笔，然后让周期过期 —— 没有新流量时也必须在读取时结算，
         // 否则安静的凭据会一直显示上个周期的数字
         {
@@ -761,7 +778,7 @@ mod tests {
     #[test]
     fn a_request_after_the_reset_point_lands_in_the_new_cycle() {
         let total = CreditTotal::new();
-        total.note_cycle_reset(7, Some(now_unix() - 10.0));
+        set_passed_boundary(&total, 7, now_unix() - 10.0);
         // add 先结算周期再累加：这一笔属于新周期，不该被自己的结算清掉
         total.add(7, 3.0);
 
@@ -792,6 +809,36 @@ mod tests {
         let per = total.by_credential();
         assert!((per[&7].cycle_credits - 1.0).abs() < 1e-12);
         assert_eq!(per[&7].cycle_reset_at, Some(known));
+    }
+
+    /// 上游在周期翻转后仍返回旧的 nextDateReset：不能再把它记成边界，
+    /// 否则下一次读取会把翻转后的新周期用量再清零一次（每次余额刷新都重复）
+    #[test]
+    fn stale_reset_point_after_rollover_does_not_zero_the_new_cycle_again() {
+        let total = CreditTotal::new();
+        let old_reset = now_unix() - 60.0;
+        set_passed_boundary(&total, 7, old_reset);
+
+        // 翻转后的第一笔：结算旧周期，记入新周期
+        total.add(7, 2.0);
+        assert!((total.by_credential()[&7].cycle_credits - 2.0).abs() < 1e-12);
+
+        // 上游滞后，余额刷新仍给出已经过去的旧重置点
+        total.note_cycle_reset(7, Some(old_reset));
+        let per = total.by_credential();
+        assert!(
+            (per[&7].cycle_credits - 2.0).abs() < 1e-12,
+            "滞后的旧重置点不能再次清零新周期的用量"
+        );
+        assert!(per[&7].cycle_reset_at.is_none());
+
+        // 上游终于给出新周期的重置点：记下边界，保留已记的用量和「覆盖完整周期」标记
+        let next_reset = now_unix() + 30.0 * 86_400.0;
+        total.note_cycle_reset(7, Some(next_reset));
+        let per = total.by_credential();
+        assert_eq!(per[&7].cycle_reset_at, Some(next_reset));
+        assert!((per[&7].cycle_credits - 2.0).abs() < 1e-12);
+        assert!(per[&7].cycle_from_start);
     }
 
     #[test]
