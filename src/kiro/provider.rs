@@ -1813,7 +1813,13 @@ mod rate_limit_tests {
             .await
             .unwrap();
         assert_eq!(result.response.text().await.unwrap(), "fallback-ok");
-        assert_eq!(budget.remaining(), std::time::Duration::from_millis(500));
+        // 按剩余冷却精确扣除（略少于 1s）：剩余预算在 500ms 上方一点
+        let remaining = budget.remaining();
+        assert!(
+            remaining >= std::time::Duration::from_millis(500)
+                && remaining < std::time::Duration::from_millis(600),
+            "{remaining:?}"
+        );
 
         tm.report_account_throttled_for_request(1, std::time::Duration::from_secs(1), None, None);
         let started = std::time::Instant::now();

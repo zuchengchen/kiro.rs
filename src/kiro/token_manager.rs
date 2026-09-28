@@ -1319,13 +1319,15 @@ impl AcquireWaitBudget {
         self.remaining
     }
 
-    /// 申请等待 `wait_secs` 秒，成功则从预算中扣除。
+    /// 申请等待 `needed`，成功则从预算中扣除。
     ///
     /// 冷却可能长达 `accountThrottleCooldownSecs`（或 RPM 的 60 秒窗口），远超客户端
     /// 能接受的等待。只有当所需时长完整落在剩余预算内才批准；否则返回 `None`，
     /// 由调用方返回带 `Retry-After` 的 429，避免把客户端挂到超时。
-    fn take(&mut self, wait_secs: u64) -> Option<StdDuration> {
-        let needed = StdDuration::from_secs(wait_secs);
+    ///
+    /// 按实际剩余冷却计时，不取整到秒：瞬态 5xx 退避只有 200-250ms，按整秒等待会白等
+    /// 四倍时间，还把 3 秒预算一次吃掉 1 秒，下一次稍长的冷却就放不进来了。
+    fn take(&mut self, needed: StdDuration) -> Option<StdDuration> {
         // needed 为零说明冷却其实已过，不该白等一轮。
         if needed.is_zero() || needed > self.remaining {
             return None;
@@ -1333,6 +1335,19 @@ impl AcquireWaitBudget {
         self.remaining = self.remaining.saturating_sub(needed);
         Some(needed)
     }
+}
+
+/// 单次内部等待的下限
+///
+/// 保证每次批准的等待都扣掉可观的预算，重选号循环必然在有限轮内结束
+/// （3 秒预算最多 60 轮），也避免剩余冷却只有几微秒时空转。
+const MIN_INTERNAL_WAIT: StdDuration = StdDuration::from_millis(50);
+
+/// 对客户端的 `Retry-After`：向上取整到秒，至少 1 秒，不返回 `Retry-After: 0`
+fn retry_after_header_secs(wait: StdDuration) -> u64 {
+    wait.as_secs()
+        .saturating_add(u64::from(wait.subsec_nanos() > 0))
+        .max(1)
 }
 
 /// API 调用上下文
@@ -2181,14 +2196,14 @@ impl MultiTokenManager {
         fresh as u32 >= limit
     }
 
-    /// 当所有其它条件均满足的候选都耗尽 RPM 额度时，返回最早可重试秒数。
-    fn rpm_retry_after_secs(
+    /// 当所有其它条件均满足的候选都耗尽 RPM 额度时，返回最早可重试的等待时长。
+    fn rpm_retry_after(
         &self,
         entries: &[CredentialEntry],
         model: Option<&str>,
         group: Option<&str>,
         now: Instant,
-    ) -> Option<u64> {
+    ) -> Option<StdDuration> {
         if !self.account_rpm_limit_enabled.load(Ordering::Relaxed) {
             return None;
         }
@@ -2232,14 +2247,12 @@ impl MultiTokenManager {
                 .copied()
                 .expect("fresh_count 与窗口迭代结果应一致")
                 + window;
-            let remaining = release_at.saturating_duration_since(now);
-            let retry_after = remaining
-                .as_secs()
-                .saturating_add(u64::from(remaining.subsec_nanos() > 0))
-                .max(1);
+            let retry_after = release_at
+                .saturating_duration_since(now)
+                .max(MIN_INTERNAL_WAIT);
             earliest_retry_after = Some(
                 earliest_retry_after
-                    .map(|current: u64| current.min(retry_after))
+                    .map(|current: StdDuration| current.min(retry_after))
                     .unwrap_or(retry_after),
             );
         }
@@ -2284,16 +2297,15 @@ impl MultiTokenManager {
         true
     }
 
-    /// 返回当前请求范围内最早结束的账号冷却秒数。
-    ///
-    /// 向上取整可避免还有不足一秒冷却时对客户端返回 `Retry-After: 0`。
+    /// 返回当前请求范围内最早结束的账号冷却的剩余时长（精确值，内部等待直接用它；
+    /// 对客户端的 `Retry-After` 由 [`retry_after_header_secs`] 向上取整）。
     fn retry_after_for_throttled_request(
         &self,
         entries: &[CredentialEntry],
         model: Option<&str>,
         group: Option<&str>,
         now: Instant,
-    ) -> Option<u64> {
+    ) -> Option<StdDuration> {
         entries
             .iter()
             .filter(|entry| {
@@ -2309,12 +2321,7 @@ impl MultiTokenManager {
                     .and_then(|until| until.checked_duration_since(now))
             })
             .filter(|remaining| !remaining.is_zero())
-            .map(|remaining| {
-                remaining
-                    .as_secs()
-                    .saturating_add(u64::from(remaining.subsec_nanos() > 0))
-                    .max(1)
-            })
+            .map(|remaining| remaining.max(MIN_INTERNAL_WAIT))
             .min()
     }
 
@@ -2564,8 +2571,8 @@ impl MultiTokenManager {
                 );
             }
 
-            // 本轮选号若因全池冷却失败，记录需要等待的秒数，出锁后再决定是否等待。
-            let mut pending_wait_secs: Option<u64> = None;
+            // 本轮选号若因全池冷却失败，记录需要等待的时长，出锁后再决定是否等待。
+            let mut pending_wait: Option<StdDuration> = None;
 
             let selection = 'select: {
                 let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
@@ -2594,7 +2601,7 @@ impl MultiTokenManager {
                     // RPM 打满或账号冷却中（而非全部禁用）时取最早可重试的时间：
                     // 调用方据此知道这是限流而不是凭据耗尽。
                     let retry_after = [
-                        self.rpm_retry_after_secs(&entries, model, group, now),
+                        self.rpm_retry_after(&entries, model, group, now),
                         self.retry_after_for_throttled_request(&entries, model, group, now),
                     ]
                     .into_iter()
@@ -2604,8 +2611,8 @@ impl MultiTokenManager {
                         // 不在持锁状态下等待：parking_lot 的 guard 跨 await 会让
                         // future 变成 !Send，且阻塞 OS 线程会连带卡住所有需要
                         // entries 锁的路径（含 report_* 写回冷却状态）。
-                        // 这里只记录秒数，实际等待放到出锁之后。
-                        pending_wait_secs = Some(retry_after);
+                        // 这里只记录时长，实际等待放到出锁之后。
+                        pending_wait = Some(retry_after);
                         break 'select None;
                     }
                     // 注意：必须在 bail! 之前计算 available_count，
@@ -2662,16 +2669,17 @@ impl MultiTokenManager {
 
             // 此处已不持有任何 parking_lot 锁（selection 块结束时全部释放）。
             let Some((id, credentials, is_balanced, route)) = selection else {
-                let wait_secs = pending_wait_secs.unwrap_or(0);
+                let needed = pending_wait.unwrap_or_default();
                 // 等待窗口超出剩余预算时，仍按原行为把类型化 429 交给客户端，
                 // 由它按 Retry-After 自行安排重试。
                 let wait = if waits_allowed {
-                    wait_budget.take(wait_secs)
+                    wait_budget.take(needed)
                 } else {
                     None
                 };
                 let Some(wait) = wait else {
-                    return Err(UpstreamRateLimitError::new(Some(wait_secs.to_string())).into());
+                    let retry_after = retry_after_header_secs(needed);
+                    return Err(UpstreamRateLimitError::new(Some(retry_after.to_string())).into());
                 };
 
                 tracing::debug!(
@@ -6991,6 +6999,33 @@ mod tests {
         );
     }
 
+    /// 亚秒级冷却（瞬态 5xx 退避 200-250ms）按实际剩余时长等待，不取整成 1 秒：
+    /// 既少等，也只扣掉这么多预算
+    #[tokio::test]
+    async fn acquire_waits_only_the_actual_sub_second_cooldown() {
+        let mut config = Config::default();
+        config.acquire_wait_budget_ms = 3_000;
+        let mgr = offline_manager(config);
+        let id = mgr.snapshot().current_id;
+        mgr.report_account_throttled_for_request(id, StdDuration::from_millis(250), None, None);
+
+        let mut budget = mgr.new_acquire_wait_budget();
+        let started = Instant::now();
+        mgr.acquire_context_with_budget(None, None, &mut budget)
+            .await
+            .expect("短冷却应被等待吸收");
+        let waited = started.elapsed();
+        assert!(
+            waited >= StdDuration::from_millis(200) && waited < StdDuration::from_millis(800),
+            "应只等约 250ms，而不是取整后的 1 秒：{waited:?}"
+        );
+        assert!(
+            budget.remaining() > StdDuration::from_millis(2_600),
+            "只应扣掉实际等待的时长：{:?}",
+            budget.remaining()
+        );
+    }
+
     #[tokio::test]
     async fn acquire_returns_rate_limit_when_cooldown_exceeds_budget() {
         // 冷却 300 秒远超 3 秒预算 → 立即返回类型化 429，不把客户端挂住。
@@ -7049,7 +7084,12 @@ mod tests {
         mgr.acquire_context_with_budget(None, None, &mut budget)
             .await
             .expect("首次短冷却应被等待吸收");
-        assert_eq!(budget.remaining(), StdDuration::from_secs(1));
+        // 按剩余冷却精确扣除（略少于 1s）：剩余预算在 1s 上方一点
+        let remaining = budget.remaining();
+        assert!(
+            remaining >= StdDuration::from_secs(1) && remaining < StdDuration::from_millis(1_100),
+            "{remaining:?}"
+        );
 
         // 再来一次 2 秒冷却：剩余预算只有 1 秒，必须直接 429 而不是又等 2 秒
         mgr.report_account_throttled_for_request(id, StdDuration::from_secs(2), None, None);
@@ -7091,14 +7131,21 @@ mod tests {
         let mgr = MultiTokenManager::new(config, vec![cred], None, None, true).unwrap();
         // 预算 0 完全恢复旧行为（立即 429）
         assert_eq!(mgr.new_acquire_wait_budget().remaining(), StdDuration::ZERO);
-        assert_eq!(mgr.new_acquire_wait_budget().take(1), None);
+        assert_eq!(
+            mgr.new_acquire_wait_budget()
+                .take(StdDuration::from_secs(1)),
+            None
+        );
     }
 
     #[test]
     fn budget_grants_wait_when_cooldown_fits() {
         // 剩余冷却 2s、预算 3s：内部等待 2s，客户端只感知一次延迟而非 429。
         let mut budget = budget_of(3_000);
-        assert_eq!(budget.take(2), Some(StdDuration::from_secs(2)));
+        assert_eq!(
+            budget.take(StdDuration::from_secs(2)),
+            Some(StdDuration::from_secs(2))
+        );
         // 扣除后只剩 1s
         assert_eq!(budget.remaining(), StdDuration::from_secs(1));
     }
@@ -7107,12 +7154,15 @@ mod tests {
     fn budget_refuses_when_cooldown_exceeds_remaining() {
         let mut budget = budget_of(3_000);
         // 冷却 300s 远超预算：必须立刻返回 429，不能把客户端挂到超时
-        assert_eq!(budget.take(300), None);
+        assert_eq!(budget.take(StdDuration::from_secs(300)), None);
         // 拒绝不应扣预算
         assert_eq!(budget.remaining(), StdDuration::from_secs(3));
         // 边界：正好等于预算可用，超出一秒即拒绝
-        assert_eq!(budget.take(4), None);
-        assert_eq!(budget.take(3), Some(StdDuration::from_secs(3)));
+        assert_eq!(budget.take(StdDuration::from_secs(4)), None);
+        assert_eq!(
+            budget.take(StdDuration::from_secs(3)),
+            Some(StdDuration::from_secs(3))
+        );
         assert_eq!(budget.remaining(), StdDuration::ZERO);
     }
 
@@ -7120,16 +7170,26 @@ mod tests {
     fn budget_ignores_zero_wait() {
         // retry_after 为 0 说明冷却已过，不该白等一轮
         let mut budget = budget_of(3_000);
-        assert_eq!(budget.take(0), None);
+        assert_eq!(budget.take(StdDuration::ZERO), None);
         assert_eq!(budget.remaining(), StdDuration::from_secs(3));
     }
 
     #[test]
+    fn retry_after_header_rounds_up_to_whole_seconds() {
+        // 对客户端的 Retry-After 仍是整秒且至少 1：内部等待的精度不外泄
+        assert_eq!(retry_after_header_secs(StdDuration::ZERO), 1);
+        assert_eq!(retry_after_header_secs(StdDuration::from_millis(250)), 1);
+        assert_eq!(retry_after_header_secs(StdDuration::from_millis(1_001)), 2);
+        assert_eq!(retry_after_header_secs(StdDuration::from_secs(300)), 300);
+    }
+
+    #[test]
     fn budget_is_exhausted_by_repeated_waits_so_loop_terminates() {
-        // 关键不变量：每次批准至少扣 1s，预算单调递减 → 循环必然终止。
+        // 关键不变量：每次批准都扣掉非零时长（选号侧另有 MIN_INTERNAL_WAIT 下限），
+        // 预算单调递减 → 循环必然终止。
         let mut budget = budget_of(3_000);
         let mut granted = 0;
-        while budget.take(1).is_some() {
+        while budget.take(StdDuration::from_secs(1)).is_some() {
             granted += 1;
             assert!(granted <= 3, "预算应在 3 次 1s 等待后耗尽");
         }
