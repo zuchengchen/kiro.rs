@@ -131,7 +131,7 @@ pub fn maybe_shrink_image(
     }
 
     // 4) Actually shrink the image
-    match shrink_static_image(cfg, &format_lc, data_base64) {
+    match run_cpu_heavy(|| shrink_static_image(cfg, &format_lc, data_base64)) {
         Ok(processed) => processed,
         Err(e) => {
             warn!(
@@ -143,6 +143,24 @@ pub fn maybe_shrink_image(
             );
             passthrough(format_lc, data_base64)
         }
+    }
+}
+
+/// Runs CPU-heavy work (full decode + Lanczos3 resize + JPEG re-encode, tens to hundreds of
+/// milliseconds per screenshot) without stalling a tokio worker.
+///
+/// Conversion is synchronous and runs inside the request handler, so the shrink would
+/// otherwise hold a worker for its whole duration; with several concurrent image requests
+/// that delays unrelated streams (including their keepalive pings). `block_in_place` hands the
+/// worker's other tasks to another thread first. It panics on a current-thread runtime, so it
+/// is only used on a multi-thread runtime; elsewhere (tests, no runtime) the work runs inline.
+/// Only the shrink path goes through here: passthrough stays on the fast path.
+fn run_cpu_heavy<R>(work: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(work)
+        }
+        _ => work(),
     }
 }
 
@@ -380,6 +398,36 @@ mod tests {
         let tokens = estimate_image_tokens("image/png", &img);
         let expected = (1568.0_f64 * 1568.0 / 750.0).round() as u32;
         assert_eq!(tokens, expected, "超大图应缩到长边上限后计 token");
+    }
+
+    /// 缩图在三种运行环境下都能完成：多线程运行时（走 block_in_place）、
+    /// 单线程运行时（block_in_place 会 panic，必须回退为直接执行）、没有运行时
+    #[test]
+    fn shrink_runs_under_every_runtime_flavor() {
+        let cfg = ResizeConfig {
+            enabled: true,
+            max_long_side: 256,
+            max_bytes: 1,
+            jpeg_quality: 80,
+        };
+        let img = make_png(800, 600);
+        let shrink = move |img: String| {
+            let out = maybe_shrink_image(cfg, "png", &img);
+            assert!(out.was_resized);
+            assert_eq!(out.format, "jpeg");
+        };
+
+        shrink(img.clone());
+        let current = img.clone();
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async move { shrink(current) });
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .build()
+            .unwrap()
+            .block_on(async move { tokio::spawn(async move { shrink(img) }).await.unwrap() });
     }
 
     #[test]
