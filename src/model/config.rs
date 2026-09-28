@@ -632,6 +632,14 @@ impl Config {
             let mut file = fs::File::create(&tmp)?;
             if let Ok(meta) = fs::metadata(&target) {
                 file.set_permissions(meta.permissions())?;
+                // 以 root 运行的容器替换宿主用户的文件时，rename 会把属主换成 root，
+                // 宿主用户（部署脚本、运维）从此读不了 0600 的 config.json。沿用原属主；
+                // 非 root 进程改不了属主，失败即保持现状（此时属主本来就不会变）。
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    let _ = std::os::unix::fs::fchown(&file, Some(meta.uid()), Some(meta.gid()));
+                }
             }
             file.write_all(content.as_bytes())?;
             file.sync_all()
@@ -686,9 +694,17 @@ mod tests {
         );
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "config.json 含 API Key，保存后不能放宽权限");
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let meta = std::fs::metadata(&path).unwrap();
+            assert_eq!(
+                meta.permissions().mode() & 0o777,
+                0o600,
+                "config.json 含 API Key，保存后不能放宽权限"
+            );
+            // 属主保持不变（跨用户的情形——root 容器替换宿主用户的文件——需要 root 才能测，
+            // 部署候选实例上验证）
+            let before = std::fs::metadata(&dir).unwrap();
+            assert_eq!((meta.uid(), meta.gid()), (before.uid(), before.gid()));
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
