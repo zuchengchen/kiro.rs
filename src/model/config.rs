@@ -392,6 +392,10 @@ fn default_acquire_wait_budget_ms() -> u64 {
     3_000
 }
 
+/// 内部等待预算上限：再长就会撞上客户端自己的超时，等待反而有害。
+/// Admin API 与配置文件加载共用这一上限。
+pub const MAX_ACQUIRE_WAIT_BUDGET_MS: u64 = 30_000;
+
 fn default_upstream_timeout_secs() -> u64 {
     30 * 60
 }
@@ -572,6 +576,24 @@ impl Config {
             );
             config.agent_mode = default_agent_mode();
         }
+        // 0 常被理解成「不限时」，但 reqwest 的 timeout(0) 会让每个上游请求立即超时，
+        // 整个服务等于不可用。超时本来就是防挂死的兜底，没有「关掉」的合理用法。
+        if config.upstream_timeout_secs == 0 {
+            tracing::warn!(
+                "upstreamTimeoutSecs 为 0 会让所有上游请求立即超时，回退为默认值 {}",
+                default_upstream_timeout_secs()
+            );
+            config.upstream_timeout_secs = default_upstream_timeout_secs();
+        }
+        // 与 Admin API 同一上限；手写的超大值收到上限而不是拒绝启动
+        if config.acquire_wait_budget_ms > MAX_ACQUIRE_WAIT_BUDGET_MS {
+            tracing::warn!(
+                "acquireWaitBudgetMs={} 超过上限，按 {} 处理",
+                config.acquire_wait_budget_ms,
+                MAX_ACQUIRE_WAIT_BUDGET_MS
+            );
+            config.acquire_wait_budget_ms = MAX_ACQUIRE_WAIT_BUDGET_MS;
+        }
 
         Ok(config)
     }
@@ -713,6 +735,37 @@ mod tests {
     fn acquire_wait_budget_accepts_zero_to_restore_old_behavior() {
         let config: Config = serde_json::from_str(r#"{"acquireWaitBudgetMs":0}"#).unwrap();
         assert_eq!(config.acquire_wait_budget_ms, 0);
+    }
+
+    #[test]
+    fn load_rejects_zero_upstream_timeout_and_clamps_wait_budget() {
+        let dir = tmp_dir("load_validation");
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"upstreamTimeoutSecs":0,"acquireWaitBudgetMs":600000}"#,
+        )
+        .unwrap();
+        let config = Config::load(&path).unwrap();
+        assert_eq!(
+            config.upstream_timeout_secs, 1_800,
+            "0 会让每个上游请求立即超时，必须回退默认值"
+        );
+        assert_eq!(
+            config.acquire_wait_budget_ms,
+            super::MAX_ACQUIRE_WAIT_BUDGET_MS
+        );
+
+        // 合法值原样保留（0 预算是「恢复旧行为」的正式用法）
+        std::fs::write(
+            &path,
+            r#"{"upstreamTimeoutSecs":3,"acquireWaitBudgetMs":0}"#,
+        )
+        .unwrap();
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.upstream_timeout_secs, 3);
+        assert_eq!(config.acquire_wait_budget_ms, 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -5009,9 +5009,12 @@ impl MultiTokenManager {
             }
         }
         if let Some(ms) = acquire_wait_budget_ms {
-            // 上限 30 秒：再长就会撞上客户端自己的超时，等待反而有害。
-            if ms > 30_000 {
-                anyhow::bail!("内部等待预算必须在 0..=30000 毫秒内: {}", ms);
+            if ms > crate::model::config::MAX_ACQUIRE_WAIT_BUDGET_MS {
+                anyhow::bail!(
+                    "内部等待预算必须在 0..={} 毫秒内: {}",
+                    crate::model::config::MAX_ACQUIRE_WAIT_BUDGET_MS,
+                    ms
+                );
             }
         }
 
