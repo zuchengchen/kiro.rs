@@ -358,10 +358,23 @@ impl CreditTotal {
         state.by_credential.clone()
     }
 
+    /// 出现过的最大凭据 id（含已删除凭据留下的条目）
+    ///
+    /// 启动时交给调度层预留 ID：持久化高水位之前被删掉的账号只剩这里的记录。
+    pub fn max_credential_id(&self) -> u64 {
+        self.inner
+            .lock()
+            .by_credential
+            .keys()
+            .copied()
+            .max()
+            .unwrap_or(0)
+    }
+
     /// 丢弃某个凭据的累计量
     ///
-    /// 凭据被删除时调用。`next_id` 由 `max_existing_id + 1` 推导，删掉最大 id 再重启会
-    /// 把它分配给新账号；不清理的话新账号会继承前任的积分。
+    /// 凭据被删除时调用，免得已不存在的账号在文件里一直占位。ID 已经跨重启单调
+    /// （见 `credential_id_watermark`），不会再分给新账号，所以这里只是清理，不影响正确性。
     pub fn forget_credential(&self, credential_id: u64) {
         let mut state = self.inner.lock();
         if state.by_credential.remove(&credential_id).is_none() {
@@ -659,10 +672,22 @@ mod tests {
         assert!((total.snapshot().credits - 3.0).abs() < 1e-12);
         assert_eq!(total.snapshot().calls, 2);
 
-        // 必须已落盘：否则重启后 id 复用会让新账号继承前任的数字
+        // 必须已落盘：重启后已删账号的条目不应复活
         let reloaded = CreditTotal::load(dir.path());
         assert!(!reloaded.by_credential().contains_key(&7));
         assert!((reloaded.by_credential()[&9].credits - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn max_credential_id_covers_accounts_no_longer_live() {
+        let total = CreditTotal::new();
+        assert_eq!(total.max_credential_id(), 0);
+        // 0 表示没走到上游，不进账号维度，也就不影响 ID 预留
+        total.add(0, 1.0);
+        assert_eq!(total.max_credential_id(), 0);
+        total.add(290, 1.0);
+        total.add(6, 1.0);
+        assert_eq!(total.max_credential_id(), 290);
     }
 
     #[test]

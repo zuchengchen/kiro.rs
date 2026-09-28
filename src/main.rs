@@ -235,6 +235,11 @@ async fn main() {
             );
         }
     }
+    // 新账号的 ID 要越过历史里出现过的所有 ID：持久化高水位之前被删掉的账号只留在
+    // credit_total 里，复用它们的 ID 会让新账号继承前任的累计积分和调用数。
+    if let Err(e) = token_manager.reserve_ids_through(credit_total.max_credential_id()) {
+        tracing::warn!("持久化凭据 ID 高水位失败: {}", e);
+    }
     // 把周期用量推给调度层，供每个账号的 maxCycleCredits 判断使用。
     //
     // 必须在播种之后注册：set_usage_sink 会立即推一次当前值，放在播种之前的话推的是

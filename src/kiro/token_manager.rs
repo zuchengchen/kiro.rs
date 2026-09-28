@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
+use crate::kiro::credential_id_watermark;
 use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::kiro_version::USAGE_API_KIRO_VERSION;
 use crate::kiro::machine_id;
@@ -1470,9 +1471,14 @@ impl MultiTokenManager {
         credentials_path: Option<PathBuf>,
         is_multiple_format: bool,
     ) -> anyhow::Result<Self> {
-        // 计算当前最大 ID，为没有 ID 的凭据分配新 ID
+        // 计算当前最大 ID，为没有 ID 的凭据分配新 ID。起点还要越过持久化的高水位：
+        // 被删除的最大 ID 不在现存凭据里，只按现存最大值推导会在重启后复用它。
         let max_existing_id = credentials.iter().filter_map(|c| c.id).max().unwrap_or(0);
-        let mut next_id = max_existing_id + 1;
+        let persisted_watermark = credentials_path
+            .as_deref()
+            .map(credential_id_watermark::load)
+            .unwrap_or(0);
+        let mut next_id = max_existing_id.max(persisted_watermark) + 1;
         let mut has_new_ids = false;
         let mut has_new_machine_ids = false;
         let config_ref = &config;
@@ -1656,10 +1662,42 @@ impl MultiTokenManager {
             }
         }
 
+        // 把本次启动见过的最大 ID 记入高水位：之后即便这个账号在进程外（手工编辑、
+        // 恢复备份）被删掉，下次启动也不会把它的 ID 分给新账号。
+        let max_issued_id = next_id - 1;
+        if max_issued_id > persisted_watermark
+            && let Some(path) = manager.credentials_path.as_deref()
+            && let Err(e) = credential_id_watermark::store(path, max_issued_id)
+        {
+            tracing::warn!("持久化凭据 ID 高水位失败: {}", e);
+        }
+
         // 加载持久化的统计数据（success_count, last_used_at）
         manager.load_stats();
 
         Ok(manager)
+    }
+
+    /// 保证后续新分配的 ID 都大于 `historical_max_id`
+    ///
+    /// 启动时由 main 传入历史记录（credit_total）中出现过的最大凭据 ID。在引入持久化
+    /// 高水位之前，被删除的 ID 只留在这些历史里，现存凭据和高水位文件都不知道它们。
+    pub fn reserve_ids_through(&self, historical_max_id: u64) -> anyhow::Result<()> {
+        let previous = self
+            .next_id
+            .fetch_max(historical_max_id.saturating_add(1), Ordering::Relaxed);
+        if previous > historical_max_id {
+            return Ok(());
+        }
+        tracing::info!(
+            "凭据 ID 起点从 {} 推进到 {}：越过历史记录中的已用 ID",
+            previous,
+            historical_max_id + 1
+        );
+        match self.credentials_path.as_deref() {
+            Some(path) => credential_id_watermark::store(path, historical_max_id),
+            None => Ok(()),
+        }
     }
 
     /// 获取配置的引用
@@ -4440,6 +4478,11 @@ impl MultiTokenManager {
         // 否则删除最后一个账号后再添加会复用旧 ID，导致 trace/usage/kiro_stats
         // 这类按 credential_id 聚合的历史被新账号继承。
         let new_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        // 入库前先推进持久化高水位，跨重启同样不复用。写失败则放弃本次添加：
+        // 没记下的 ID 在删号 + 重启后会被复用，而中止只是跳过一个号。
+        if let Some(path) = self.credentials_path.as_deref() {
+            credential_id_watermark::store(path, new_id)?;
+        }
 
         // 5. 设置 ID 并保留用户输入的元数据
         validated_cred.id = Some(new_id);
@@ -7520,6 +7563,9 @@ mod tests {
     fn tmp_creds_path(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!("kiro_test_{}.json", name));
+        // 路径按名字固定、跨次运行复用：清掉上次留下的 ID 高水位，否则新 ID 的断言
+        // 会被上一次运行推高
+        let _ = std::fs::remove_file(credential_id_watermark::path_for(&p));
         p
     }
 
@@ -7643,6 +7689,94 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn api_key_cred(id: Option<u64>, key: &str) -> KiroCredentials {
+        let mut cred = KiroCredentials::default();
+        cred.id = id;
+        cred.kiro_api_key = Some(key.to_string());
+        cred.auth_method = Some("api_key".to_string());
+        cred
+    }
+
+    /// 删掉最大 ID 后重启：新账号仍不能拿到被删的 ID（修复前 next_id 按现存最大值重算）
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_add_credential_does_not_reuse_deleted_id_after_restart() {
+        let path = tmp_creds_path("no_reuse_after_restart");
+        let cred1 = api_key_cred(Some(1), "ksk_restart_1");
+        let cred2 = api_key_cred(Some(2), "ksk_restart_2");
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred1.clone(), cred2],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+        manager.delete_credential(2).unwrap();
+        drop(manager);
+
+        // 重启：文件里只剩 #1
+        let restarted = MultiTokenManager::new(
+            Config::default(),
+            vec![cred1],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+        let new_id = restarted
+            .add_credential(api_key_cred(None, "ksk_restart_new"))
+            .await
+            .unwrap();
+        assert_eq!(new_id, 3, "重启后被删的 #2 不能分给新账号");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(credential_id_watermark::path_for(&path));
+    }
+
+    /// 历史记录里出现过的 ID（修复前删掉的账号）要被越过，且越过的结果跨重启保留
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_reserve_ids_through_skips_historical_ids_across_restart() {
+        let path = tmp_creds_path("reserve_historical_ids");
+        let cred1 = api_key_cred(Some(1), "ksk_reserve_1");
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred1.clone()],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+        manager.reserve_ids_through(290).unwrap();
+        // 更小的历史值不能把起点拉回去
+        manager.reserve_ids_through(10).unwrap();
+        let first = manager
+            .add_credential(api_key_cred(None, "ksk_reserve_a"))
+            .await
+            .unwrap();
+        assert_eq!(first, 291);
+        manager.delete_credential(first).unwrap();
+        drop(manager);
+
+        let restarted = MultiTokenManager::new(
+            Config::default(),
+            vec![cred1],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+        let second = restarted
+            .add_credential(api_key_cred(None, "ksk_reserve_b"))
+            .await
+            .unwrap();
+        assert_eq!(second, 292, "预留和已发出的 ID 都要跨重启保留");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(credential_id_watermark::path_for(&path));
     }
 
     // ── 并发去重（TOCTOU 回归守卫） ───────────────────────────────────────────

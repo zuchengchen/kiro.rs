@@ -1741,7 +1741,7 @@ impl AdminService {
             trace_store.delete_for_credential(id);
         }
 
-        // 丢弃累计积分的分摊值：id 会被后来的新凭据复用，留着会让新账号继承前任的数字
+        // 丢弃累计积分的分摊值（ID 不会被复用，这里只是清理已删账号的条目）
         if let Some(credit_total) = &self.credit_total {
             credit_total.forget_credential(id);
         }
