@@ -1357,6 +1357,28 @@ async fn handle_non_stream_request(
     }
 }
 
+/// 非流式路径一次性拿到完整响应体后，分块喂给解码器
+///
+/// 解码器缓冲区上限 16 MiB。整个响应体一次 `feed` 时，超过上限的响应会被整体拒绝，之后
+/// 什么也解不出来，客户端拿到的是 200 + 空内容 + `end_turn`，看起来像模型什么都没说。
+/// 分块喂、每块之后立即解码，缓冲区里只留跨块的半截帧，与流式路径的用法一致。
+/// 单帧本身超过上限（上游不会发）时仍会溢出，此时报错而不是假装成功。
+fn decode_buffered_event_stream(
+    body: &[u8],
+) -> Result<Vec<crate::kiro::parser::error::ParseResult<crate::kiro::parser::frame::Frame>>, String>
+{
+    const FEED_CHUNK: usize = 1024 * 1024;
+    let mut decoder = EventStreamDecoder::new();
+    let mut results = Vec::new();
+    for chunk in body.chunks(FEED_CHUNK) {
+        decoder
+            .feed(chunk)
+            .map_err(|e| format!("上游响应帧超过解码缓冲区上限: {e}"))?;
+        results.extend(decoder.decode_iter());
+    }
+    Ok(results)
+}
+
 pub(crate) async fn execute_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
@@ -1423,10 +1445,30 @@ pub(crate) async fn execute_non_stream_request(
     };
 
     // 解析事件流
-    let mut decoder = EventStreamDecoder::new();
-    if let Err(e) = decoder.feed(&body_bytes) {
-        tracing::warn!("缓冲区溢出: {}", e);
-    }
+    let frames = match decode_buffered_event_stream(&body_bytes) {
+        Ok(frames) => frames,
+        Err(e) => {
+            tracing::error!("解码上游响应失败: {}", e);
+            hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
+            tracer.finalize(
+                "error",
+                Some(outcome::UNKNOWN),
+                Some(&e.to_string()),
+                None,
+                TraceUsage::zero(),
+            );
+            return Err(NonStreamExecutionError::Response(
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(ErrorResponse::new(
+                        "api_error",
+                        "Upstream response could not be decoded",
+                    )),
+                )
+                    .into_response(),
+            ));
+        }
+    };
 
     let mut text_content = String::new();
     let mut native_thinking = String::new();
@@ -1452,7 +1494,7 @@ pub(crate) async fn execute_non_stream_request(
     let mut tool_accumulator = super::stream::ToolJsonAccumulator::new();
     let mut tool_json_error: Option<super::stream::ToolJsonAccumulatorError> = None;
 
-    for result in decoder.decode_iter() {
+    for result in frames {
         match result {
             Ok(frame) => {
                 if let Ok(event) = Event::from_frame(frame) {
@@ -2510,6 +2552,53 @@ mod tests {
             "ValidationException: transient backend issue".to_string()
         ));
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// 按 AWS event stream 格式编码一帧（测试用）：只带 `:event-type` 一个字符串头
+    fn encode_event_frame(event_type: &str, payload: &[u8]) -> Vec<u8> {
+        let crc = |data: &[u8]| crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC).checksum(data);
+        let mut headers = Vec::new();
+        let name = b":event-type";
+        headers.push(name.len() as u8);
+        headers.extend_from_slice(name);
+        headers.push(7); // string
+        headers.extend_from_slice(&(event_type.len() as u16).to_be_bytes());
+        headers.extend_from_slice(event_type.as_bytes());
+
+        let total = 12 + headers.len() + payload.len() + 4;
+        let mut frame = Vec::with_capacity(total);
+        frame.extend_from_slice(&(total as u32).to_be_bytes());
+        frame.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+        let prelude_crc = crc(&frame);
+        frame.extend_from_slice(&prelude_crc.to_be_bytes());
+        frame.extend_from_slice(&headers);
+        frame.extend_from_slice(payload);
+        let message_crc = crc(&frame);
+        frame.extend_from_slice(&message_crc.to_be_bytes());
+        frame
+    }
+
+    /// 超过解码缓冲区上限（16 MiB）的完整响应体也要解出全部帧，
+    /// 而不是一次 feed 失败后什么都解不出、返回空的 200
+    #[test]
+    fn buffered_decode_handles_bodies_larger_than_the_decoder_limit() {
+        let frame = encode_event_frame("assistantResponseEvent", &[b' '; 64 * 1024]);
+        let copies = (crate::kiro::parser::decoder::DEFAULT_MAX_BUFFER_SIZE / frame.len()) + 8;
+        let body: Vec<u8> = frame
+            .iter()
+            .copied()
+            .cycle()
+            .take(frame.len() * copies)
+            .collect();
+        assert!(body.len() > crate::kiro::parser::decoder::DEFAULT_MAX_BUFFER_SIZE);
+
+        // 修复前的做法：整体 feed 直接溢出
+        let mut single_shot = EventStreamDecoder::new();
+        assert!(single_shot.feed(&body).is_err());
+
+        let frames = decode_buffered_event_stream(&body).unwrap();
+        assert_eq!(frames.len(), copies);
+        assert!(frames.iter().all(|f| f.is_ok()));
     }
 
     /// 流式 web_search（混合工具）首轮取号就遇到全池限流：必须返回真实的 429 + Retry-After，
