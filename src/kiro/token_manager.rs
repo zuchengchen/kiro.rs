@@ -5089,14 +5089,14 @@ impl MultiTokenManager {
                 anyhow::bail!("冷却时长必须在 1..=86400 秒内: {}", secs);
             }
         }
-        if let Some(ms) = acquire_wait_budget_ms {
-            if ms > crate::model::config::MAX_ACQUIRE_WAIT_BUDGET_MS {
-                anyhow::bail!(
-                    "内部等待预算必须在 0..={} 毫秒内: {}",
-                    crate::model::config::MAX_ACQUIRE_WAIT_BUDGET_MS,
-                    ms
-                );
-            }
+        if let Some(ms) = acquire_wait_budget_ms
+            && ms > crate::model::config::MAX_ACQUIRE_WAIT_BUDGET_MS
+        {
+            anyhow::bail!(
+                "内部等待预算必须在 0..={} 毫秒内: {}",
+                crate::model::config::MAX_ACQUIRE_WAIT_BUDGET_MS,
+                ms
+            );
         }
 
         let _update_guard = self.runtime_config_update_lock.lock();
@@ -8004,11 +8004,12 @@ mod tests {
     }
 
     fn api_key_cred(id: Option<u64>, key: &str) -> KiroCredentials {
-        let mut cred = KiroCredentials::default();
-        cred.id = id;
-        cred.kiro_api_key = Some(key.to_string());
-        cred.auth_method = Some("api_key".to_string());
-        cred
+        KiroCredentials {
+            id,
+            kiro_api_key: Some(key.to_string()),
+            auth_method: Some("api_key".to_string()),
+            ..KiroCredentials::default()
+        }
     }
 
     /// 删掉最大 ID 后重启：新账号仍不能拿到被删的 ID（修复前 next_id 按现存最大值重算）
