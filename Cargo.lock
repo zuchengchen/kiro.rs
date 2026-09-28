@@ -1149,6 +1149,7 @@ dependencies = [
  "fastrand",
  "flate2",
  "futures",
+ "getrandom 0.3.4",
  "hex",
  "http",
  "httpdate",

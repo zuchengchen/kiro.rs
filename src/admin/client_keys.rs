@@ -560,17 +560,9 @@ fn is_false(b: &bool) -> bool {
     !b
 }
 
-/// 生成 `sk-` 前缀 + 32 位 base62 随机字符串
+/// 生成 `sk-` 前缀 + 32 位 base62 随机字符串（系统熵源，见 `common::secure_random`）
 pub fn generate_client_key() -> String {
-    const CHARSET: &[u8] =
-        b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let body: String = (0..32)
-        .map(|_| {
-            let idx = fastrand::usize(..CHARSET.len());
-            CHARSET[idx] as char
-        })
-        .collect();
-    format!("sk-{}", body)
+    format!("sk-{}", crate::common::secure_random::alphanumeric(32))
 }
 
 /// 脱敏展示：保留前 8 个字符（含前缀）和后 4 个字符

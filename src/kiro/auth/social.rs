@@ -252,16 +252,11 @@ fn base64_encode_standard(data: &[u8]) -> String {
 
 /// 生成 PKCE code_verifier 和 code_challenge
 pub fn generate_pkce() -> (String, String) {
-    // 32 字节随机数作为 verifier（与 IDE crypto.randomBytes(32).toString("base64url") 等价）
+    // 32 字节随机数作为 verifier（与 IDE crypto.randomBytes(32).toString("base64url") 等价）。
+    // 必须来自系统熵源：原来用 fastrand 再异或 uuid，uuid 的版本位 / 变体位是常量，
+    // 对应的字节只剩 fastrand 的可预测输出。
     let mut bytes = [0u8; 32];
-    for (i, b) in bytes.iter_mut().enumerate() {
-        *b = fastrand::u8(..).wrapping_add(i as u8);
-    }
-    // 使用 uuid v4 的随机性来增强
-    let uuid_bytes = uuid::Uuid::new_v4().as_bytes().to_owned();
-    for (i, b) in bytes.iter_mut().enumerate() {
-        *b ^= uuid_bytes[i % 16];
-    }
+    crate::common::secure_random::fill_bytes(&mut bytes);
 
     let verifier = base64url_encode(&bytes);
 
