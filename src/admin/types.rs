@@ -1018,6 +1018,9 @@ pub struct CreateClientKeyResponse {
     pub key: String,
     pub name: String,
     pub created_at: String,
+    /// 操作已生效但有后续步骤失败（如系统密钥轮换后写 config.json 失败）时的提示
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 /// 更新客户端 Key 元数据

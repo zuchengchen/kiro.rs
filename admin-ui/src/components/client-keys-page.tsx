@@ -195,6 +195,10 @@ export function ClientKeysPage() {
       const res = await rotateKey.mutateAsync(item.id)
       setCreatedKey(res)
       setShowCreatedPlain(true)
+      // 轮换已生效但持久化失败：新明文照常展示，同时提醒重启前重试
+      if (res.warning) {
+        toast.error(res.warning, { duration: 15000 })
+      }
       // 系统密钥轮换后本地存储的 apiKey 已失效，提示用户用新明文重新登录
       if (item.isSystem) {
         toast.info('系统密钥已更新，若你正用该密钥登录管理面板，请用新明文重新登录')

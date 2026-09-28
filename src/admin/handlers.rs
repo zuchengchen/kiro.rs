@@ -969,11 +969,12 @@ pub async fn update_admin_key(
             .into_response();
     }
 
-    // 更新内存中的登录API密钥
-    *state.admin_api_key.write() = new_key.clone();
-
-    // 通过 service 持久化到 config.json（从磁盘加载最新后再写，避免覆盖其他字段）
-    state.service.persist_admin_key(&new_key);
+    // 先持久化到 config.json（从磁盘加载最新后再写，避免覆盖其他字段），成功后才切换内存：
+    // 写盘失败时若已切换，面板会提示成功，新密钥却在重启后悄悄换回旧值。
+    if let Err(e) = state.service.persist_admin_key(&new_key) {
+        return (e.status_code(), Json(e.into_response())).into_response();
+    }
+    *state.admin_api_key.write() = new_key;
 
     Json(SuccessResponse::new("登录API密钥已更新")).into_response()
 }
@@ -1059,6 +1060,7 @@ pub async fn create_client_key(
         key: entry.key,
         name: entry.name,
         created_at: entry.created_at,
+        warning: None,
     })
     .into_response()
 }
@@ -1217,15 +1219,26 @@ pub async fn rotate_client_key(
     use axum::http::StatusCode;
     match state.client_keys.rotate(id) {
         Some(entry) => {
-            // 避免重启时被 config.apiKey 中的旧值覆盖。
-            if entry.is_system {
-                state.service.persist_api_key(&entry.key);
-            }
+            // 避免重启时被 config.apiKey 中的旧值覆盖。轮换已经生效、旧明文已失效，
+            // 写 config.json 失败时不能报错丢掉新明文（它只在这里出现一次），改为随响应
+            // 带回警告，让管理员知道重启前需要重试。
+            let warning = if entry.is_system {
+                state.service.persist_api_key(&entry.key).err().map(|e| {
+                    tracing::warn!("系统密钥已轮换，但写回 config.json 失败: {}", e);
+                    format!(
+                        "新密钥已生效，但写入 config.json 失败（{}）。重启前请重试轮换，否则重启后会恢复为旧密钥",
+                        e
+                    )
+                })
+            } else {
+                None
+            };
             Json(CreateClientKeyResponse {
                 id: entry.id,
                 key: entry.key,
                 name: entry.name,
                 created_at: entry.created_at,
+                warning,
             })
             .into_response()
         }

@@ -1920,15 +1920,21 @@ impl AdminService {
     }
 
     /// 持久化新的登录API密钥（adminApiKey）到配置文件（内存中的 key 由 handler 层负责更新）
-    pub fn persist_admin_key(&self, new_key: &str) {
+    ///
+    /// 失败必须上报：密钥写不进 config.json，重启后会悄悄换回旧值。
+    pub fn persist_admin_key(&self, new_key: &str) -> Result<(), AdminServiceError> {
         let key = new_key.to_string();
-        self.update_config_file(move |c| c.admin_api_key = Some(key));
+        self.token_manager
+            .update_config_file(move |c| c.admin_api_key = Some(key))
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))
     }
 
-    /// 将系统密钥写回 `config.json`。
-    pub fn persist_api_key(&self, new_key: &str) {
+    /// 将系统密钥写回 `config.json`。失败时重启会用 config 里的旧值覆盖新密钥。
+    pub fn persist_api_key(&self, new_key: &str) -> Result<(), AdminServiceError> {
         let key = new_key.to_string();
-        self.update_config_file(move |c| c.api_key = Some(key));
+        self.token_manager
+            .update_config_file(move |c| c.api_key = Some(key))
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))
     }
 
     /// 获取在线更新配置（GitHub Token 只返回是否已配置）
@@ -3919,6 +3925,41 @@ mod tests {
         assert_eq!(region.title, "区域");
         assert_eq!(region.description.as_deref(), Some("凭据所属区域"));
         assert_eq!(region.value, serde_json::json!("us-east-1"));
+    }
+
+    /// 写不进 config.json 必须上报，否则面板提示成功、重启后密钥悄悄换回旧值
+    #[tokio::test]
+    async fn persist_admin_key_reports_write_failures() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base =
+            std::env::temp_dir().join(format!("kiro_persist_key_{}_{}", std::process::id(), nonce));
+
+        // 目录不存在 → 写盘失败 → 返回错误
+        let missing = Config::load(base.join("missing").join("config.json")).unwrap();
+        let manager =
+            Arc::new(MultiTokenManager::new(missing, Vec::new(), None, None, false).unwrap());
+        let service = AdminService::new(manager, Vec::new());
+        assert!(service.persist_admin_key("sk-new-admin").is_err());
+        assert!(service.persist_api_key("sk-new-api").is_err());
+
+        // 正常目录 → 写入成功，值落到文件里
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::load(&path).unwrap(), Vec::new(), None, None, false)
+                .unwrap(),
+        );
+        let service = AdminService::new(manager, Vec::new());
+        service.persist_admin_key("sk-new-admin").unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().admin_api_key.as_deref(),
+            Some("sk-new-admin")
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]

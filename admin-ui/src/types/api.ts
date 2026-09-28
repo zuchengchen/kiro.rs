@@ -514,6 +514,8 @@ export interface CreateClientKeyResponse {
   key: string
   name: string
   createdAt: string
+  /** 操作已生效但后续步骤失败时的提示（如系统密钥轮换后写 config.json 失败） */
+  warning?: string
 }
 
 export interface UpdateClientKeyRequest {
