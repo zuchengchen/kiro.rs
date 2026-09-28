@@ -54,7 +54,7 @@ git push origin main-czc
 成功路径（静默缺失）。解完冲突标记后跑全量测试，并逐个复核上游新增的调用点是否也要
 走我们的定制。
 
-解冲突时必须守住的三条不变量：
+解冲突时必须守住的三条不变量（第 2 条的流式 web_search 入口见下方定制清单后的说明）：
 
 1. **不能持 `parking_lot` guard 跨 `.await`**。guard 是 `!Send`，会让 handler
    future 变成 `!Send`（编译不过），强行绕过则阻塞 OS 线程、卡住所有需要
@@ -114,6 +114,17 @@ image tag 和 `deployment-*.json` 沿用同一个编号（`kiro-rs:0.9.0.1`）�
 | `a84e02e` | Admin UI 区分「同凭据换桶」与「转其他凭据」救回 |
 | `bd53626` | 按账号周期积分上限参与调度（粘性选号同样受限） |
 | v0.9.0 合并 | Claude 固定 90% 缓存命中（`src/anthropic/fixed_cache_ratio.rs`），其他模型走上游计量；取代 `a90235e` / `6c26708` 的全模型固定比例 |
+| `0338d8b` | 凭据 ID 跨重启单调（`src/kiro/credential_id_watermark.rs`）：删号 + 重启不再把旧 ID 分给新账号 |
+| `9065d67` | API Key / PKCE 用系统熵源生成（`src/common/secure_random.rs`），不再用 `fastrand` |
+
+2026-09-28 全项目审查的其余修复（`8085197..HEAD`）都是对已有代码的缺陷修正，
+没有新功能，逐条见各自的提交说明。其中会影响合并判断的两处上游代码改动：
+
+- 流式 web_search agentic loop（`websearch_loop.rs::run_web_search_loop`）在首次
+  上游尝试成功前不提交 HTTP 200，靠 `RequestTracer::subscribe_first_success`。
+  上游若重写这个入口，要保住「首轮失败返回真实 429 + Retry-After」。
+- `Config` 带 `#[serde(flatten)] unknown_fields`，保存时原样写回不认识的字段；
+  上游给 `Config` 加字段不会冲突，但别删掉它（回滚安全靠它）。
 
 写定制时的两个习惯，能显著减少下次冲突：
 
@@ -128,8 +139,16 @@ image tag 和 `deployment-*.json` 沿用同一个编号（`kiro-rs:0.9.0.1`）�
 
 ```bash
 cd admin-ui && pnpm install --no-frozen-lockfile && ./node_modules/.bin/vite build
-cd .. && cargo test          # 当前基线 815 通过
+cd .. && cargo test          # 当前基线 849 通过
 ```
+
+CI（`.github/workflows/test.yaml`）在 main-czc 的 push / PR 上跑 `bun install
+--frozen-lockfile && bun run build`（含 `tsc -b`）、`cargo test --locked` 和
+`cargo audit`。`build.yaml` 也跟 main-czc；`docker-build.yaml` 故意仍挂在废弃的
+`dev-czc` 上——它会往 Docker Hub 推镜像，而生产镜像是本地从 `git archive` 构建的。
+截至 2026-09-28 这个仓库在 GitHub 上一次 workflow run 都没有（Actions API
+`total_count: 0`），推送后若仍无记录，检查仓库设置里 Actions 是否被禁用（fork
+默认禁用）。
 
 仓库跟踪的是 `admin-ui/bun.lock`；上面的 `pnpm install` 会生成一个未跟踪的
 `admin-ui/pnpm-lock.yaml`，构建完删掉，别提交。
