@@ -5,7 +5,7 @@
 ```
 hank9999/kiro.rs        原始项目。版本号是日期式（v2026.3.1）。
         ↓               落后我们约 36k 行，永远不要直接 merge 它。
-ZyphrZero/kiro.rs       我们真正的上游。0.x 语义版本（v0.8.0）。
+ZyphrZero/kiro.rs       我们真正的上游。0.x 语义版本（v0.9.0）。
         ↓               = git remote `upstream`
 zuchengchen/kiro.rs     本仓库。= git remote `origin`
 ```
@@ -20,13 +20,14 @@ zuchengchen/kiro.rs     本仓库。= git remote `origin`
 | `master` | **上游纯镜像**，不放任何定制 | `upstream/master` |
 | `main-czc` | **定制主分支**，生产部署来源 | `origin/main-czc` |
 
-`git diff master main-czc -- src/` 就是我们全部的定制（约 1,900 行 / 12 个文件）。
+`git diff master main-czc -- src/` 就是我们全部的定制（相对 v0.9.0 约 +4,200 / −400 行，27 个文件）。
 
 ## 同步上游
 
 ```bash
 git fetch upstream
 git log --oneline main-czc..upstream/master     # 先看有什么
+git merge-tree --write-tree --name-only main-czc upstream/master   # 空跑：冲突文件列表，不动工作区
 
 git checkout master && git merge --ff-only upstream/master && git push origin master
 
@@ -40,11 +41,18 @@ git push origin main-czc
 
 ### 常见冲突点
 
-定制集中在上游的活跃区，这三个文件几乎每次都冲突：
+定制集中在上游的活跃区，这几个文件几乎每次都冲突：
 
 - `src/kiro/token_manager.rs` — 选号策略 + 取号路径（我们的限流内部等待在这里）
 - `src/kiro/provider.rs` — 重试循环、429 换桶
 - `src/anthropic/responses.rs` — 流式分流
+- `src/anthropic/cache_metering.rs` — 上游反复重写计量；我们的固定比例已移到
+  `fixed_cache_ratio.rs`，该文件与上游保持一致，冲突时直接取上游版本
+
+**没报冲突不等于合对了。** v0.9.0 合并时：上游删掉的函数仍被我们调用（编译失败）、
+断言旧语义的测试被静默合入（测试失败）、上游新加的 `bind_session` 没覆盖我们的换桶
+成功路径（静默缺失）。解完冲突标记后跑全量测试，并逐个复核上游新增的调用点是否也要
+走我们的定制。
 
 解冲突时必须守住的三条不变量：
 
@@ -55,35 +63,37 @@ git push origin main-czc
    持续 429 风暴（曾实测 8 天 19,454 次伪 429，单次冷却连带拒绝 635 个请求）。
 3. **`AcquireWaitBudget` 必须由最外层调用方创建并跨重试共享**。每次取号各自
    新建预算会把单请求累计等待放大到 `轮数 × 预算`（WebSearch 6 轮 × 4 次重试）。
+   上游新增的取号入口（如 v0.9.0 的 `acquire_context_routed`）要改成接收调用方的
+   预算，不能照搬上游签名。
 
-## 版本号：`0.8.0.8` = 上游基线 + 定制迭代号
+## 版本号：`0.9.0.1` = 上游基线 + 定制迭代号
 
 第四段是本仓库的定制迭代号，前三段永远是我们所基于的上游基线。这样上游发到
-`0.8.8` 也不会和我们的编号撞车。
+`0.9.1` 也不会和我们的编号撞车。
 
-**Cargo 不接受四段版本号**（`0.8.0.8` 直接报 `unexpected character '.' after
+**Cargo 不接受四段版本号**（`0.9.0.1` 直接报 `unexpected character '.' after
 patch version number`），所以三个版本文件里写的是 semver build metadata 形式：
 
 | 文件 | 值 |
 |---|---|
-| `Cargo.toml` | `0.8.0+9` |
-| `Cargo.lock`（kiro-rs 自身条目） | `0.8.0+9` |
-| `admin-ui/package.json` | `0.8.0+9` |
+| `Cargo.toml` | `0.9.0+1` |
+| `Cargo.lock`（kiro-rs 自身条目） | `0.9.0+1` |
+| `admin-ui/package.json` | `0.9.0+1` |
 
-`display_version()`（`src/admin/service.rs`）在对外暴露时把 `+8` 还原成 `.8`，
-Admin UI 显示 `v0.8.0.8`。`parse_semver_core()` 返回 `[u32; 4]`，两种形式都解析
-成同一个 `[0,8,0,8]` —— 显示形式会回流进 `compare_semver`（`current_version`
+`display_version()`（`src/admin/service.rs`）在对外暴露时把 `+1` 还原成 `.1`，
+Admin UI 显示 `v0.9.0.1`。`parse_semver_core()` 返回 `[u32; 4]`，两种形式都解析
+成同一个 `[0,9,0,1]` —— 显示形式会回流进 `compare_semver`（`current_version`
 已是显示形式），两者必须一致，否则第四段被 `splitn` 吞掉。
 
-更新提示的语义因此是对的：我们 `[0,8,0,8]` > 上游 `0.8.0` = `[0,8,0,0]`，不提示；
-上游发 `0.8.1`/`0.8.8`/`0.9.0` 时前三段更大，正常提示。上游历史 tag 全是纯三段
-（`v0.7.0` … `v0.8.0`），从未带 `+`，所以第四段解析为 0 不会误判。
+更新提示的语义因此是对的：我们 `[0,9,0,1]` > 上游 `0.9.0` = `[0,9,0,0]`，不提示；
+上游发 `0.9.1`/`0.9.8`/`0.10.0` 时前三段更大，正常提示。上游历史 tag 全是纯三段
+（`v0.7.0` … `v0.9.0`），从未带 `+`，所以第四段解析为 0 不会误判。
 
 **升级定制迭代号时三个文件一起改**，只改 `Cargo.toml` 会让 `Cargo.lock` 和
 `package.json` 落后。合并上游时这三行都会冲突：保留上游的三段基线，把 `+N` 接
 回去；基线变了（如上游到 0.9.0）则迭代号归 1。
 
-image tag 和 `deployment-*.json` 沿用同一个编号（`kiro-rs:0.8.0.8`）。历史上
+image tag 和 `deployment-*.json` 沿用同一个编号（`kiro-rs:0.9.0.1`）。历史上
 `0.8.1`–`0.8.8` 那批部署记录是旧的两段式本地编号，留着不动，它们是历史追溯点。
 
 ## Tag 约定
@@ -92,14 +102,16 @@ image tag 和 `deployment-*.json` 沿用同一个编号（`kiro-rs:0.8.0.8`）�
 - **不要 `git push --tags`。** 上游 tag 会污染 `origin`。已设
   `remote.upstream.tagOpt=--no-tags` 阻止拉取，推送时显式指定 tag 名。
 
-## 定制清单（相对上游 v0.8.0）
+## 定制清单（相对上游 v0.9.0）
 
 | 提交 | 内容 |
 |---|---|
 | `6924c26` | 端点分桶 + 429 同账号换桶 failover |
-| `0ace7b9` | 额度感知选号（现降级为同 priority 内的 tie-break） |
+| `0ace7b9` | 额度感知选号（现降级为同 priority 内的 tie-break；会话粘性命中时跳过） |
 | `aedc64c` | 全池冷却内部等待（`acquireWaitBudgetMs`）+ `agentMode` |
 | `a84e02e` | Admin UI 区分「同凭据换桶」与「转其他凭据」救回 |
+| `bd53626` | 按账号周期积分上限参与调度（粘性选号同样受限） |
+| v0.9.0 合并 | Claude 固定 90% 缓存命中（`src/anthropic/fixed_cache_ratio.rs`），其他模型走上游计量；取代 `a90235e` / `6c26708` 的全模型固定比例 |
 
 写定制时的两个习惯，能显著减少下次冲突：
 
@@ -114,8 +126,11 @@ image tag 和 `deployment-*.json` 沿用同一个编号（`kiro-rs:0.8.0.8`）�
 
 ```bash
 cd admin-ui && pnpm install --no-frozen-lockfile && ./node_modules/.bin/vite build
-cd .. && cargo test          # 当前基线 712 通过
+cd .. && cargo test          # 当前基线 815 通过
 ```
+
+仓库跟踪的是 `admin-ui/bun.lock`；上面的 `pnpm install` 会生成一个未跟踪的
+`admin-ui/pnpm-lock.yaml`，构建完删掉，别提交。
 
 注意 `cargo fmt` 会格式化整个 crate，忽略文件参数——它会顺带重排大量无关文件，
 提交前用 `git checkout --` 撤回那些噪音，保持 diff 干净。
