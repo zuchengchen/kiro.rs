@@ -138,24 +138,22 @@ pub(crate) fn has_web_search_among_tools(req: &MessagesRequest) -> bool {
 
 /// 从消息中提取搜索查询
 ///
-/// 读取 messages 的第一条消息的第一个内容块
-/// 并去除 "Perform a web search for the query: " 前缀
+/// 读取**最后一条** user 消息里的第一个文本块，并去除 "Perform a web search for the query: " 前缀。
+///
+/// 不能读第一条消息：Claude Code 的 WebSearch 子请求只有一条消息，两者没有区别；但多轮对话里
+/// 第一条是对话开头，每一轮都会拿开头那句话去搜，与用户当前的问题无关。
 pub fn extract_search_query(req: &MessagesRequest) -> Option<String> {
-    // 获取第一条消息
-    let first_msg = req.messages.first()?;
+    let latest_user = req.messages.iter().rev().find(|m| m.role == "user")?;
 
-    // 提取文本内容
-    let text = match &first_msg.content {
+    // 提取文本内容（图片、tool_result 等非文本块跳过）
+    let text = match &latest_user.content {
         serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Array(arr) => {
-            // 获取第一个内容块
-            let first_block = arr.first()?;
-            if first_block.get("type")?.as_str()? == "text" {
-                first_block.get("text")?.as_str()?.to_string()
-            } else {
-                return None;
-            }
-        }
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .find(|block| block.get("type").and_then(|t| t.as_str()) == Some("text"))?
+            .get("text")?
+            .as_str()?
+            .to_string(),
         _ => return None,
     };
 
@@ -1013,6 +1011,47 @@ mod tests {
 
         let query = extract_search_query(&req);
         assert_eq!(query, Some("What is the weather today?".to_string()));
+    }
+
+    /// 多轮对话要搜最后一轮的问题，而不是对话开头那句
+    #[test]
+    fn test_extract_search_query_uses_latest_user_turn() {
+        use crate::anthropic::types::Message;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!("Hello, who are you?"),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("I'm an assistant."),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA=="}},
+                        {"type": "text", "text": "rust 1.97 release notes"}
+                    ]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            cache_control: None,
+        };
+
+        assert_eq!(
+            extract_search_query(&req),
+            Some("rust 1.97 release notes".to_string())
+        );
     }
 
     #[test]
