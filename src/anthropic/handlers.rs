@@ -6,7 +6,8 @@ use std::time::Instant;
 
 use crate::admin::client_keys::SharedClientKeyManager;
 use crate::admin::trace_db::{
-    SharedTraceStore, TraceAttempt, TraceKeySource, TraceRecord, TraceSink, outcome,
+    SharedTraceStore, TraceAttempt, TraceKeySource, TraceRecord, TraceRoute, TraceSink, outcome,
+    usage_source,
 };
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
 use crate::kiro::model::available_models::{TokenLimits, UpstreamModel};
@@ -31,7 +32,7 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
-use super::converter::{ConversionError, convert_request_with_mode};
+use super::converter::{ConversionError, convert_request_with_mode, get_context_window_size};
 use super::middleware::{AppState, KeyContext};
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{
@@ -137,12 +138,52 @@ pub(crate) struct RequestTracer {
     ts: String,
     key_id: u64,
     key_source: TraceKeySource,
+    client_ip: Option<String>,
     model: String,
     is_stream: bool,
     started_at: Instant,
     /// 首个上游 chunk 到达时刻（仅流式标记；取第一次）
     first_token_at: parking_lot::Mutex<Option<Instant>>,
     attempts: parking_lot::Mutex<Vec<TraceAttempt>>,
+    /// 首次选号的路由决策。web_search 一条 trace 内多次 provider 调用，
+    /// 「是否沿用了上一轮账号」只看第一次。
+    route: parking_lot::Mutex<Option<TraceRoute>>,
+}
+
+/// usage 三项的来源，落到 trace 行便于区分「上游真值」与「本地估算」。
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) enum UsageSource {
+    /// 错误早退等无用量场景
+    #[default]
+    Unknown,
+    /// 上游 metadataEvent.tokenUsage
+    Provider,
+    /// 本地 CacheMeter 按断点估算
+    Simulated,
+    /// 无断点 / 计量关闭
+    None,
+}
+
+impl UsageSource {
+    fn as_db(self) -> Option<&'static str> {
+        match self {
+            Self::Unknown => Option::None,
+            Self::Provider => Some(usage_source::PROVIDER),
+            Self::Simulated => Some(usage_source::SIMULATED),
+            Self::None => Some(usage_source::NONE),
+        }
+    }
+
+    /// 由「上游是否给了精确用量」与「本地模拟是否覆盖到前缀」推断来源。
+    pub fn resolve(has_provider_usage: bool, cache_usage: &super::cache_metering::CacheUsage) -> Self {
+        if has_provider_usage {
+            Self::Provider
+        } else if cache_usage.cache_covered_est > 0 {
+            Self::Simulated
+        } else {
+            Self::None
+        }
+    }
 }
 
 /// 本次请求的用量快照（落入 trace 行，与 usage_log 同源）
@@ -153,6 +194,7 @@ pub(crate) struct TraceUsage {
     pub cache_creation_tokens: u64,
     pub cache_read_tokens: u64,
     pub credits: f64,
+    pub source: UsageSource,
 }
 
 impl TraceUsage {
@@ -176,11 +218,13 @@ impl RequestTracer {
             ts: Utc::now().to_rfc3339(),
             key_id: options.key_ctx.key_id,
             key_source: options.key_ctx.key_source,
+            client_ip: options.key_ctx.client_ip,
             model: options.model,
             is_stream: options.is_stream,
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
+            route: parking_lot::Mutex::new(None),
         }
     }
 
@@ -212,6 +256,7 @@ impl RequestTracer {
             .first_token_at
             .lock()
             .map(|t| t.duration_since(self.started_at).as_millis() as u64);
+        let route = self.route.lock().take();
         let rec = TraceRecord {
             trace_id: self.trace_id.clone(),
             ts: self.ts.clone(),
@@ -232,6 +277,15 @@ impl RequestTracer {
             cache_read_tokens: usage.cache_read_tokens,
             credits: usage.credits,
             first_token_ms,
+            session_id: route.as_ref().and_then(|r| r.session_id.clone()),
+            sticky_outcome: route.as_ref().map(|r| r.sticky_outcome.to_string()),
+            previous_credential_id: route.as_ref().and_then(|r| r.previous_credential_id),
+            usage_source: super::fixed_cache_ratio::trace_usage_source(
+                &self.model,
+                usage.source.as_db(),
+            )
+            .map(|s| s.to_string()),
+            client_ip: self.client_ip.clone(),
             attempts,
         };
         store.insert(&rec);
@@ -246,6 +300,13 @@ impl TraceSink for RequestTracer {
         // before persisting to the (trace_id, attempt) primary key.
         attempt.attempt = attempts.len() as u32;
         attempts.push(attempt);
+    }
+
+    fn on_route(&self, route: TraceRoute) {
+        let mut slot = self.route.lock();
+        if slot.is_none() {
+            *slot = Some(route);
+        }
     }
 }
 
@@ -322,6 +383,21 @@ fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 pub(super) fn map_provider_error(err: Error) -> Response {
+    if err
+        .downcast_ref::<crate::kiro::error::UpstreamContextOverflowError>()
+        .is_some()
+    {
+        tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满（不应重试）");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                "Context window is full. Reduce conversation history, system prompt, or tools.",
+            )),
+        )
+            .into_response();
+    }
+
     if let Some(rate_limit) = err.downcast_ref::<crate::kiro::error::UpstreamRateLimitError>() {
         tracing::warn!(error = %err, "上游限流（映射为 429）");
         let mut response = (
@@ -498,6 +574,14 @@ fn infer_model_owner(model_id: &str) -> &'static str {
     }
 }
 
+fn context_window_from_upstream(model_id: &str, token_limits: Option<&TokenLimits>) -> i32 {
+    token_limits
+        .and_then(|limits| limits.max_input_tokens)
+        .and_then(|limit| i32::try_from(limit).ok())
+        .filter(|limit| *limit > 0)
+        .unwrap_or_else(|| get_context_window_size(model_id))
+}
+
 fn model_from_upstream(upstream: UpstreamModel) -> Model {
     let max_tokens = upstream
         .token_limits
@@ -506,6 +590,8 @@ fn model_from_upstream(upstream: UpstreamModel) -> Model {
         .and_then(|limit| i32::try_from(limit).ok())
         .filter(|limit| *limit > 0)
         .unwrap_or(64_000);
+    let context_window =
+        context_window_from_upstream(&upstream.model_id, upstream.token_limits.as_ref());
     Model {
         display_name: upstream
             .model_name
@@ -516,6 +602,7 @@ fn model_from_upstream(upstream: UpstreamModel) -> Model {
         object: "model".to_string(),
         created: 0,
         model_type: "chat".to_string(),
+        context_window,
         max_tokens,
     }
 }
@@ -563,6 +650,9 @@ fn aggregate_available_models_with_custom(
                 .clone()
                 .unwrap_or_else(|| custom.id.clone()),
             model_type: "chat".to_string(),
+            context_window: custom
+                .context_window
+                .unwrap_or_else(|| get_context_window_size(&custom.id)),
             max_tokens: custom.max_tokens.unwrap_or(64_000),
         };
         models.insert(model.id.clone(), model);
@@ -752,6 +842,10 @@ pub async fn post_messages(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
+                ConversionError::InvalidMessageSequence(reason) => (
+                    "invalid_request_error",
+                    format!("消息序列无效: {}", reason),
+                ),
                 ConversionError::UnsupportedToolMapping(reason) => (
                     "invalid_request_error",
                     format!("工具映射不支持: {}", reason),
@@ -813,11 +907,12 @@ pub async fn post_messages(
 
     // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存。
     // 返回 estimate 口径的覆盖量；真实 input/cache 互斥分摊在拿到 total 真值时进行。
-    let cache_usage = state
-        .cache_meter
-        .as_ref()
-        .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
-        .unwrap_or_default();
+    let cache_usage = match state.cache_meter.as_ref() {
+        Some(cache) => {
+            super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id).await
+        }
+        None => super::cache_metering::CacheUsage::default(),
+    };
 
     if payload.stream {
         // 流式响应
@@ -1168,6 +1263,7 @@ fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
         output_tokens: ctx.resolved_output_tokens() as u64,
         cache_creation_tokens: cache_creation.max(0) as u64,
         cache_read_tokens: cache_read.max(0) as u64,
+        source: UsageSource::resolve(ctx.provider_token_usage.is_some(), &ctx.cache_usage),
         credits: if ctx.credits.is_finite() && ctx.credits > 0.0 {
             ctx.credits
         } else {
@@ -1176,7 +1272,25 @@ fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
     }
 }
 
-use super::converter::get_context_window_size;
+pub(crate) enum NonStreamExecutionError {
+    Provider(Error),
+    Response(Response),
+}
+
+pub(crate) fn new_non_stream_request_tracer(
+    state: &AppState,
+    key_ctx: KeyContext,
+    model: String,
+) -> std::sync::Arc<RequestTracer> {
+    std::sync::Arc::new(RequestTracer::new(
+        state,
+        RequestTraceOptions {
+            key_ctx,
+            model,
+            is_stream: false,
+        },
+    ))
+}
 
 /// 处理非流式请求
 async fn handle_non_stream_request(
@@ -1194,6 +1308,38 @@ async fn handle_non_stream_request(
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
 ) -> Response {
+    match execute_non_stream_request(
+        provider,
+        request_body,
+        model,
+        input_tokens,
+        thinking_enabled,
+        tool_name_map,
+        hook,
+        cache_usage,
+        tracer,
+        group,
+    )
+    .await
+    {
+        Ok(response_body) => (StatusCode::OK, Json(response_body)).into_response(),
+        Err(NonStreamExecutionError::Provider(error)) => map_provider_error(error),
+        Err(NonStreamExecutionError::Response(response)) => response,
+    }
+}
+
+pub(crate) async fn execute_non_stream_request(
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    request_body: &str,
+    model: &str,
+    input_tokens: i32,
+    thinking_enabled: bool,
+    tool_name_map: std::collections::HashMap<String, String>,
+    hook: UsageRecordHook,
+    cache_usage: super::cache_metering::CacheUsage,
+    tracer: std::sync::Arc<RequestTracer>,
+    group: Option<String>,
+) -> Result<serde_json::Value, NonStreamExecutionError> {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
         .call_api(request_body, Some(tracer.as_ref()), group.as_deref())
@@ -1209,7 +1355,7 @@ async fn handle_non_stream_request(
                 None,
                 TraceUsage::zero(),
             );
-            return map_provider_error(e);
+            return Err(NonStreamExecutionError::Provider(e));
         }
     };
     let response = call_result.response;
@@ -1228,14 +1374,16 @@ async fn handle_non_stream_request(
                 None,
                 TraceUsage::zero(),
             );
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse::new(
-                    "api_error",
-                    format!("读取响应失败: {}", e),
-                )),
-            )
-                .into_response();
+            return Err(NonStreamExecutionError::Response(
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(ErrorResponse::new(
+                        "api_error",
+                        format!("读取响应失败: {}", e),
+                    )),
+                )
+                    .into_response(),
+            ));
         }
     };
 
@@ -1378,7 +1526,7 @@ async fn handle_non_stream_request(
     if let Some(err) = tool_json_error {
         let message = err.message();
         if let Some(usage) = provider_token_usage {
-            let usage = usage.sanitized();
+            let usage = super::fixed_cache_ratio::apply_token_usage(model, usage.sanitized());
             let trace_usage = TraceUsage {
                 input_tokens: usage.uncached_input_tokens as u64,
                 output_tokens: usage.output_tokens as u64,
@@ -1389,6 +1537,7 @@ async fn handle_non_stream_request(
                 } else {
                     0.0
                 },
+                source: UsageSource::Provider,
             };
             hook.record(
                 credential_id,
@@ -1417,11 +1566,13 @@ async fn handle_non_stream_request(
                 TraceUsage::zero(),
             );
         }
-        return (
-            StatusCode::BAD_GATEWAY,
-            Json(ErrorResponse::new("upstream_tool_json_error", message)),
-        )
-            .into_response();
+        return Err(NonStreamExecutionError::Response(
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse::new("upstream_tool_json_error", message)),
+            )
+                .into_response(),
+        ));
     }
 
     // 确定 stop_reason
@@ -1451,6 +1602,11 @@ async fn handle_non_stream_request(
             fallback_output_tokens,
             cache_usage,
             provider_token_usage,
+        );
+    let (final_input_tokens, cache_creation_tokens, cache_read_tokens) =
+        super::fixed_cache_ratio::apply(
+            model,
+            (final_input_tokens, cache_creation_tokens, cache_read_tokens),
         );
 
     // 构建 Anthropic 响应
@@ -1502,9 +1658,10 @@ async fn handle_non_stream_request(
             } else {
                 0.0
             },
+            source: UsageSource::resolve(provider_token_usage.is_some(), &cache_usage),
         },
     );
-    (StatusCode::OK, Json(response_body)).into_response()
+    Ok(response_body)
 }
 
 fn build_non_stream_content(
@@ -1741,6 +1898,10 @@ pub async fn post_messages_cc(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
+                ConversionError::InvalidMessageSequence(reason) => (
+                    "invalid_request_error",
+                    format!("消息序列无效: {}", reason),
+                ),
                 ConversionError::UnsupportedToolMapping(reason) => (
                     "invalid_request_error",
                     format!("工具映射不支持: {}", reason),
@@ -1801,11 +1962,12 @@ pub async fn post_messages_cc(
     let known_tool_names = conversion_result.known_tool_names;
 
     // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存（estimate 口径）。
-    let cache_usage = state
-        .cache_meter
-        .as_ref()
-        .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
-        .unwrap_or_default();
+    let cache_usage = match state.cache_meter.as_ref() {
+        Some(cache) => {
+            super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id).await
+        }
+        None => super::cache_metering::CacheUsage::default(),
+    };
 
     if payload.stream {
         // 流式响应（缓冲模式）
@@ -2010,6 +2172,7 @@ fn create_buffered_sse_stream(
                                         cache_creation_tokens: cc.max(0) as u64,
                                         cache_read_tokens: cr.max(0) as u64,
                                         credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
+                                        source: UsageSource::resolve(ctx.has_provider_usage(), ctx.cache_usage()),
                                     },
                                 );
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
@@ -2030,6 +2193,7 @@ fn create_buffered_sse_stream(
                                     cache_creation_tokens: cc.max(0) as u64,
                                     cache_read_tokens: cr.max(0) as u64,
                                     credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
+                                    source: UsageSource::resolve(ctx.has_provider_usage(), ctx.cache_usage()),
                                 };
                                 if let Some(message) = ctx.tool_json_error_message() {
                                     hook.record(credential_id, i, o, cc, cr, credits, "error");
@@ -2080,6 +2244,7 @@ mod tests {
                     key_id: 0,
                     group: None,
                     key_source: TraceKeySource::MasterApiKey,
+                    client_ip: None,
                 },
                 model: "test-model".to_string(),
                 is_stream: true,
@@ -2102,9 +2267,7 @@ mod tests {
         let overview = aggregator.overview();
         assert_eq!(overview.today_calls, 1);
         assert_eq!(overview.today_errors, 1);
-        // 无 provider 快照 → 走本地分摊，11 个输入 token 里 85%（9，四舍五入）记为缓存读取，
-        // 只剩 2 计入 input。统计口径下 input_tokens 因此不再等于总输入。
-        assert_eq!(overview.today_input_tokens, 2);
+        assert_eq!(overview.today_input_tokens, 11);
         assert_eq!(overview.today_output_tokens, 7);
         assert_eq!(overview.today_credits, 0.5);
     }
@@ -2120,11 +2283,13 @@ mod tests {
             ts: Utc::now().to_rfc3339(),
             key_id: 7,
             key_source: TraceKeySource::ClientKey,
+            client_ip: None,
             model: "gpt-5.6-luna".to_string(),
             is_stream: false,
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
+            route: parking_lot::Mutex::new(None),
         };
 
         let attempt = |attempt, credential_id, outcome: &str| TraceAttempt {
@@ -2152,6 +2317,7 @@ mod tests {
                 cache_creation_tokens: 7,
                 cache_read_tokens: 89,
                 credits: 0.25,
+                source: UsageSource::Simulated,
             },
         );
 
@@ -2188,11 +2354,13 @@ mod tests {
             ts: Utc::now().to_rfc3339(),
             key_id: 0,
             key_source: TraceKeySource::MasterApiKey,
+            client_ip: None,
             model: "claude-sonnet-4".to_string(),
             is_stream: false,
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
+            route: parking_lot::Mutex::new(None),
         };
 
         tracer.mark_first_token();
@@ -2218,11 +2386,13 @@ mod tests {
             ts: Utc::now().to_rfc3339(),
             key_id: 0,
             key_source: TraceKeySource::MasterApiKey,
+            client_ip: None,
             model: "claude-sonnet-4".to_string(),
             is_stream: true,
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
+            route: parking_lot::Mutex::new(None),
         };
         let attempt = |credential_id, endpoint: &str, status, attempt_outcome: &str| TraceAttempt {
             attempt: 0,
@@ -2349,6 +2519,21 @@ mod tests {
         );
         let resp = map_provider_error(err.into());
         assert_eq!(resp.headers().get(header::RETRY_AFTER).unwrap(), "3600");
+    }
+
+    #[tokio::test]
+    async fn typed_context_overflow_maps_to_stable_400() {
+        let resp = map_provider_error(crate::kiro::error::UpstreamContextOverflowError.into());
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Context window is full"));
     }
 
     #[tokio::test]
@@ -2517,6 +2702,7 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].display_name, "GLM 5");
         assert_eq!(models[0].owned_by, "kiro");
+        assert_eq!(models[0].context_window, 1_000_000);
         assert_eq!(models[0].max_tokens, 32_000);
     }
 
@@ -2547,6 +2733,7 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].display_name, "Configured GPT");
         assert_eq!(models[0].owned_by, "configured-owner");
+        assert_eq!(models[0].context_window, 500_000);
         assert_eq!(models[0].max_tokens, 12_345);
     }
 
@@ -2578,16 +2765,13 @@ mod tests {
             prompt_total_est: 100,
         };
 
-        // total=80 → read 钉死 85% = 68；真实覆盖（50/100 → 40）低于它，以 68 为准，
-        // creation=0，input=12。
         assert_eq!(
             resolve_non_stream_usage(100, Some(80), 9, cache_usage, None),
-            (12, 9, 0, 68)
+            (40, 9, 20, 20)
         );
-        // 无 contextUsage → 退回估算 total=100；无缓存基准也照样上报 85% = 85。
         assert_eq!(
             resolve_non_stream_usage(100, None, -9, Default::default(), None),
-            (15, 0, 0, 85)
+            (100, 0, 0, 0)
         );
     }
 

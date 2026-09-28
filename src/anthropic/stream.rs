@@ -1448,11 +1448,17 @@ pub struct StreamContext {
 }
 
 impl StreamContext {
+    /// 对外上报的 `(uncached_input, cache_write, cache_read)`：Claude 模型按
+    /// [`super::fixed_cache_ratio`] 改写为固定缓存比例，其余模型即上游口径。
+    pub fn resolved_usage(&self) -> (i32, i32, i32) {
+        super::fixed_cache_ratio::apply(&self.model, self.resolved_usage_raw())
+    }
+
     /// 解析 Anthropic 口径的 `(uncached_input, cache_write, cache_read)`。
     ///
     /// 精确 `metadataEvent.tokenUsage` 优先；只有上游未提供该事件时，才按
     /// contextUsage/请求估算总量与本地 CacheMeter 比例回退。
-    pub fn resolved_usage(&self) -> (i32, i32, i32) {
+    fn resolved_usage_raw(&self) -> (i32, i32, i32) {
         if let Some(usage) = self.provider_token_usage {
             let usage = usage.sanitized();
             return (
@@ -2703,6 +2709,16 @@ impl BufferedStreamContext {
             read,
             self.inner.credits,
         )
+    }
+
+    /// 上游是否下发了精确 tokenUsage；配合 [`Self::cache_usage`] 推断 usage 来源。
+    pub fn has_provider_usage(&self) -> bool {
+        self.inner.provider_token_usage.is_some()
+    }
+
+    /// 本地 CacheMeter 的覆盖情况
+    pub fn cache_usage(&self) -> &super::cache_metering::CacheUsage {
+        &self.inner.cache_usage
     }
 
     /// 工具调用 JSON 错误信息（转发内部 StreamContext）。缓冲流据此记 error。
@@ -5407,8 +5423,9 @@ mod tests {
         use crate::anthropic::cache_metering::CacheUsage;
         use crate::kiro::model::events::MetadataEvent;
 
+        // 非 Claude 模型：验证上游快照优先级本身（Claude 的固定比例见 fixed_cache_ratio 测试）。
         let mut ctx = StreamContext::new_with_thinking(
-            "claude-opus-4-7",
+            "gpt-5.6-luna",
             100,
             false,
             HashMap::new(),
@@ -5450,8 +5467,9 @@ mod tests {
     fn stream_usage_falls_back_to_context_cache_split_and_local_output() {
         use crate::anthropic::cache_metering::CacheUsage;
 
+        // 非 Claude 模型：验证上游口径本身（Claude 的固定比例见 fixed_cache_ratio 测试）。
         let mut ctx = StreamContext::new_with_thinking(
-            "claude-opus-4-7",
+            "gpt-5.6-luna",
             100,
             false,
             HashMap::new(),
@@ -5465,8 +5483,7 @@ mod tests {
             prompt_total_est: 100,
         };
 
-        // total=80 → read 钉死 85% = 68；真实覆盖（50/100 → 40）低于它，以 68 为准。
-        assert_eq!(ctx.resolved_usage(), (12, 0, 68));
+        assert_eq!(ctx.resolved_usage(), (40, 20, 20));
         assert_eq!(ctx.resolved_output_tokens(), 9);
     }
 
@@ -5480,8 +5497,9 @@ mod tests {
             cache_read_input_tokens: 7,
             cache_write_input_tokens: 4,
         };
+        // 非 Claude 模型：验证事件与最终 usage 同源（Claude 的固定比例见 fixed_cache_ratio 测试）。
         let mut ctx = BufferedStreamContext::new(
-            "claude-opus-4-7",
+            "gpt-5.6-luna",
             100,
             false,
             HashMap::new(),

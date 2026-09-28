@@ -24,6 +24,7 @@
 
 pub mod cache_metering;
 mod converter;
+mod fixed_cache_ratio;
 mod handlers;
 mod middleware;
 mod openai;

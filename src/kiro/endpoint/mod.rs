@@ -384,6 +384,102 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_api_region_controls_api_and_mcp_requests() {
+        let client = reqwest::Client::new();
+        // 本 fork 按限流桶拆分端点（codewhisperer / amazonq / runtime / amazonq-cli），
+        // 各桶 host 规则不同，但 API 与 MCP 的区域都必须遵循同一套优先级。
+        let codewhisperer = IdeEndpoint::codewhisperer();
+        let amazon_q = IdeEndpoint::amazon_q();
+        let runtime = IdeEndpoint::runtime();
+        let amazon_q_cli = CliEndpoint::new();
+        let endpoints: [&dyn KiroEndpoint; 4] =
+            [&codewhisperer, &amazon_q, &runtime, &amazon_q_cli];
+        let cases = [
+            (
+                r#"{"region":"eu-central-1"}"#,
+                None,
+                "us-east-1",
+                "eu-central-1",
+            ),
+            (
+                r#"{"region":"eu-central-1"}"#,
+                Some("us-east-1"),
+                "us-west-2",
+                "eu-central-1",
+            ),
+            (
+                r#"{"region":"eu-central-1","apiRegion":"us-east-1"}"#,
+                Some("eu-central-1"),
+                "us-west-2",
+                "us-east-1",
+            ),
+            ("{}", Some("eu-central-1"), "us-east-1", "eu-central-1"),
+            ("{}", None, "eu-central-1", "eu-central-1"),
+            ("{}", None, "us-east-1", "us-east-1"),
+            (
+                r#"{"authRegion":"eu-central-1"}"#,
+                None,
+                "us-east-1",
+                "us-east-1",
+            ),
+            (
+                r#"{"region":"eu-central-1","authRegion":"us-east-1"}"#,
+                None,
+                "us-east-1",
+                "eu-central-1",
+            ),
+        ];
+
+        for (json, global_api_region, global_region, expected_region) in cases {
+            let credentials: KiroCredentials = serde_json::from_str(json).unwrap();
+            let mut config = Config::default();
+            config.region = global_region.to_string();
+            config.api_region = global_api_region.map(str::to_string);
+            let ctx = RequestContext {
+                credentials: &credentials,
+                token: "test-token",
+                machine_id: "test-machine",
+                config: &config,
+            };
+            let host = format!("q.{expected_region}.amazonaws.com");
+
+            for endpoint in endpoints {
+                let api = endpoint
+                    .decorate_api(client.post(endpoint.api_url(&ctx)), &ctx)
+                    .build()
+                    .unwrap();
+                let (api_host, api_path) = match endpoint.name() {
+                    "codewhisperer" if expected_region == "us-east-1" => (
+                        "codewhisperer.us-east-1.amazonaws.com".to_string(),
+                        "/generateAssistantResponse",
+                    ),
+                    "codewhisperer" | "amazonq" => (host.clone(), "/generateAssistantResponse"),
+                    "runtime" => (
+                        format!("runtime.{expected_region}.kiro.dev"),
+                        "/generateAssistantResponse",
+                    ),
+                    "amazonq-cli" => (host.clone(), "/SendMessageStreaming"),
+                    name => panic!("unexpected endpoint: {name}"),
+                };
+                assert_eq!(
+                    api.url().as_str(),
+                    format!("https://{api_host}{api_path}"),
+                    "{} API with credentials {json}",
+                    endpoint.name(),
+                );
+                assert_eq!(api.headers()["host"].to_str().unwrap(), api_host);
+
+                let mcp = endpoint
+                    .decorate_mcp(client.post(endpoint.mcp_url(&ctx)), &ctx)
+                    .build()
+                    .unwrap();
+                assert_eq!(mcp.url().as_str(), format!("https://{host}/mcp"));
+                assert_eq!(mcp.headers()["host"].to_str().unwrap(), host);
+            }
+        }
+    }
+
+    #[test]
     fn test_default_monthly_request_limit_detects_reason() {
         let body = r#"{"message":"You have reached the limit.","reason":"MONTHLY_REQUEST_COUNT"}"#;
         assert!(default_is_monthly_request_limit(body));

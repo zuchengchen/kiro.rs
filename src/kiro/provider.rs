@@ -11,10 +11,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
-use crate::admin::trace_db::{TraceAttempt, TraceSink, outcome, truncate_snippet};
+use crate::admin::trace_db::{TraceAttempt, TraceRoute, TraceSink, outcome, truncate_snippet};
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
-use crate::kiro::error::UpstreamRateLimitError;
+use crate::kiro::error::{UpstreamContextOverflowError, UpstreamRateLimitError};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
@@ -740,7 +740,7 @@ impl KiroProvider {
         rctx: &RequestContext<'_>,
     ) -> String {
         let body = if endpoint.requires_codewhisperer_model_id() {
-            if let Some(requested) = Self::extract_model_from_request(request_body) {
+            if let Some(requested) = Self::extract_routing_hints(request_body).0 {
                 let resolved = self
                     .token_manager
                     .resolve_codewhisperer_model_id_for(credential_id, &requested)
@@ -817,21 +817,40 @@ impl KiroProvider {
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
 
-        // 尝试从请求体中提取模型信息
-        let model = Self::extract_model_from_request(request_body);
+        // 尝试从请求体中提取模型与会话标识
+        let (model, session_id) = Self::extract_routing_hints(request_body);
         // 全池冷却的内部等待预算按「一次调用」计量并在各次重试间共享，
         // 否则每轮重试各自新建预算会把累计等待放大到 重试轮数 × 预算。
         let mut wait_budget = self.token_manager.new_acquire_wait_budget();
 
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
-            // 获取调用上下文（绑定 index、credentials、token）
+            // 获取调用上下文（绑定 index、credentials、token）；同一会话优先沿用上一轮凭据
             let mut ctx = match self
                 .token_manager
-                .acquire_context_with_budget(model.as_deref(), group, &mut wait_budget)
+                .acquire_context_routed(
+                    model.as_deref(),
+                    group,
+                    session_id.as_deref(),
+                    &mut wait_budget,
+                )
                 .await
             {
-                Ok(c) => c,
+                Ok((c, route)) => {
+                    // 只在首次选号时计入命中率并上报 trace；重试轮次的判定受本请求内
+                    // 刚发生的失败影响，不代表会话层面的粘性效果。
+                    if attempt == 0 {
+                        self.token_manager.record_route(&route);
+                        if let Some(sink) = sink {
+                            sink.on_route(TraceRoute {
+                                session_id: session_id.clone(),
+                                sticky_outcome: route.sticky_outcome.as_str(),
+                                previous_credential_id: route.previous_credential_id,
+                            });
+                        }
+                    }
+                    c
+                }
                 Err(e) => {
                     if is_rate_limit_error(&e) {
                         Self::emit_attempt(
@@ -968,6 +987,10 @@ impl KiroProvider {
                 );
                 self.token_manager
                     .report_success_for_request(ctx.id, model.as_deref());
+                // 上游接受了请求才把会话钉到这个凭据，失败的凭据不会被绑定
+                if let Some(session) = session_id.as_deref() {
+                    self.token_manager.bind_session(session, ctx.id);
+                }
                 return Ok(KiroCallResult {
                     response,
                     credential_id: ctx.id,
@@ -1032,6 +1055,10 @@ impl KiroProvider {
                             );
                             self.token_manager
                                 .report_success_for_request(ctx.id, model.as_deref());
+                            // 同账号换桶救回也算该凭据成功服务了会话，与主桶成功路径一致
+                            if let Some(session) = session_id.as_deref() {
+                                self.token_manager.bind_session(session, ctx.id);
+                            }
                             return Ok(KiroCallResult {
                                 response: fallback_response,
                                 credential_id: ctx.id,
@@ -1137,6 +1164,9 @@ impl KiroProvider {
                     Some(&body),
                     attempt_start,
                 );
+                if body.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
+                    return Err(UpstreamContextOverflowError.into());
+                }
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
@@ -1491,20 +1521,31 @@ impl KiroProvider {
         });
     }
 
-    /// 从请求体中提取模型信息
-    ///
-    /// 尝试解析 JSON 请求体，提取 conversationState.currentMessage.userInputMessage.modelId
-    fn extract_model_from_request(request_body: &str) -> Option<String> {
+    /// 一次解析同时取出调度需要的两个提示：
+    /// - 模型 id（`conversationState.currentMessage.userInputMessage.modelId`），用于按模型过滤凭据
+    /// - 会话 id（`conversationState.conversationId`），用于会话粘性路由
+    fn extract_routing_hints(request_body: &str) -> (Option<String>, Option<String>) {
         use serde_json::Value;
 
-        let json: Value = serde_json::from_str(request_body).ok()?;
-
-        json.get("conversationState")?
-            .get("currentMessage")?
-            .get("userInputMessage")?
-            .get("modelId")?
-            .as_str()
-            .map(|s| s.to_string())
+        let Ok(json) = serde_json::from_str::<Value>(request_body) else {
+            return (None, None);
+        };
+        let Some(state) = json.get("conversationState") else {
+            return (None, None);
+        };
+        let model = state
+            .get("currentMessage")
+            .and_then(|m| m.get("userInputMessage"))
+            .and_then(|m| m.get("modelId"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let session = state
+            .get("conversationId")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        (model, session)
     }
 
     fn retry_delay(attempt: usize) -> Duration {
