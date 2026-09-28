@@ -1110,7 +1110,11 @@ where
     result
 }
 
+/// 流式 web_search 的 message_start：usage 按与最终聚合相同的口径拆分请求时的输入估算
+/// （Claude 固定比例），与主流式路径一致
 fn initial_stream_event(model: &str, input_tokens: i32) -> SseEvent {
+    let (input_tokens, cache_creation, cache_read) =
+        super::fixed_cache_ratio::apply(model, (input_tokens.max(0), 0, 0));
     let message_id = format!("msg_{}", &Uuid::new_v4().to_string().replace('-', "")[..24]);
     SseEvent::new(
         "message_start",
@@ -1125,10 +1129,10 @@ fn initial_stream_event(model: &str, input_tokens: i32) -> SseEvent {
                 "stop_reason": null,
                 "stop_sequence": null,
                 "usage": {
-                    "input_tokens": input_tokens.max(0),
+                    "input_tokens": input_tokens,
                     "output_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
+                    "cache_creation_input_tokens": cache_creation,
+                    "cache_read_input_tokens": cache_read
                 }
             }
         }),

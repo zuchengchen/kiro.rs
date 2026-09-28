@@ -1529,7 +1529,13 @@ impl StreamContext {
     }
 
     /// 生成 message_start 事件
+    ///
+    /// usage 与 message_delta 走同一套拆分（[`Self::resolved_usage`]）：发出时上游还没回任何
+    /// 用量，拆分的是请求时的输入估算，Claude 模型同样是固定比例。之前这里写死 cache 为 0，
+    /// 只从 message_start 取 input / cache 的下游会看到 0% 缓存命中，而 message_delta 和
+    /// usage_log 记的是 90%。
     pub fn create_message_start_event(&self) -> serde_json::Value {
+        let (input_tokens, cache_creation, cache_read) = self.resolved_usage();
         json!({
             "type": "message_start",
             "message": {
@@ -1541,10 +1547,10 @@ impl StreamContext {
                 "stop_reason": null,
                 "stop_sequence": null,
                 "usage": {
-                    "input_tokens": self.input_tokens,
+                    "input_tokens": input_tokens,
                     "output_tokens": 1,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
+                    "cache_creation_input_tokens": cache_creation,
+                    "cache_read_input_tokens": cache_read
                 }
             }
         })
@@ -5550,6 +5556,34 @@ mod tests {
             .unwrap()
             .data["usage"];
         assert_eq!(delta_usage["output_tokens"], json!(11));
+    }
+
+    /// live 流式的 message_start 与 message_delta 用同一套拆分：Claude 固定 90% 缓存读，
+    /// 其他模型按原口径（无缓存覆盖时全部是 input）
+    #[test]
+    fn message_start_usage_uses_the_same_split_as_the_final_delta() {
+        let claude = StreamContext::new_with_thinking(
+            "claude-opus-4-7",
+            100,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let usage = &claude.create_message_start_event()["message"]["usage"];
+        assert_eq!(usage["input_tokens"], json!(10));
+        assert_eq!(usage["cache_creation_input_tokens"], json!(0));
+        assert_eq!(usage["cache_read_input_tokens"], json!(90));
+
+        let other = StreamContext::new_with_thinking(
+            "gpt-5.6-luna",
+            100,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let usage = &other.create_message_start_event()["message"]["usage"];
+        assert_eq!(usage["input_tokens"], json!(100));
+        assert_eq!(usage["cache_read_input_tokens"], json!(0));
     }
 
     /// 缓冲模式（/cc/v1）上游断流：必须以 error 收尾，不能伪装成正常完成
