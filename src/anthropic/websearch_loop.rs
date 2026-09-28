@@ -834,8 +834,16 @@ impl WebSearchUsageSettlement {
 
     /// 多轮聚合后的对外 usage：Claude 在总量上统一改写一次固定缓存比例
     /// （逐轮改写再相加会累积舍入误差）。
+    ///
+    /// 没有任何一轮拿到上游响应（`source` 仍为 Unknown，如首轮取号就失败）时不改写：
+    /// 此时的用量只是本地估算的输入，Kiro 根本没处理这个请求，记成 90% 缓存读会让
+    /// 失败请求看起来吃到了缓存。与其他路径失败时记原始估算的做法一致。
     fn usage(&self) -> TokenUsage {
-        super::fixed_cache_ratio::apply_token_usage(&self.hook.model, self.usage.sanitized())
+        let usage = self.usage.sanitized();
+        if self.source == UsageSource::Unknown {
+            return usage;
+        }
+        super::fixed_cache_ratio::apply_token_usage(&self.hook.model, usage)
     }
 
     fn finish(
@@ -2115,6 +2123,44 @@ mod tests {
             .await
             .expect("in-flight future must be dropped")
             .expect("cancellation probe must be notified");
+    }
+
+    /// 没有任何一轮到达上游时，失败记录保留原始估算，不套 Claude 的固定缓存比例；
+    /// 有一轮成功后才按固定比例改写聚合用量
+    #[test]
+    fn settlement_applies_fixed_ratio_only_after_an_upstream_round() {
+        let hook = UsageRecordHook {
+            recorder: None,
+            aggregator: None,
+            client_keys: None,
+            credit_total: None,
+            key_id: 0,
+            model: "claude-opus-4-7".to_string(),
+            started_at: std::time::Instant::now(),
+        };
+        let mut settlement = WebSearchUsageSettlement::without_trace(hook);
+        settlement.add(
+            0,
+            TokenUsage {
+                uncached_input_tokens: 100,
+                ..TokenUsage::default()
+            },
+            0.0,
+        );
+        let before = settlement.usage();
+        assert_eq!(
+            (before.uncached_input_tokens, before.cache_read_input_tokens),
+            (100, 0),
+            "首轮取号失败：Kiro 没处理这个请求，不能记成 90% 缓存读"
+        );
+
+        settlement.note_source(false);
+        let after = settlement.usage();
+        assert_eq!(
+            (after.uncached_input_tokens, after.cache_read_input_tokens),
+            (10, 90)
+        );
+        settlement.settled = true;
     }
 
     #[tokio::test]
