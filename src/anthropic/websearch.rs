@@ -15,7 +15,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::admin::trace_db::TraceSink;
+use crate::admin::trace_db::{TraceSink, outcome};
+use crate::kiro::model::events::TokenUsage;
+
+use super::handlers::{
+    RequestTracer, TraceUsage, UsageRecordHook, UsageSource, last_attempt_outcome,
+};
 
 use super::stream::SseEvent;
 use super::types::{ErrorResponse, MessagesRequest};
@@ -239,10 +244,9 @@ pub fn create_websearch_sse_stream(
     query: String,
     tool_use_id: String,
     search_results: Option<WebSearchResults>,
-    input_tokens: i32,
+    usage: TokenUsage,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    let events =
-        generate_websearch_events(&model, &query, &tool_use_id, search_results, input_tokens);
+    let events = generate_websearch_events(&model, &query, &tool_use_id, search_results, usage);
 
     stream::iter(
         events
@@ -257,7 +261,7 @@ fn generate_websearch_events(
     query: &str,
     tool_use_id: &str,
     search_results: Option<WebSearchResults>,
-    input_tokens: i32,
+    usage: TokenUsage,
 ) -> Vec<SseEvent> {
     let mut events = Vec::new();
     let message_id = format!(
@@ -278,10 +282,10 @@ fn generate_websearch_events(
                 "content": [],
                 "stop_reason": null,
                 "usage": {
-                    "input_tokens": input_tokens,
+                    "input_tokens": usage.uncached_input_tokens,
                     "output_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
+                    "cache_creation_input_tokens": usage.cache_write_input_tokens,
+                    "cache_read_input_tokens": usage.cache_read_input_tokens
                 }
             }
         }),
@@ -416,7 +420,7 @@ fn generate_websearch_events(
 
     // 10. message_delta
     // 官方 API 的 message_delta.delta 中没有 stop_sequence 字段
-    let output_tokens = (summary.len() as i32 + 3) / 4; // 简单估算
+    let output_tokens = usage.output_tokens;
     events.push(SseEvent::new(
         "message_delta",
         json!({
@@ -528,17 +532,17 @@ fn finish_mcp_call(
     }
 }
 
+/// `usage` 已按 [`websearch_usage`] 拆分；流式与非流式、usage_log 与 trace 用同一份数字
 fn render_websearch_response(
     stream_response: bool,
     model: String,
     query: String,
     tool_use_id: String,
     search_results: Option<WebSearchResults>,
-    input_tokens: i32,
+    usage: TokenUsage,
 ) -> Response {
     if stream_response {
-        let stream =
-            create_websearch_sse_stream(model, query, tool_use_id, search_results, input_tokens);
+        let stream = create_websearch_sse_stream(model, query, tool_use_id, search_results, usage);
         Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/event-stream")
@@ -548,36 +552,47 @@ fn render_websearch_response(
             .unwrap()
     } else {
         let content = build_websearch_content(&query, &tool_use_id, &search_results);
-        let summary = generate_search_summary(&query, &search_results);
-        let output_tokens = (summary.len() as i32 + 3) / 4;
         // 本地 WebSearch 不走上游，不会收到 meteringEvent，因此也不带 credit_* 字段。
-        super::websearch_loop::render_json(
-            &model,
-            content,
-            "end_turn",
-            crate::kiro::model::events::TokenUsage {
-                uncached_input_tokens: input_tokens,
-                output_tokens,
-                cache_read_input_tokens: 0,
-                cache_write_input_tokens: 0,
-            },
-            "",
-            None,
-        )
+        super::websearch_loop::render_json(&model, content, "end_turn", usage, "", None)
+    }
+}
+
+/// 纯 web_search 请求对外上报的用量
+///
+/// 输入是本地估算的总 prompt token，按与其他路径相同的口径拆分（Claude 模型走固定比例）。
+/// 这条路径不经过 `StreamContext`，之前直接写死 cache 为 0，是固定比例唯一漏掉的出口。
+fn websearch_usage(
+    model: &str,
+    query: &str,
+    search_results: &Option<WebSearchResults>,
+    input_tokens: i32,
+) -> TokenUsage {
+    let (input, creation, read) =
+        super::fixed_cache_ratio::apply(model, (input_tokens.max(0), 0, 0));
+    TokenUsage {
+        uncached_input_tokens: input,
+        cache_write_input_tokens: creation,
+        cache_read_input_tokens: read,
+        output_tokens: (generate_search_summary(query, search_results).len() as i32 + 3) / 4,
     }
 }
 
 /// 处理 WebSearch 请求
-pub async fn handle_websearch_request(
+///
+/// 在这里完成 usage_log 记账与 trace 落库，两个挂载点（`/v1`、`/cc/v1`）共用。
+pub(crate) async fn handle_websearch_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     payload: &MessagesRequest,
     input_tokens: i32,
     group: Option<&str>,
+    hook: &UsageRecordHook,
+    tracer: &RequestTracer,
 ) -> Response {
     // 1. 提取搜索查询
     let query = match extract_search_query(payload) {
         Some(q) => q,
         None => {
+            hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse::new(
@@ -596,21 +611,64 @@ pub async fn handle_websearch_request(
 
     // 3. 调用 Kiro MCP API（单次调用，自建一份等待预算）
     let mut wait_budget = provider.token_manager().new_acquire_wait_budget();
-    let search_results = match finish_mcp_call(
-        call_mcp_api(&provider, &mcp_request, None, group, &mut wait_budget).await,
-    ) {
+    let result = call_mcp_api(
+        &provider,
+        &mcp_request,
+        Some(tracer),
+        group,
+        &mut wait_budget,
+    )
+    .await;
+    let error_message = result.as_ref().err().map(|e| e.to_string());
+    let search_results = match finish_mcp_call(result) {
         Ok(results) => results,
-        Err(response) => return response,
+        Err(response) => {
+            // 失败时与其他路径一致记原始估算，不按固定比例改写
+            hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
+            tracer.finalize(
+                "error",
+                Some(last_attempt_outcome(tracer).unwrap_or(outcome::UNKNOWN)),
+                error_message.as_deref(),
+                None,
+                TraceUsage::zero(),
+            );
+            return response;
+        }
     };
 
     // 4. 按请求模式生成响应
+    let usage = websearch_usage(&payload.model, &query, &search_results, input_tokens);
+    // MCP 端点没有 credential_id 上下文，usage_log 统一记 0（trace 里有实际凭据）
+    hook.record(
+        0,
+        usage.uncached_input_tokens,
+        usage.output_tokens,
+        usage.cache_write_input_tokens,
+        usage.cache_read_input_tokens,
+        0.0,
+        "success",
+    );
+    tracer.finalize(
+        "success",
+        None,
+        None,
+        None,
+        TraceUsage {
+            input_tokens: usage.uncached_input_tokens.max(0) as u64,
+            output_tokens: usage.output_tokens.max(0) as u64,
+            cache_creation_tokens: usage.cache_write_input_tokens.max(0) as u64,
+            cache_read_tokens: usage.cache_read_input_tokens.max(0) as u64,
+            credits: 0.0,
+            source: UsageSource::None,
+        },
+    );
     render_websearch_response(
         payload.stream,
         payload.model.clone(),
         query,
         tool_use_id,
         search_results,
-        input_tokens,
+        usage,
     )
 }
 
@@ -705,6 +763,57 @@ mod tests {
         assert!(response.result.is_some());
     }
 
+    /// 纯 web_search 路径也要走与其他出口相同的拆分：Claude 固定 90% 缓存读，
+    /// 其他模型原样记为 input；流式 message_start 与非流式 body 用同一份数字
+    #[tokio::test]
+    async fn websearch_usage_uses_the_fixed_ratio_on_both_outputs() {
+        let claude = websearch_usage("claude-opus-4-7", "rust", &None, 100);
+        assert_eq!(
+            (
+                claude.uncached_input_tokens,
+                claude.cache_write_input_tokens,
+                claude.cache_read_input_tokens
+            ),
+            (10, 0, 90)
+        );
+        assert!(claude.output_tokens > 0);
+        let other = websearch_usage("gpt-5.6-luna", "rust", &None, 100);
+        assert_eq!(
+            (
+                other.uncached_input_tokens,
+                other.cache_write_input_tokens,
+                other.cache_read_input_tokens
+            ),
+            (100, 0, 0)
+        );
+
+        let events =
+            generate_websearch_events("claude-opus-4-7", "rust", "srvtoolu_x", None, claude);
+        let start = &events[0].data["message"]["usage"];
+        assert_eq!(start["input_tokens"], json!(10));
+        assert_eq!(start["cache_read_input_tokens"], json!(90));
+        let delta = events.iter().find(|e| e.event == "message_delta").unwrap();
+        assert_eq!(
+            delta.data["usage"]["output_tokens"],
+            json!(claude.output_tokens)
+        );
+
+        let response = render_websearch_response(
+            false,
+            "claude-opus-4-7".to_string(),
+            "rust".to_string(),
+            "srvtoolu_x".to_string(),
+            None,
+            claude,
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["usage"]["input_tokens"], json!(10));
+        assert_eq!(body["usage"]["cache_read_input_tokens"], json!(90));
+    }
+
     #[tokio::test]
     async fn test_non_stream_websearch_response_is_json() {
         let response = render_websearch_response(
@@ -713,7 +822,7 @@ mod tests {
             "rust".to_string(),
             "srvtoolu_test".to_string(),
             None,
-            12,
+            websearch_usage("claude-sonnet-4", "rust", &None, 12),
         );
 
         assert_eq!(response.status(), StatusCode::OK);

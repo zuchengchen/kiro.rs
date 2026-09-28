@@ -786,21 +786,24 @@ pub async fn post_messages(
             payload.tools.clone(),
         ) as i32;
 
-        let resp = websearch::handle_websearch_request(
+        let tracer = RequestTracer::new(
+            &state,
+            RequestTraceOptions {
+                key_ctx: key_ctx.clone(),
+                model: payload.model.clone(),
+                is_stream: payload.stream,
+            },
+        );
+        // usage_log 记账与 trace 落库都在 handle_websearch_request 内完成
+        return websearch::handle_websearch_request(
             provider,
             &payload,
             input_tokens,
             key_ctx.group.as_deref(),
+            &hook,
+            &tracer,
         )
         .await;
-        // WebSearch 路径走 MCP 端点，没有 credential_id 上下文，统一记 0
-        let status = if resp.status().is_success() {
-            "success"
-        } else {
-            "error"
-        };
-        hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
-        return resp;
     }
 
     let payload_stream = payload.stream;
@@ -1851,20 +1854,23 @@ pub async fn post_messages_cc(
             payload.tools.clone(),
         ) as i32;
 
-        let resp = websearch::handle_websearch_request(
+        let tracer = RequestTracer::new(
+            &state,
+            RequestTraceOptions {
+                key_ctx: key_ctx.clone(),
+                model: payload.model.clone(),
+                is_stream: payload.stream,
+            },
+        );
+        return websearch::handle_websearch_request(
             provider,
             &payload,
             input_tokens,
             key_ctx.group.as_deref(),
+            &hook,
+            &tracer,
         )
         .await;
-        let status = if resp.status().is_success() {
-            "success"
-        } else {
-            "error"
-        };
-        hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
-        return resp;
     }
 
     let payload_stream = payload.stream;
