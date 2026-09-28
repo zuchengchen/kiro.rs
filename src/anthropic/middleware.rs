@@ -146,14 +146,7 @@ pub async fn auth_middleware(
                 return next.run(request).await;
             }
             KeyAuth::OverLimit { used, limit, .. } => {
-                let error = ErrorResponse::new(
-                    "rate_limit_error",
-                    format!(
-                        "该 API Key 已达到积分使用上限（已用 {:.2} / 上限 {:.2}），请联系管理员调整额度或重置统计",
-                        used, limit
-                    ),
-                );
-                return (StatusCode::TOO_MANY_REQUESTS, Json(error)).into_response();
+                return key_over_limit_response(used, limit);
             }
             KeyAuth::NotFound => {}
         }
@@ -161,6 +154,30 @@ pub async fn auth_middleware(
 
     let error = ErrorResponse::authentication_error();
     (StatusCode::UNAUTHORIZED, Json(error)).into_response()
+}
+
+/// Key 积分上限用满时的 `Retry-After`（秒）
+///
+/// 这个上限是累计值，要等管理员调额度或重置统计才会解除，没有可预期的恢复时刻。
+/// 仍然必须带 `Retry-After`：不带的话客户端按普通 429 立刻重试，每次重试都要拿
+/// client_keys 的写锁，一个用满的 Key 就能把所有请求的鉴权拖慢。取 1 小时，与账号
+/// 积分上限（`CreditLimitReachedError`）的兜底值一致。
+const KEY_OVER_LIMIT_RETRY_AFTER_SECS: u64 = 3600;
+
+fn key_over_limit_response(used: f64, limit: f64) -> Response {
+    let error = ErrorResponse::new(
+        "rate_limit_error",
+        format!(
+            "该 API Key 已达到积分使用上限（已用 {:.2} / 上限 {:.2}），请联系管理员调整额度或重置统计",
+            used, limit
+        ),
+    );
+    let mut response = (StatusCode::TOO_MANY_REQUESTS, Json(error)).into_response();
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from(KEY_OVER_LIMIT_RETRY_AFTER_SECS),
+    );
+    response
 }
 
 /// CORS 中间件层
@@ -179,4 +196,23 @@ pub fn cors_layer() -> tower_http::cors::CorsLayer {
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Key 积分上限的 429 必须带 Retry-After，否则客户端会立即重试
+    #[test]
+    fn key_over_limit_response_carries_retry_after() {
+        let response = key_over_limit_response(12.5, 10.0);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .unwrap(),
+            "3600"
+        );
+    }
 }
