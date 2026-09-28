@@ -43,3 +43,9 @@
 /.local-test/
 /aab822_*.json
 /jac0991_*.json
+
+# 账号导出（含明文 refreshToken / accessToken，绝对不能提交）。
+# 不锚定根目录：拷进任何子目录都要拦住。
+# kiro-account-manager-export-*.json 是 Admin UI「导出」的下载文件名。
+kiro-accounts-*.json
+kiro-account-manager-export-*.json
