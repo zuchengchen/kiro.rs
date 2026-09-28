@@ -104,12 +104,22 @@ pub(super) async fn handle(
         }
     };
 
-    let first_attempt =
-        match run_attempt(state.clone(), key_ctx.clone(), anthropic_req, &model).await {
-            Ok(parsed) => Some(parsed),
-            Err(AttemptError::ContextOverflow) => None,
-            Err(AttemptError::Response(response)) => return response,
-        };
+    // 两次尝试（首次 + 溢出重试）属于同一个客户端请求，共用一份内部等待预算
+    // （CLAUDE.md 不变量 #3）。首次尝试拿到 provider 后才创建。
+    let mut wait_budget = None;
+    let first_attempt = match run_attempt(
+        state.clone(),
+        key_ctx.clone(),
+        anthropic_req,
+        &model,
+        &mut wait_budget,
+    )
+    .await
+    {
+        Ok(parsed) => Some(parsed),
+        Err(AttemptError::ContextOverflow) => None,
+        Err(AttemptError::Response(response)) => return response,
+    };
     let mut accumulated_usage = CompactionUsage::default();
     if let Some(parsed) = &first_attempt {
         accumulated_usage.add(parsed);
@@ -140,7 +150,8 @@ pub(super) async fn handle(
                     );
                 }
             };
-            final_parsed = match run_attempt(state, key_ctx, retry, &model).await {
+            final_parsed = match run_attempt(state, key_ctx, retry, &model, &mut wait_budget).await
+            {
                 Ok(parsed) => {
                     accumulated_usage.add(&parsed);
                     Some(parsed)
@@ -197,6 +208,7 @@ async fn run_attempt(
     key_ctx: KeyContext,
     anthropic_req: MessagesRequest,
     model: &str,
+    wait_budget: &mut Option<crate::kiro::token_manager::AcquireWaitBudget>,
 ) -> Result<ParsedResponse, AttemptError> {
     let provider = match &state.kiro_provider {
         Some(provider) => provider.clone(),
@@ -208,6 +220,8 @@ async fn run_attempt(
             )));
         }
     };
+    let wait_budget =
+        wait_budget.get_or_insert_with(|| provider.token_manager().new_acquire_wait_budget());
 
     let conversion = convert_request_with_purpose(
         &anthropic_req,
@@ -261,6 +275,7 @@ async fn run_attempt(
         cache_usage,
         tracer,
         key_ctx.group.clone(),
+        wait_budget,
     )
     .await
     .map_err(|error| match error {

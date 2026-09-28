@@ -64,7 +64,9 @@ git push origin main-czc
 3. **`AcquireWaitBudget` 必须由最外层调用方创建并跨重试共享**。每次取号各自
    新建预算会把单请求累计等待放大到 `轮数 × 预算`（WebSearch 6 轮 × 4 次重试）。
    上游新增的取号入口（如 v0.9.0 的 `acquire_context_routed`）要改成接收调用方的
-   预算，不能照搬上游签名。
+   预算，不能照搬上游签名。一次客户端请求会多次调用上游的路径，要在最外层建一份预算，
+   经 `call_api*_with_budget` / `call_mcp` 往下传。目前有 web_search 多轮循环
+   （含 MCP 搜索）和 Codex 压缩的溢出重试；以后新增这类路径也照此处理。
 
 ## 版本号：`0.9.0.1` = 上游基线 + 定制迭代号
 

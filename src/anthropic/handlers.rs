@@ -1308,6 +1308,7 @@ async fn handle_non_stream_request(
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
 ) -> Response {
+    let mut wait_budget = provider.token_manager().new_acquire_wait_budget();
     match execute_non_stream_request(
         provider,
         request_body,
@@ -1319,6 +1320,7 @@ async fn handle_non_stream_request(
         cache_usage,
         tracer,
         group,
+        &mut wait_budget,
     )
     .await
     {
@@ -1339,10 +1341,16 @@ pub(crate) async fn execute_non_stream_request(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    wait_budget: &mut crate::kiro::token_manager::AcquireWaitBudget,
 ) -> Result<serde_json::Value, NonStreamExecutionError> {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
-        .call_api(request_body, Some(tracer.as_ref()), group.as_deref())
+        .call_api_with_budget(
+            request_body,
+            Some(tracer.as_ref()),
+            group.as_deref(),
+            wait_budget,
+        )
         .await
     {
         Ok(resp) => resp,

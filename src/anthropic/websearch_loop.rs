@@ -32,6 +32,7 @@ use crate::kiro::model::events::{Event, MeteringEvent, TokenUsage};
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
+use crate::kiro::token_manager::AcquireWaitBudget;
 use crate::token;
 
 use super::converter::{ConversionError, convert_request_with_mode, get_context_window_size};
@@ -392,6 +393,7 @@ async fn run_round(
     tracer: &RequestTracer,
     group: Option<&str>,
     tool_compatibility_mode: ToolCompatibilityMode,
+    wait_budget: &mut AcquireWaitBudget,
 ) -> Result<(RoundOutcome, u64), RoundFailure> {
     let conversion = match convert_request_with_mode(payload, tool_compatibility_mode) {
         Ok(c) => c,
@@ -451,7 +453,7 @@ async fn run_round(
     };
 
     let call_result = match provider
-        .call_api_stream(&request_body, Some(tracer), group)
+        .call_api_stream_with_budget(&request_body, Some(tracer), group, wait_budget)
         .await
     {
         Ok(r) => r,
@@ -1210,6 +1212,7 @@ async fn execute_web_search(
     group: Option<&str>,
     final_round: bool,
     emitter: &mut Option<&mut WebSearchSseEmitter>,
+    wait_budget: &mut AcquireWaitBudget,
 ) -> anyhow::Result<Option<WebSearchResults>> {
     let query = tool_query(tool_use);
     let pending = if let Some(emitter) = emitter.as_deref_mut() {
@@ -1221,7 +1224,9 @@ async fn execute_web_search(
     let result = if let Some(query) = query {
         log_normalized_web_search_query(tool_use, &query);
         let (_, mcp_request) = websearch::create_mcp_request(&query);
-        match websearch::call_mcp_api(provider, &mcp_request, Some(tracer), group).await {
+        match websearch::call_mcp_api(provider, &mcp_request, Some(tracer), group, wait_budget)
+            .await
+        {
             Ok(response) => websearch::parse_search_results(&response),
             Err(error) if websearch::is_no_results_mcp_error(&error) => {
                 tracing::warn!(
@@ -1381,6 +1386,9 @@ async fn run_web_search_loop_inner(
     let mut settlement = WebSearchUsageSettlement::new(hook, tracer.clone());
     let mut latest_metering: Option<MeteringEvent> = None;
     let mut all_thinking = String::new();
+    // 一个客户端请求一份内部等待预算：各轮模型调用、空结果重试与 MCP 搜索共用，
+    // 否则全池冷却时累计等待会放大到调用次数 × 预算（CLAUDE.md 不变量 #3）。
+    let mut wait_budget = provider.token_manager().new_acquire_wait_budget();
 
     for round_idx in 0..=MAX_WEB_SEARCH_ROUNDS {
         let mut empty_retries = 0usize;
@@ -1398,6 +1406,7 @@ async fn run_web_search_loop_inner(
                 tracer.as_ref(),
                 group.as_deref(),
                 tool_compatibility_mode,
+                &mut wait_budget,
             )
             .await
             {
@@ -1494,6 +1503,7 @@ async fn run_web_search_loop_inner(
                     group.as_deref(),
                     false,
                     &mut emitter,
+                    &mut wait_budget,
                 )
                 .await
                 {
@@ -1538,6 +1548,7 @@ async fn run_web_search_loop_inner(
                     group.as_deref(),
                     true,
                     &mut emitter,
+                    &mut wait_budget,
                 )
                 .await
                 {

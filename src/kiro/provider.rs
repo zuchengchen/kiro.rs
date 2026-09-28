@@ -17,6 +17,7 @@ use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::error::{UpstreamContextOverflowError, UpstreamRateLimitError};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::token_manager::AcquireWaitBudget;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
@@ -275,7 +276,8 @@ impl KiroProvider {
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, false, sink, group)
+        let mut wait_budget = self.token_manager.new_acquire_wait_budget();
+        self.call_api_with_retry(request_body, false, sink, group, &mut wait_budget)
             .await
     }
 
@@ -286,17 +288,49 @@ impl KiroProvider {
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, true, sink, group)
+        let mut wait_budget = self.token_manager.new_acquire_wait_budget();
+        self.call_api_with_retry(request_body, true, sink, group, &mut wait_budget)
             .await
     }
 
-    /// 发送 MCP API 请求（WebSearch 等工具调用）
+    /// 同 [`Self::call_api`]，但全池冷却的内部等待记在调用方的预算上。
+    ///
+    /// 一次客户端请求会调用上游多次时（Codex 压缩的溢出重试），必须由最外层创建
+    /// 一份预算并在各次调用间共享（CLAUDE.md 不变量 #3）。
+    pub async fn call_api_with_budget(
+        &self,
+        request_body: &str,
+        sink: Option<&dyn TraceSink>,
+        group: Option<&str>,
+        wait_budget: &mut AcquireWaitBudget,
+    ) -> anyhow::Result<KiroCallResult> {
+        self.call_api_with_retry(request_body, false, sink, group, wait_budget)
+            .await
+    }
+
+    /// 同 [`Self::call_api_stream`]，但等待记在调用方的预算上（web_search 多轮循环）。
+    pub async fn call_api_stream_with_budget(
+        &self,
+        request_body: &str,
+        sink: Option<&dyn TraceSink>,
+        group: Option<&str>,
+        wait_budget: &mut AcquireWaitBudget,
+    ) -> anyhow::Result<KiroCallResult> {
+        self.call_api_with_retry(request_body, true, sink, group, wait_budget)
+            .await
+    }
+
+    /// 发送 MCP API 请求（WebSearch 等工具调用）。`wait_budget` 由调用方持有，
+    /// 使同一客户端请求里的模型调用与搜索调用共享一份内部等待上限。
     pub async fn call_mcp(
         &self,
         request_body: &str,
         group: Option<&str>,
+        wait_budget: &mut AcquireWaitBudget,
     ) -> anyhow::Result<reqwest::Response> {
-        let result = self.call_mcp_with_retry(request_body, None, group).await?;
+        let result = self
+            .call_mcp_with_retry(request_body, None, group, wait_budget)
+            .await?;
         self.token_manager
             .report_success_for_request(result.credential_id, None);
         Ok(result.response)
@@ -310,9 +344,10 @@ impl KiroProvider {
         group: Option<&str>,
         validate: fn(&str) -> anyhow::Result<T>,
         is_benign_error: fn(&anyhow::Error) -> bool,
+        wait_budget: &mut AcquireWaitBudget,
     ) -> anyhow::Result<T> {
         let result = self
-            .call_mcp_with_retry(request_body, Some(sink), group)
+            .call_mcp_with_retry(request_body, Some(sink), group, wait_budget)
             .await?;
         let status = result.response.status().as_u16();
         let body = match result.response.text().await {
@@ -367,26 +402,25 @@ impl KiroProvider {
         }
     }
 
-    /// 内部方法：带重试逻辑的 MCP API 调用
+    /// 内部方法：带重试逻辑的 MCP API 调用（`wait_budget` 语义同 [`Self::call_api_with_retry`]）
     async fn call_mcp_with_retry(
         &self,
         request_body: &str,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
+        wait_budget: &mut AcquireWaitBudget,
     ) -> anyhow::Result<McpCallResult> {
         let total_credentials = self.token_manager.total_count_in_group(group).max(1);
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
-        // 同 call_api_with_retry：等待预算在重试间共享，避免累计放大。
-        let mut wait_budget = self.token_manager.new_acquire_wait_budget();
 
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
             // MCP 调用不涉及模型选择，但必须遵守客户端 Key 的凭据分组隔离。
             let mut ctx = match self
                 .token_manager
-                .acquire_context_with_budget(None, group, &mut wait_budget)
+                .acquire_context_with_budget(None, group, wait_budget)
                 .await
             {
                 Ok(c) => c,
@@ -803,12 +837,17 @@ impl KiroProvider {
     /// - 每个凭据最多重试 MAX_RETRIES_PER_CREDENTIAL 次
     /// - 总重试次数 = min(凭据数量 × 每凭据重试次数, MAX_TOTAL_RETRIES)
     /// - 硬上限 9 次，避免无限重试
+    ///
+    /// 全池冷却的内部等待记在 `wait_budget` 上。预算由调用方持有，在本次调用的各次
+    /// 重试之间共享，也在同一客户端请求的其他上游调用之间共享，否则累计等待会被放大到
+    /// 调用次数 × 预算。
     async fn call_api_with_retry(
         &self,
         request_body: &str,
         is_stream: bool,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
+        wait_budget: &mut AcquireWaitBudget,
     ) -> anyhow::Result<KiroCallResult> {
         // 重试预算按当前请求所属分组的账号数计算，避免小分组按全局账号数获得过多无效重试
         let total_credentials = self.token_manager.total_count_in_group(group).max(1);
@@ -819,21 +858,13 @@ impl KiroProvider {
 
         // 尝试从请求体中提取模型与会话标识
         let (model, session_id) = Self::extract_routing_hints(request_body);
-        // 全池冷却的内部等待预算按「一次调用」计量并在各次重试间共享，
-        // 否则每轮重试各自新建预算会把累计等待放大到 重试轮数 × 预算。
-        let mut wait_budget = self.token_manager.new_acquire_wait_budget();
 
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
             // 获取调用上下文（绑定 index、credentials、token）；同一会话优先沿用上一轮凭据
             let mut ctx = match self
                 .token_manager
-                .acquire_context_routed(
-                    model.as_deref(),
-                    group,
-                    session_id.as_deref(),
-                    &mut wait_budget,
-                )
+                .acquire_context_routed(model.as_deref(), group, session_id.as_deref(), wait_budget)
                 .await
             {
                 Ok((c, route)) => {
@@ -1758,6 +1789,46 @@ mod rate_limit_tests {
         assert_eq!(result.credential_id, 1);
         assert_eq!(result.response.text().await.unwrap(), "fallback-ok");
         assert_eq!(primary_count.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_count.load(Ordering::SeqCst), 1);
+    }
+
+    /// 不变量 #3：同一客户端请求的多次上游调用共用调用方的等待预算。第一次调用
+    /// 吸收 1s 冷却并扣掉预算；第二次时剩余预算不够，必须立即 429，而不是像各自
+    /// 新建预算那样再等一轮。
+    #[tokio::test]
+    async fn wait_budget_is_shared_across_calls_of_one_request() {
+        let (base_url, primary_count, fallback_count) =
+            mock_upstreams(StatusCode::OK, "fallback-ok").await;
+        let provider = provider_for_mock_upstreams(&base_url);
+        let tm = provider.token_manager();
+        tm.set_account_throttle_config(None, None, Some(1_500))
+            .unwrap();
+        let mut budget = tm.new_acquire_wait_budget();
+
+        tm.report_account_throttled_for_request(1, std::time::Duration::from_secs(1), None, None);
+        let result = provider
+            .call_api_stream_with_budget(TEST_REQUEST_BODY, None, None, &mut budget)
+            .await
+            .unwrap();
+        assert_eq!(result.response.text().await.unwrap(), "fallback-ok");
+        assert_eq!(budget.remaining(), std::time::Duration::from_millis(500));
+
+        tm.report_account_throttled_for_request(1, std::time::Duration::from_secs(1), None, None);
+        let started = std::time::Instant::now();
+        let error = match provider
+            .call_api_with_budget(TEST_REQUEST_BODY, None, None, &mut budget)
+            .await
+        {
+            Ok(_) => panic!("shared budget is spent; the second call must not wait again"),
+            Err(error) => error,
+        };
+        assert!(error.downcast_ref::<UpstreamRateLimitError>().is_some());
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        assert_eq!(
+            primary_count.load(Ordering::SeqCst),
+            1,
+            "second call never reaches upstream"
+        );
         assert_eq!(fallback_count.load(Ordering::SeqCst), 1);
     }
 

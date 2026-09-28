@@ -594,12 +594,14 @@ pub async fn handle_websearch_request(
     // 2. 创建 MCP 请求
     let (tool_use_id, mcp_request) = create_mcp_request(&query);
 
-    // 3. 调用 Kiro MCP API
-    let search_results =
-        match finish_mcp_call(call_mcp_api(&provider, &mcp_request, None, group).await) {
-            Ok(results) => results,
-            Err(response) => return response,
-        };
+    // 3. 调用 Kiro MCP API（单次调用，自建一份等待预算）
+    let mut wait_budget = provider.token_manager().new_acquire_wait_budget();
+    let search_results = match finish_mcp_call(
+        call_mcp_api(&provider, &mcp_request, None, group, &mut wait_budget).await,
+    ) {
+        Ok(results) => results,
+        Err(response) => return response,
+    };
 
     // 4. 按请求模式生成响应
     render_websearch_response(
@@ -618,6 +620,7 @@ pub(crate) async fn call_mcp_api(
     request: &McpRequest,
     sink: Option<&dyn TraceSink>,
     group: Option<&str>,
+    wait_budget: &mut crate::kiro::token_manager::AcquireWaitBudget,
 ) -> anyhow::Result<McpResponse> {
     let request_body = serde_json::to_string(request)?;
 
@@ -631,11 +634,12 @@ pub(crate) async fn call_mcp_api(
                 group,
                 parse_mcp_response,
                 is_no_results_mcp_error,
+                wait_budget,
             )
             .await;
     }
 
-    let response = provider.call_mcp(&request_body, group).await?;
+    let response = provider.call_mcp(&request_body, group, wait_budget).await?;
     let body = response.text().await?;
     parse_mcp_response(&body)
 }
