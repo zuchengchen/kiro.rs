@@ -899,4 +899,3 @@ mod tests {
         assert_eq!(config.account_rpm_limit, 120);
     }
 }
-
