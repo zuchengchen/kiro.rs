@@ -1781,15 +1781,21 @@ impl MultiTokenManager {
                 anyhow::bail!("积分上限必须是非负有限数: {}", v);
             }
         }
-        {
+        let previous = {
             let mut entries = self.entries.lock();
             let entry = entries
                 .iter_mut()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            entry.credentials.max_cycle_credits = limit;
+            std::mem::replace(&mut entry.credentials.max_cycle_credits, limit)
+        };
+        // 写盘失败要回滚：否则 Admin 看到报错，上限却已在内存里生效，重启后又悄悄消失
+        if let Err(err) = self.persist_credentials() {
+            if let Some(entry) = self.entries.lock().iter_mut().find(|e| e.id == id) {
+                entry.credentials.max_cycle_credits = previous;
+            }
+            return Err(err);
         }
-        self.persist_credentials()?;
         Ok(())
     }
 
@@ -5492,6 +5498,42 @@ mod tests {
         assert!(mgr.set_max_cycle_credits(1, Some(-5.0)).is_err());
         assert!(mgr.set_max_cycle_credits(1, Some(f64::NAN)).is_err());
         assert!(mgr.set_max_cycle_credits(999, Some(1.0)).is_err());
+    }
+
+    /// 写盘失败时内存里的上限要回滚，否则 Admin 看到报错、上限却已生效，重启后又消失
+    #[test]
+    fn set_max_cycle_credits_rolls_back_when_persist_fails() {
+        // 目录不存在 → persist_credentials 必然失败
+        let missing_dir = std::env::temp_dir().join(format!(
+            "kiro_missing_dir_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cred = KiroCredentials {
+            id: Some(1),
+            access_token: Some("access-token".to_string()),
+            max_cycle_credits: Some(5.0),
+            ..KiroCredentials::default()
+        };
+        let mgr = MultiTokenManager::new(
+            Config::default(),
+            vec![cred],
+            None,
+            Some(missing_dir.join("credentials.json")),
+            true,
+        )
+        .unwrap();
+
+        assert!(mgr.set_max_cycle_credits(1, Some(25.0)).is_err());
+        assert_eq!(
+            mgr.snapshot().entries[0].max_cycle_credits,
+            Some(5.0),
+            "持久化失败后内存值必须回滚"
+        );
+        assert!(!missing_dir.exists());
     }
 
     #[test]
