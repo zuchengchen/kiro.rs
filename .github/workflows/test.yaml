@@ -1,0 +1,83 @@
+name: Test
+
+on:
+  push:
+    branches:
+      - main-czc
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.gitignore'
+      - '.gitattributes'
+      - 'LICENSE'
+      - 'config.example.json'
+      - '.vscode/**'
+      - '.idea/**'
+  pull_request:
+    branches:
+      - main-czc
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.3'
+
+      - name: Cache bun install
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-${{ runner.arch }}-bun-${{ hashFiles('admin-ui/bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-bun-
+
+      # RustEmbed embeds admin-ui/dist at compile time, so cargo test needs it.
+      # `bun run build` runs `tsc -b` first, which doubles as the frontend type check.
+      - name: Build admin-ui
+        working-directory: admin-ui
+        run: |
+          bun install --frozen-lockfile
+          bun run build
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "rust-cache-test"
+          cache-on-failure: true
+
+      - name: Run tests
+        run: cargo test --locked
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Caches ~/.cargo/bin, so cargo-audit is only compiled on a cache miss.
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "rust-cache-audit"
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Audit Cargo.lock
+        run: cargo audit

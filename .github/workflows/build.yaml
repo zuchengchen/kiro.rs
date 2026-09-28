@@ -3,7 +3,7 @@ name: Build Artifacts
 on:
   push:
     branches:
-      - dev-czc
+      - main-czc
     paths-ignore:
       - '**.md'
       - 'docs/**'
