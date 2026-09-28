@@ -1968,25 +1968,32 @@ impl MultiTokenManager {
 
     /// Resolve a friendly model name to the internal ID required by the
     /// CodeWhisperer host. Model discovery shares the existing per-account
-    /// cache; a discovery failure or unknown name uses the conservative
-    /// CodeWhisperer fallback from the official client behavior.
+    /// cache.
+    ///
+    /// An unresolvable name is an error, never a substitution. The official
+    /// client falls back to sonnet here, but a proxy that did the same would
+    /// serve (and bill) a different model than the client asked for while the
+    /// response and usage records still name the requested one. Only `auto`,
+    /// which asks the service to pick, keeps the official fallback. The caller
+    /// then treats the CodeWhisperer bucket as unusable for this request.
     pub(crate) async fn resolve_codewhisperer_model_id_for(
         &self,
         id: u64,
         requested: &str,
-    ) -> String {
-        const FALLBACK_MODEL_ID: &str = "claude-sonnet-4.6";
+    ) -> anyhow::Result<String> {
+        const AUTO_MODEL_FALLBACK_ID: &str = "claude-sonnet-4.6";
+        let is_auto = requested.eq_ignore_ascii_case("auto");
 
         let models = match self.cached_or_refresh_models_for(id).await {
             Ok(response) => response.models,
+            Err(_) if is_auto => return Ok(AUTO_MODEL_FALLBACK_ID.to_string()),
             Err(error) => {
-                tracing::warn!(
-                    "凭据 #{} CodeWhisperer 模型解析失败，回退 {}: {}",
+                anyhow::bail!(
+                    "凭据 #{} 无法解析 CodeWhisperer 模型 {:?}（模型列表不可用）: {}",
                     id,
-                    FALLBACK_MODEL_ID,
+                    requested,
                     error
                 );
-                return FALLBACK_MODEL_ID.to_string();
             }
         };
 
@@ -1994,7 +2001,7 @@ impl MultiTokenManager {
             .iter()
             .find(|model| model.model_id.eq_ignore_ascii_case(requested))
         {
-            return model.model_id.clone();
+            return Ok(model.model_id.clone());
         }
 
         let requested_key = normalize_model_name(requested);
@@ -2004,16 +2011,17 @@ impl MultiTokenManager {
                 .as_deref()
                 .is_some_and(|name| normalize_model_name(name) == requested_key)
         }) {
-            return model.model_id.clone();
+            return Ok(model.model_id.clone());
         }
 
-        tracing::warn!(
-            "凭据 #{} 未找到 CodeWhisperer 模型 {:?}，回退 {}",
+        if is_auto {
+            return Ok(AUTO_MODEL_FALLBACK_ID.to_string());
+        }
+        anyhow::bail!(
+            "凭据 #{} 的 CodeWhisperer 模型列表中没有 {:?}",
             id,
-            requested,
-            FALLBACK_MODEL_ID
-        );
-        FALLBACK_MODEL_ID.to_string()
+            requested
+        )
     }
 
     fn available_model_credential_ids(&self, group: Option<&str>) -> Vec<u64> {
@@ -8021,6 +8029,67 @@ mod tests {
                 refreshed_at: Instant::now(),
             },
         );
+    }
+
+    /// CodeWhisperer 模型解析：解析不到就报错，绝不换成别的模型（`auto` 除外）
+    #[tokio::test]
+    async fn test_resolve_codewhisperer_model_id_never_substitutes() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.model_cache.lock().insert(
+            1,
+            ModelCacheEntry {
+                response: ListAvailableModelsResponse {
+                    models: vec![
+                        UpstreamModel {
+                            model_id: "claude-sonnet-4.6".to_string(),
+                            model_name: None,
+                            description: None,
+                            token_limits: None,
+                        },
+                        UpstreamModel {
+                            model_id: "CLAUDE_OPUS_5_V1".to_string(),
+                            model_name: Some("Claude Opus 5".to_string()),
+                            description: None,
+                            token_limits: None,
+                        },
+                    ],
+                },
+                refreshed_at: Instant::now(),
+            },
+        );
+
+        let exact = manager
+            .resolve_codewhisperer_model_id_for(1, "claude-sonnet-4.6")
+            .await
+            .unwrap();
+        assert_eq!(exact, "claude-sonnet-4.6");
+        let by_name = manager
+            .resolve_codewhisperer_model_id_for(1, "claude-opus-5")
+            .await
+            .unwrap();
+        assert_eq!(by_name, "CLAUDE_OPUS_5_V1");
+
+        let unknown = manager
+            .resolve_codewhisperer_model_id_for(1, "claude-opus-5.5")
+            .await;
+        assert!(
+            unknown.is_err(),
+            "解析不到的模型必须报错，不能静默换成 sonnet：{unknown:?}"
+        );
+
+        // auto 本来就是让服务端选模型，保留官方客户端的默认值
+        let auto = manager
+            .resolve_codewhisperer_model_id_for(1, "auto")
+            .await
+            .unwrap();
+        assert_eq!(auto, "claude-sonnet-4.6");
     }
 
     #[test]

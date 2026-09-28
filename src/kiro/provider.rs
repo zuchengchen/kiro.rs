@@ -772,13 +772,15 @@ impl KiroProvider {
         credential_id: u64,
         request_body: &str,
         rctx: &RequestContext<'_>,
-    ) -> String {
+    ) -> anyhow::Result<String> {
         let body = if endpoint.requires_codewhisperer_model_id() {
             if let Some(requested) = Self::extract_routing_hints(request_body).0 {
+                // 解析失败直接报错，不换成别的模型：作为 429 换桶目标时调用方保留主桶的
+                // 限额语义；作为主端点时按请求发送失败处理（模型列表拉取失败是瞬态的）
                 let resolved = self
                     .token_manager
                     .resolve_codewhisperer_model_id_for(credential_id, &requested)
-                    .await;
+                    .await?;
                 crate::kiro::endpoint::apply_payload_model_id(request_body, &resolved)
             } else {
                 request_body.to_string()
@@ -786,7 +788,7 @@ impl KiroProvider {
         } else {
             request_body.to_string()
         };
-        endpoint.transform_api_body(&body, rctx)
+        Ok(endpoint.transform_api_body(&body, rctx))
     }
 
     /// Build and send one data-plane request. The returned response still owns
@@ -803,7 +805,7 @@ impl KiroProvider {
         let url = endpoint.api_url(rctx);
         let body = self
             .prepare_endpoint_api_body(endpoint, credential_id, request_body, rctx)
-            .await;
+            .await?;
 
         tracing::debug!("使用端点 [{}] POST {}", endpoint.display_name(), url);
         tracing::debug!("实际发送请求体: {}", body);
