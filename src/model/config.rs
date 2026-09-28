@@ -582,15 +582,33 @@ impl Config {
     }
 
     /// 将当前配置写回原始配置文件
+    ///
+    /// 先写同目录临时文件再 rename：直接 `fs::write` 是「截断 + 写入」，进程在中间被杀
+    /// （部署切换时 docker 的 SIGKILL）会留下半截 config.json，下次启动解析失败直接退出。
+    /// 临时文件沿用原文件权限（config.json 里有 API Key，通常是 0600），符号链接写到目标文件。
     pub fn save(&self) -> anyhow::Result<()> {
+        use std::io::Write;
+
         let path = self
             .config_path
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，无法保存配置"))?;
+        let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
 
         let content = serde_json::to_string_pretty(self).context("序列化配置失败")?;
-        fs::write(path, content)
-            .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
+        let tmp = target.with_extension("json.tmp");
+        let write_tmp = || -> std::io::Result<()> {
+            let mut file = fs::File::create(&tmp)?;
+            if let Ok(meta) = fs::metadata(&target) {
+                file.set_permissions(meta.permissions())?;
+            }
+            file.write_all(content.as_bytes())?;
+            file.sync_all()
+        };
+        if let Err(e) = write_tmp().and_then(|()| fs::rename(&tmp, &target)) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e).with_context(|| format!("写入配置文件失败: {}", path.display()));
+        }
         Ok(())
     }
 }
@@ -598,6 +616,75 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::Config;
+
+    fn tmp_dir(name: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "kiro_config_{}_{}_{}",
+            name,
+            std::process::id(),
+            nonce
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn save_is_atomic_and_keeps_file_mode() {
+        let dir = tmp_dir("save_atomic");
+        let path = dir.join("config.json");
+        std::fs::write(&path, r#"{"port":1234}"#).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let mut config = Config::load(&path).unwrap();
+        config.port = 4321;
+        config.save().unwrap();
+
+        let reloaded = Config::load(&path).unwrap();
+        assert_eq!(reloaded.port, 4321);
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "rename 后不应残留临时文件"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "config.json 含 API Key，保存后不能放宽权限");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_writes_through_symlink() {
+        let dir = tmp_dir("save_symlink");
+        let real = dir.join("real-config.json");
+        let link = dir.join("config.json");
+        std::fs::write(&real, r#"{"port":1234}"#).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let mut config = Config::load(&link).unwrap();
+        config.port = 4321;
+        config.save().unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "rename 不能把符号链接替换成普通文件"
+        );
+        assert_eq!(Config::load(&real).unwrap().port, 4321);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn upstream_timeout_defaults_to_30_minutes() {
