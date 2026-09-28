@@ -334,16 +334,6 @@ function MachineUsageRow({ credential }: { credential: CredentialStatusItem }) {
 }
 
 /**
- * 本计费周期内「本机 / 其他机器」的用量拆分。
- *
- * 其他机器 = 账号本周期总用量 − 本机本周期用量，所以只有查过余额才能给出。刻意用
- * 周期口径而不是全周期累计：上游 `currentUsage` 每个计费周期归零，拿全周期累计去减
- * 会得到负数或严重偏大的差值。
- *
- * `otherMachineExact` 为 false 时（本机计数没覆盖完整周期）标注「至多」，因为此时本机
- * 周期用量偏小，差值只是上界。
- */
-/**
  * 解析积分上限输入框：空 → null（不限制），合法非负数 → number，其它 → 'invalid'。
  *
  * 与客户端 Key 页面的 parseMaxCreditsInput 保持一致的输入约定。
@@ -518,6 +508,16 @@ function CreditLimitDialog({
   );
 }
 
+/**
+ * 本计费周期内「本机 / 其他机器」的用量拆分。
+ *
+ * 其他机器 = 账号本周期总用量 − 本机本周期用量，所以只有查过余额才能给出。刻意用
+ * 周期口径而不是全周期累计：上游 `currentUsage` 每个计费周期归零，拿全周期累计去减
+ * 会得到负数或严重偏大的差值。
+ *
+ * `otherMachineExact` 为 false 时（本机计数没覆盖完整周期）标注「至多」，因为此时本机
+ * 周期用量偏小，差值只是上界。
+ */
 function CycleSplitRows({ credential }: { credential: CredentialStatusItem }) {
   const other = credential.otherMachineCredits;
   if (other === undefined) return null;
