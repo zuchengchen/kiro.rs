@@ -1324,6 +1324,13 @@ pub(super) async fn run_web_search_loop(
     ) as i32;
     let initial_event = initial_stream_event(&payload.model, initial_input_tokens);
     let (sender, receiver) = mpsc::channel(WEB_SEARCH_PROGRESS_CAPACITY);
+    // HTTP 200 推迟到第一次上游尝试成功后再提交。之前 200 在选号之前就发出，首轮取号
+    // 遇到全池 429 只能变成流内 error 事件：SSE 里没有 Retry-After，客户端会立即重试
+    // （CLAUDE.md 不变量 #2）。与普通流式路径一致，拿到上游响应头之前的失败按真实
+    // 状态码 + Retry-After 返回。
+    let accepted = tracer.subscribe_first_success();
+    let (early_tx, early_rx) = tokio::sync::oneshot::channel::<Response>();
+    let signal = tracer.clone();
     tokio::spawn(async move {
         let receiver_guard = sender.clone();
         let mut emitter = WebSearchSseEmitter::new(sender);
@@ -1352,6 +1359,11 @@ pub(super) async fn run_web_search_loop(
         match outcome {
             Ok(response) => {
                 if !emitter.terminal {
+                    // 还没提交 200：把原始错误响应（含状态码与 Retry-After）交给 handler
+                    if signal.awaiting_first_success() {
+                        let _ = early_tx.send(response);
+                        return;
+                    }
                     let (error_type, message) = response_error_details(response).await;
                     emitter.fail(&error_type, &message).await;
                 }
@@ -1362,6 +1374,19 @@ pub(super) async fn run_web_search_loop(
                     "web_search agentic loop panicked"
                 );
                 if !emitter.terminal {
+                    if signal.awaiting_first_success() {
+                        let _ = early_tx.send(
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(ErrorResponse::new(
+                                    "internal_error",
+                                    "web_search agentic loop panicked",
+                                )),
+                            )
+                                .into_response(),
+                        );
+                        return;
+                    }
                     emitter
                         .fail("internal_error", "web_search agentic loop panicked")
                         .await;
@@ -1370,7 +1395,14 @@ pub(super) async fn run_web_search_loop(
         }
     });
 
-    render_channel_sse(initial_event, receiver)
+    tokio::select! {
+        // 上游已接受请求：从这里开始是 SSE，之后的失败只能走流内 error 事件
+        Ok(()) = accepted => render_channel_sse(initial_event, receiver),
+        // 首次成功之前就结束了：原样返回真实错误
+        Ok(response) = early_rx => response,
+        // 两个信号都没来（任务在发送前退出）：退回流式渲染，已缓冲的事件照常送达
+        else => render_channel_sse(initial_event, receiver),
+    }
 }
 
 async fn run_web_search_loop_inner(

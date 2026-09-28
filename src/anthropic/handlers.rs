@@ -148,6 +148,9 @@ pub(crate) struct RequestTracer {
     /// 首次选号的路由决策。web_search 一条 trace 内多次 provider 调用，
     /// 「是否沿用了上一轮账号」只看第一次。
     route: parking_lot::Mutex<Option<TraceRoute>>,
+    /// 第一次有上游尝试成功时触发（只触发一次）。流式 web_search 用它推迟提交 HTTP 200：
+    /// 在此之前的失败仍能以真实状态码 + `Retry-After` 返回，而不是流内 error 事件。
+    first_success: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 /// usage 三项的来源，落到 trace 行便于区分「上游真值」与「本地估算」。
@@ -225,7 +228,21 @@ impl RequestTracer {
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
             route: parking_lot::Mutex::new(None),
+            first_success: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// 订阅「第一次上游尝试成功」。返回的 receiver 在成功时收到 `()`；
+    /// 追踪器被丢弃而从未成功时收到 `RecvError`。
+    pub(crate) fn subscribe_first_success(&self) -> tokio::sync::oneshot::Receiver<()> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        *self.first_success.lock() = Some(sender);
+        receiver
+    }
+
+    /// 已订阅且还没有任何上游尝试成功
+    pub(crate) fn awaiting_first_success(&self) -> bool {
+        self.first_success.lock().is_some()
     }
 
     /// 标记首个上游 chunk 到达（幂等，仅记录第一次）
@@ -294,12 +311,19 @@ impl RequestTracer {
 
 impl TraceSink for RequestTracer {
     fn on_attempt(&self, mut attempt: TraceAttempt) {
-        let mut attempts = self.attempts.lock();
-        // Each provider call numbers retries from zero. A web-search request can make
-        // several provider calls under one trace, so assign a request-wide sequence
-        // before persisting to the (trace_id, attempt) primary key.
-        attempt.attempt = attempts.len() as u32;
-        attempts.push(attempt);
+        let succeeded = attempt.outcome == outcome::SUCCESS;
+        {
+            let mut attempts = self.attempts.lock();
+            // Each provider call numbers retries from zero. A web-search request can make
+            // several provider calls under one trace, so assign a request-wide sequence
+            // before persisting to the (trace_id, attempt) primary key.
+            attempt.attempt = attempts.len() as u32;
+            attempts.push(attempt);
+        }
+        // 出 attempts 锁后再通知，两把锁不嵌套
+        if succeeded && let Some(sender) = self.first_success.lock().take() {
+            let _ = sender.send(());
+        }
     }
 
     fn on_route(&self, route: TraceRoute) {
@@ -2308,6 +2332,7 @@ mod tests {
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
             route: parking_lot::Mutex::new(None),
+            first_success: parking_lot::Mutex::new(None),
         };
 
         let attempt = |attempt, credential_id, outcome: &str| TraceAttempt {
@@ -2379,6 +2404,7 @@ mod tests {
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
             route: parking_lot::Mutex::new(None),
+            first_success: parking_lot::Mutex::new(None),
         };
 
         tracer.mark_first_token();
@@ -2411,6 +2437,7 @@ mod tests {
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
             route: parking_lot::Mutex::new(None),
+            first_success: parking_lot::Mutex::new(None),
         };
         let attempt = |credential_id, endpoint: &str, status, attempt_outcome: &str| TraceAttempt {
             attempt: 0,
@@ -2483,6 +2510,105 @@ mod tests {
             "ValidationException: transient backend issue".to_string()
         ));
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// 流式 web_search（混合工具）首轮取号就遇到全池限流：必须返回真实的 429 + Retry-After，
+    /// 不能先提交 200 再发一个没有 Retry-After 的流内 error 事件（不变量 #2）
+    #[tokio::test(flavor = "multi_thread")]
+    async fn streaming_web_search_loop_returns_429_before_committing_the_stream() {
+        use crate::kiro::endpoint::{IdeEndpoint, KiroEndpoint};
+        use crate::kiro::model::credentials::KiroCredentials;
+        use crate::kiro::provider::KiroProvider;
+        use crate::kiro::token_manager::MultiTokenManager;
+        use std::sync::Arc;
+
+        let mut config = crate::model::config::Config::default();
+        config.acquire_wait_budget_ms = 0;
+        let cred = KiroCredentials {
+            id: Some(1),
+            access_token: Some("access-token".to_string()),
+            expires_at: Some("2099-01-01T00:00:00Z".to_string()),
+            ..KiroCredentials::default()
+        };
+        let manager =
+            Arc::new(MultiTokenManager::new(config, vec![cred], None, None, true).unwrap());
+        manager.report_transient_throttle_for_request(
+            1,
+            std::time::Duration::from_secs(120),
+            None,
+            None,
+        );
+        let endpoint: Arc<dyn KiroEndpoint> = Arc::new(IdeEndpoint::new());
+        let endpoints =
+            std::collections::HashMap::from([(endpoint.name().to_string(), endpoint.clone())]);
+        let provider = Arc::new(KiroProvider::with_proxy(
+            manager,
+            None,
+            endpoints,
+            endpoint.name().to_string(),
+        ));
+
+        let state = AppState::new(
+            false,
+            crate::model::config::ToolCompatibilityMode::default(),
+        );
+        let key_ctx = KeyContext {
+            key_id: 0,
+            group: None,
+            key_source: TraceKeySource::ClientKey,
+            client_ip: None,
+        };
+        let payload: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4-5-20250929",
+            "max_tokens": 64,
+            "stream": true,
+            "messages": [{"role": "user", "content": "search rust news"}],
+            "tools": [
+                {"type": "web_search_20250305", "name": "web_search", "max_uses": 3},
+                {"name": "exec", "description": "run", "input_schema": {"type": "object"}}
+            ]
+        }))
+        .unwrap();
+        let tracer = Arc::new(RequestTracer::new(
+            &state,
+            RequestTraceOptions {
+                key_ctx,
+                model: payload.model.clone(),
+                is_stream: true,
+            },
+        ));
+        let hook = UsageRecordHook::from_state(&state, 0, payload.model.clone());
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            super::super::websearch_loop::run_web_search_loop(
+                provider,
+                payload,
+                hook,
+                tracer,
+                true,
+                None,
+                state.tool_compatibility_mode,
+            ),
+        )
+        .await
+        .expect("首轮失败必须尽快返回，不能挂住");
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry_after: u64 = response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .expect("429 必须带 Retry-After")
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((1..=120).contains(&retry_after), "{retry_after}");
+        assert_ne!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/event-stream",
+            "失败发生在上游接受请求之前，不应提交 SSE"
+        );
     }
 
     #[test]
