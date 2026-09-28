@@ -1337,6 +1337,12 @@ impl AcquireWaitBudget {
     }
 }
 
+/// 模型缓存后台刷新间隔：半个 TTL，保证缓存在过期前就被刷新；下限 60 秒，
+/// 避免把 TTL 配得很短时变成高频轮询上游
+fn model_cache_rewarm_interval(ttl: StdDuration) -> StdDuration {
+    (ttl / 2).max(StdDuration::from_secs(60))
+}
+
 /// 单次内部等待的下限
 ///
 /// 保证每次批准的等待都扣掉可观的预算，重选号循环必然在有限轮内结束
@@ -2114,7 +2120,12 @@ impl MultiTokenManager {
         }
     }
 
-    /// 服务启动后异步预热所有当前启用凭据的模型缓存。
+    /// 服务启动后异步预热所有当前启用凭据的模型缓存，之后每半个 TTL 强制刷新一次。
+    ///
+    /// 只在启动时预热的话，TTL（默认 1 小时）一过，刷新就落到请求路径上：CodeWhisperer
+    /// 换桶要先解析模型 ID，过期缓存的刷新（ListAvailableModels，持该凭据的刷新锁 + 全局
+    /// 信号量）会吃掉换桶本就只有 10 秒的首字节预算，同一凭据上并发的请求也排在它后面。
+    /// 后台在过期前刷新，请求路径就只读缓存。
     pub fn start_model_cache_warmer(self: &Arc<Self>) {
         let manager = Arc::clone(self);
         tokio::spawn(async move {
@@ -2126,6 +2137,29 @@ impl MultiTokenManager {
                     tracing::debug!("没有可用于模型缓存预热的凭据")
                 }
                 Err(error) => tracing::warn!("模型缓存预热失败: {}", error),
+            }
+
+            let ttl = manager.model_cache_ttl();
+            if ttl.is_zero() {
+                // TTL 为 0 表示不缓存，定期刷新没有意义
+                return;
+            }
+            let interval = model_cache_rewarm_interval(ttl);
+            loop {
+                tokio::time::sleep(interval).await;
+                let ids = manager.available_model_credential_ids(None);
+                // 并发度由 refresh_model_cache_for 内部的全局信号量限制
+                let results = futures::future::join_all(ids.iter().map(|&id| {
+                    let manager = &manager;
+                    async move { (id, manager.refresh_model_cache_for(id, true).await) }
+                }))
+                .await;
+                for (id, result) in results {
+                    if let Err(error) = result {
+                        // 失败时旧缓存保留，请求路径照常回退到最后一次成功值
+                        tracing::warn!("凭据 #{} 定期刷新模型列表失败: {}", id, error);
+                    }
+                }
             }
         });
     }
@@ -7172,6 +7206,20 @@ mod tests {
         let mut budget = budget_of(3_000);
         assert_eq!(budget.take(StdDuration::ZERO), None);
         assert_eq!(budget.remaining(), StdDuration::from_secs(3));
+    }
+
+    #[test]
+    fn model_cache_rewarm_runs_before_the_ttl_expires() {
+        // 默认 1 小时 TTL：每 30 分钟刷新一次，缓存永远不会在请求路径上过期
+        assert_eq!(
+            model_cache_rewarm_interval(StdDuration::from_secs(3_600)),
+            StdDuration::from_secs(1_800)
+        );
+        // TTL 配得很短时不变成高频轮询
+        assert_eq!(
+            model_cache_rewarm_interval(StdDuration::from_secs(10)),
+            StdDuration::from_secs(60)
+        );
     }
 
     #[test]
