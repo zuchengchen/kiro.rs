@@ -331,6 +331,14 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_metadata_schema: Option<serde_json::Value>,
 
+    /// 本版本不认识的字段，原样保留、保存时写回
+    ///
+    /// 回滚到旧二进制时尤其重要：新版本加的配置（如 acquireWaitBudgetMs、agentMode）旧版本
+    /// 不认识，没有这个兜底的话，旧版本第一次保存配置（任何一次 Admin 修改）就会把它们
+    /// 悄悄删掉，之后再升级回来只能拿到默认值。只在 `save()` 里序列化，不会经 API 外泄。
+    #[serde(flatten)]
+    unknown_fields: serde_json::Map<String, serde_json::Value>,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -523,6 +531,7 @@ impl Default for Config {
             endpoints: HashMap::new(),
             custom_models: Vec::new(),
             credential_metadata_schema: None,
+            unknown_fields: serde_json::Map::new(),
             config_path: None,
         }
     }
@@ -681,6 +690,35 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "config.json 含 API Key，保存后不能放宽权限");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 不认识的字段（更新版本写入的配置）保存后必须原样保留，回滚到旧版本也不丢
+    #[test]
+    fn save_preserves_unknown_fields() {
+        let dir = tmp_dir("unknown_fields");
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"port":1234,"someFutureSetting":{"enabled":true,"level":3},"futureFlag":"x"}"#,
+        )
+        .unwrap();
+
+        let mut config = Config::load(&path).unwrap();
+        assert_eq!(config.port, 1234, "已知字段照常解析");
+        config.port = 4321;
+        config.save().unwrap();
+
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["port"], 4321);
+        assert_eq!(
+            saved["someFutureSetting"],
+            serde_json::json!({"enabled": true, "level": 3})
+        );
+        assert_eq!(saved["futureFlag"], "x");
+        // 已知字段不能被重复写进兜底表
+        assert!(!config.unknown_fields.contains_key("port"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -861,3 +899,4 @@ mod tests {
         assert_eq!(config.account_rpm_limit, 120);
     }
 }
+
