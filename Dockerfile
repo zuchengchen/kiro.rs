@@ -1,4 +1,4 @@
-FROM oven/bun:1-alpine AS frontend-builder
+FROM oven/bun:1.3-alpine AS frontend-builder
 
 WORKDIR /app/admin-ui
 COPY admin-ui/package.json admin-ui/bun.lock* ./
@@ -15,7 +15,7 @@ COPY Cargo.toml Cargo.lock* ./
 COPY src ./src
 COPY --from=frontend-builder /app/admin-ui/dist /app/admin-ui/dist
 
-RUN cargo build --release --no-default-features
+RUN cargo build --release --locked --no-default-features
 
 FROM alpine:3.21
 
