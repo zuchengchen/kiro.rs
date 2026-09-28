@@ -57,6 +57,9 @@ config.json
 credentials.json
 credentials.*.json
 client_api_keys.json
+# 账号导出（含明文 refreshToken / accessToken），与 .gitignore 保持一致
+**/kiro-accounts-*.json
+**/kiro-account-manager-export-*.json
 kiro_balance_cache.json
 kiro_stats.json
 proxy_pool.json
