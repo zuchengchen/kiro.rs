@@ -694,11 +694,16 @@ fn build_stream_sse(p: &ParsedResponse) -> String {
 
 /// 构造 OpenAI usage 对象，并按需透传 upstream meteringEvent 写入的
 /// credit_usage / credit_unit / credit_unit_plural 字段。
+///
+/// `prompt_tokens` 是全部输入（含缓存读），命中缓存的部分按 OpenAI 格式放在
+/// `prompt_tokens_details.cached_tokens`。之前没带这一项，客户端和下游计费看到的永远是
+/// 0% 缓存命中，而 usage_log / trace 里记的是已拆分的数字（Claude 为固定 90%）。
 fn build_usage_json(p: &ParsedResponse) -> Value {
     let mut usage = json!({
         "prompt_tokens": p.prompt_tokens,
         "completion_tokens": p.completion_tokens,
         "total_tokens": p.prompt_tokens + p.completion_tokens,
+        "prompt_tokens_details": { "cached_tokens": p.cached_tokens },
     });
     if let Some(credit_usage) = p.credit_usage {
         usage["credit_usage"] = json!(credit_usage);
@@ -910,6 +915,39 @@ mod tests {
         assert_eq!(usage["prompt_tokens"], json!(7));
         assert_eq!(usage["completion_tokens"], json!(11));
         assert_eq!(usage["total_tokens"], json!(18));
+    }
+
+    /// 缓存读取要按 OpenAI 格式暴露给客户端，非流式与流式结束帧一致
+    #[test]
+    fn usage_exposes_cached_tokens_in_prompt_tokens_details() {
+        let anthropic = json!({
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 1,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 9,
+                "output_tokens": 5
+            }
+        });
+        let p = parse_anthropic_message(&anthropic, "claude-opus-4-7");
+
+        let usage = &build_completion_json(&p)["usage"];
+        assert_eq!(usage["prompt_tokens"], json!(10), "prompt_tokens 含缓存读");
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], json!(9));
+
+        let sse = build_stream_sse(&p);
+        let final_chunk: Value = sse
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str::<Value>(data).unwrap())
+            .find(|chunk| chunk.get("usage").is_some())
+            .expect("流式结束帧应带 usage");
+        assert_eq!(
+            final_chunk["usage"]["prompt_tokens_details"]["cached_tokens"],
+            json!(9)
+        );
     }
 
     #[test]

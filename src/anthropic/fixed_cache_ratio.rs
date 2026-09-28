@@ -25,7 +25,9 @@
 //! - `RequestTracer::finalize` 落库时把来源标记为 [`FIXED_USAGE_SOURCE`]
 //!
 //! OpenAI / Responses 适配层都经由 `post_messages`，从已改写的 Anthropic usage 读取
-//! `cache_read_input_tokens`，无需单独处理。
+//! `cache_read_input_tokens`，拆分本身无需单独处理；但各自的对外 usage 格式要把它带出去：
+//! chat/completions 放在 `prompt_tokens_details.cached_tokens`，Responses 放在
+//! `input_tokens_details.cached_tokens`。漏了这一步，内部记账是 90%，客户端看到的是 0%。
 
 use crate::kiro::model::events::TokenUsage;
 
