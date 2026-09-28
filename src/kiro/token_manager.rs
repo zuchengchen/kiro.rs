@@ -1748,12 +1748,15 @@ impl MultiTokenManager {
             .collect();
     }
 
-    /// 距离最近一个账号的周期重置还有多少秒；无已知重置时刻时返回 None。
-    fn earliest_cycle_reset_in_secs(&self) -> Option<u64> {
+    /// `ids` 中最早一个账号的周期重置还有多少秒；都没有已知重置时刻时返回 None。
+    ///
+    /// 只看本次请求被上限挡住的账号：别的分组里的账号先重置，并不能让这次请求变得可用，
+    /// 按它算出的 `Retry-After` 只会让客户端提前回来再吃一次 429。
+    fn earliest_cycle_reset_in_secs(&self, ids: &[u64]) -> Option<u64> {
         let now = Utc::now().timestamp() as f64;
-        self.cycle_reset_times
-            .lock()
-            .values()
+        let resets = self.cycle_reset_times.lock();
+        ids.iter()
+            .filter_map(|id| resets.get(id))
             .filter(|&&reset| reset > now)
             .map(|&reset| (reset - now).ceil() as u64)
             .min()
@@ -2182,12 +2185,15 @@ impl MultiTokenManager {
         let window = StdDuration::from_secs(RPM_WINDOW_SECS);
         let mut earliest_retry_after = None;
 
+        // 已达积分上限的账号即便 RPM 有余量也不可选，必须排除：否则它会让这里返回 None，
+        // 请求落到积分上限分支，拿到长达一小时的 Retry-After，而另一个账号一分钟内就能用
         for entry in entries.iter().filter(|entry| {
             !entry.disabled
                 && !entry
                     .throttled_until
                     .map(|until| until > now)
                     .unwrap_or(false)
+                && !self.cycle_credits_exhausted(entry)
                 && credential_matches_request(&entry.credentials, model, group)
                 && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
         }) {
@@ -2276,7 +2282,9 @@ impl MultiTokenManager {
         entries
             .iter()
             .filter(|entry| {
+                // 冷却结束后仍被积分上限挡住的账号，等它的冷却没有意义
                 !entry.disabled
+                    && !self.cycle_credits_exhausted(entry)
                     && credential_matches_request(&entry.credentials, model, group)
                     && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
             })
@@ -2592,24 +2600,42 @@ impl MultiTokenManager {
                     // 区分「积分上限用满」和「凭据被禁用」：前者是管理员主动设的策略，
                     // 下个计费周期自动恢复，错误信息必须说清楚，否则会被当成账号故障排查。
                     //
-                    // cycle_credit_usage 是另一把锁（此处只持有 entries），加锁顺序与
-                    // available_count / snapshot 一致，不构成环路。
+                    // 只统计能服务本请求的账号（分组、模型都匹配）：别的分组里有账号用满
+                    // 上限，不能把「本分组全被禁用」报成积分上限。
+                    //
+                    // cycle_credit_usage / cycle_reset_times 都是叶子锁（此处只持有 entries），
+                    // 加锁顺序与 available_count / snapshot 一致，不构成环路。
                     let usage = self.cycle_credit_usage.lock();
-                    let exhausted = entries
+                    let exhausted_ids: Vec<u64> = entries
                         .iter()
-                        .filter(|e| !e.disabled && credits_exhausted(e, &usage))
-                        .count();
+                        .filter(|e| {
+                            !e.disabled
+                                && credits_exhausted(e, &usage)
+                                && credential_matches_request(&e.credentials, model, group)
+                                && self.cached_model_support(e.id, model)
+                                    != CachedModelSupport::Unsupported
+                        })
+                        .map(|e| e.id)
+                        .collect();
                     drop(usage);
-                    if exhausted > 0 {
+                    if !exhausted_ids.is_empty() {
+                        // 池子构成只进日志：错误信息会原样返回给客户端（经 Sub2API 还会
+                        // 到终端用户），不该暴露有几个账号、几个受限。
+                        tracing::warn!(
+                            "本请求的可用凭据均已达到本周期积分上限（{} 个受限 / 启用 {}，共 {}，分组 {:?}，模型 {:?}）",
+                            exhausted_ids.len(),
+                            available,
+                            total,
+                            group,
+                            model
+                        );
                         // 用类型化错误上抛，让 handler 映射成 429 + Retry-After。
                         // 普通 bail! 会落到通用 502，客户端会立刻重试。
                         return Err(anyhow::Error::new(
                             crate::kiro::error::CreditLimitReachedError::new(
-                                format!(
-                                    "所有可用凭据均已达到本周期积分上限（{} 个受限 / 启用 {}，共 {}），下个计费周期自动恢复",
-                                    exhausted, available, total
-                                ),
-                                self.earliest_cycle_reset_in_secs(),
+                                "所有可用凭据均已达到本周期积分上限，下个计费周期自动恢复"
+                                    .to_string(),
+                                self.earliest_cycle_reset_in_secs(&exhausted_ids),
                             ),
                         ));
                     }
@@ -3807,15 +3833,13 @@ impl MultiTokenManager {
         model: Option<&str>,
         group: Option<&str>,
     ) -> bool {
+        // 与选号用同一套可用性判定（含积分上限、已知不支持该模型）：这里多算一个选号时
+        // 会跳过的账号，就会给唯一能用的账号打上冷却，下一轮取号全池失败、白白消耗等待预算
         let now = Instant::now();
         let entries = self.entries.lock();
-        entries.iter().any(|e| {
-            e.id != exclude_id
-                && !e.disabled
-                && !e.throttled_until.map(|t| t > now).unwrap_or(false)
-                && !self.rpm_exceeded(e, now)
-                && credential_matches_request(&e.credentials, model, group)
-        })
+        entries
+            .iter()
+            .any(|e| e.id != exclude_id && self.entry_available_for_request(e, model, group, now))
     }
 
     /// 瞬态限流（429/5xx）后给该凭据打一个**短冷却**，让下一轮取号换到别的凭据。
@@ -5478,6 +5502,124 @@ mod tests {
         assert_eq!(mgr.available_count(), 2);
         mgr.set_cycle_credit_usage(HashMap::from([(1, -3.0)]));
         assert_eq!(mgr.available_count(), 2);
+    }
+
+    /// 选号会跳过的账号（积分上限用满）不能算作「还有别的可换」
+    #[test]
+    fn has_other_available_ignores_capped_peer() {
+        let mgr = credit_limit_manager([None, Some(10.0)]);
+        assert!(mgr.has_other_available_for_request(1, None, None));
+        mgr.set_cycle_credit_usage(HashMap::from([(2, 10.0)]));
+        assert!(
+            !mgr.has_other_available_for_request(1, None, None),
+            "#2 已达上限，选号不会用它，#1 的瞬态限流不该打冷却"
+        );
+    }
+
+    /// #1 用满积分上限、#2 RPM 打满：应按 #2 的 RPM 窗口返回短 Retry-After，
+    /// 而不是落到积分上限分支给出长达一小时的等待
+    #[tokio::test]
+    async fn capped_account_does_not_hide_rpm_retry_after_of_its_peer() {
+        let mut config = Config::default();
+        config.account_rpm_limit_enabled = true;
+        config.account_rpm_limit = 1;
+        config.acquire_wait_budget_ms = 0;
+        let creds = [Some(10.0), None]
+            .iter()
+            .enumerate()
+            .map(|(i, limit)| KiroCredentials {
+                id: Some(i as u64 + 1),
+                access_token: Some("access-token".to_string()),
+                expires_at: Some("2099-01-01T00:00:00Z".to_string()),
+                max_cycle_credits: *limit,
+                ..KiroCredentials::default()
+            })
+            .collect();
+        let mgr = MultiTokenManager::new(config, creds, None, None, true).unwrap();
+        mgr.set_cycle_credit_usage(HashMap::from([(1, 10.0)]));
+        assert!(mgr.record_request(2), "#2 应记下这一分钟唯一的一次请求");
+
+        let Err(err) = mgr.acquire_context(None, None).await else {
+            panic!("两个账号都不可用时取号应失败");
+        };
+        assert!(
+            err.downcast_ref::<crate::kiro::error::CreditLimitReachedError>()
+                .is_none(),
+            "#2 一分钟内就能用，不能报积分上限：{err}"
+        );
+        let rate_limit = err
+            .downcast_ref::<UpstreamRateLimitError>()
+            .expect("应返回带 Retry-After 的限流错误");
+        let secs: u64 = rate_limit.retry_after().unwrap().parse().unwrap();
+        assert!(
+            (1..=60).contains(&secs),
+            "Retry-After 应来自 RPM 窗口: {secs}"
+        );
+    }
+
+    /// 积分上限错误只看本请求能用的账号：别的分组里有账号用满，不能把
+    /// 「本分组全被禁用」报成积分上限；Retry-After 也只按本请求受限的账号算
+    #[tokio::test]
+    async fn credit_limit_error_is_scoped_to_the_request() {
+        let mut disabled_a = grouped_cred("a-token", &["a"]);
+        disabled_a.id = Some(1);
+        disabled_a.disabled = true;
+        let mut capped_b = grouped_cred("b-token", &["b"]);
+        capped_b.id = Some(2);
+        capped_b.max_cycle_credits = Some(10.0);
+        let mgr = MultiTokenManager::new(
+            Config::default(),
+            vec![disabled_a, capped_b],
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+        mgr.set_cycle_credit_usage(HashMap::from([(2, 10.0)]));
+
+        let Err(err) = mgr.acquire_context(None, Some("a")).await else {
+            panic!("分组 a 没有可用账号，取号应失败");
+        };
+        assert!(
+            err.downcast_ref::<crate::kiro::error::CreditLimitReachedError>()
+                .is_none(),
+            "分组 a 是全被禁用，不是积分上限：{err}"
+        );
+
+        // 两个分组都用满上限：Retry-After 取本请求分组的重置时刻，而不是全池最早的
+        let mut capped_a = grouped_cred("a-token", &["a"]);
+        capped_a.id = Some(1);
+        capped_a.max_cycle_credits = Some(10.0);
+        let mut capped_b = grouped_cred("b-token", &["b"]);
+        capped_b.id = Some(2);
+        capped_b.max_cycle_credits = Some(10.0);
+        let mgr = MultiTokenManager::new(
+            Config::default(),
+            vec![capped_a, capped_b],
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+        mgr.set_cycle_credit_usage(HashMap::from([(1, 10.0), (2, 10.0)]));
+        let now = Utc::now().timestamp() as f64;
+        mgr.set_cycle_reset_times(HashMap::from([(1, now + 1_800.0), (2, now + 600.0)]));
+
+        let Err(err) = mgr.acquire_context(None, Some("a")).await else {
+            panic!("分组 a 的账号全部用满，取号应失败");
+        };
+        let limit = err
+            .downcast_ref::<crate::kiro::error::CreditLimitReachedError>()
+            .expect("分组 a 的账号全部用满，应报积分上限");
+        assert!(
+            (1_790..=1_800).contains(&limit.retry_after_secs()),
+            "应按 #1 的重置时刻，而不是分组 b 的 #2: {}",
+            limit.retry_after_secs()
+        );
+        assert!(
+            !limit.to_string().contains("受限"),
+            "对客户端的错误信息不应暴露池子构成：{limit}"
+        );
     }
 
     #[test]
