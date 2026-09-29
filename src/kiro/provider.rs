@@ -14,7 +14,9 @@ use tokio::time::sleep;
 use crate::admin::trace_db::{TraceAttempt, TraceRoute, TraceSink, outcome, truncate_snippet};
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
-use crate::kiro::error::{UpstreamContextOverflowError, UpstreamRateLimitError};
+use crate::kiro::error::{
+    is_model_temporarily_unavailable, UpstreamContextOverflowError, UpstreamRateLimitError,
+};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::AcquireWaitBudget;
@@ -1441,7 +1443,8 @@ impl KiroProvider {
                 //
                 // 冷却时长取本次退避时长：保证这一跳之后该凭据被跳过，且不会在
                 // 请求结束后继续影响调度。
-                let backoff = if status.as_u16() == 429 {
+                let model_overloaded = is_model_temporarily_unavailable(&body);
+                let backoff = if status.as_u16() == 429 || model_overloaded {
                     Self::retry_delay_throttle(attempt)
                 } else {
                     Self::retry_delay(attempt)
@@ -1469,7 +1472,9 @@ impl KiroProvider {
                 if attempt + 1 < max_retries {
                     // 能换号就立即重试：退避是为了给「同一个」凭据的配额留恢复时间，
                     // 换到别的凭据没有等待的理由。无处可换时照常退避。
-                    if !can_switch {
+                    // MODEL_TEMPORARILY_UNAVAILABLE 是模型容量而不是账号配额，
+                    // 换号仍打在同一 AWS 池上，立即连打只会把 500 放大。
+                    if !can_switch || model_overloaded {
                         sleep(backoff).await;
                     }
                 }

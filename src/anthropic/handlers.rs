@@ -498,6 +498,24 @@ pub(super) fn map_provider_error(err: Error) -> Response {
     // otherwise it triggers an upstream cooldown that amplifies one client error into a 30+ burst of 503s.
     // Detection is centralized in the endpoint layer (single source of truth for the markers); the provider
     // already bails out without retry on these, and this mapping is the client-facing safety net.
+    // AWS model-capacity 500. Anthropic clients retry 529 overloaded_error;
+    // mapping to 502 makes Claude Code treat it as a hard upstream failure.
+    if crate::kiro::error::is_model_temporarily_unavailable(&err_str) {
+        tracing::warn!(error = %err, "上游模型过载（映射为 529）");
+        let mut response = (
+            StatusCode::from_u16(529).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+            Json(ErrorResponse::new(
+                "overloaded_error",
+                "Upstream model is temporarily overloaded. Retry later.",
+            )),
+        )
+            .into_response();
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, header::HeaderValue::from_static("5"));
+        return response;
+    }
+
     if crate::kiro::endpoint::default_is_client_validation_error(&err_str) {
         tracing::warn!(
             error = %err,
@@ -2767,6 +2785,24 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Context window is full"));
+    }
+
+    #[tokio::test]
+    async fn model_temporarily_unavailable_maps_to_529() {
+        let resp = map_provider_error(anyhow::anyhow!(
+            "流式 API 请求失败: 500 Internal Server Error {{\"reason\":\"MODEL_TEMPORARILY_UNAVAILABLE\"}}"
+        ));
+        assert_eq!(resp.status().as_u16(), 529);
+        assert_eq!(resp.headers().get(header::RETRY_AFTER).unwrap(), "5");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "overloaded_error");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("temporarily overloaded"));
     }
 
     #[tokio::test]

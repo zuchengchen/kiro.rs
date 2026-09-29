@@ -7,6 +7,12 @@ pub struct UpstreamRateLimitError {
     retry_after: Option<String>,
 }
 
+/// AWS Kiro runtime 500 when the model itself is at capacity.
+/// Switching credentials does not help; the client should wait and retry.
+pub fn is_model_temporarily_unavailable(body: &str) -> bool {
+    body.contains("MODEL_TEMPORARILY_UNAVAILABLE")
+}
+
 /// Kiro rejected the serialized conversation because it exceeded the model's
 /// context limit. Keeping this typed at the provider boundary lets compact
 /// retry once without reverse-engineering an HTTP error response.
@@ -107,5 +113,15 @@ mod tests {
         let error = UpstreamRateLimitError::new(Some("not-a-retry-delay".to_string()));
         assert_eq!(error.retry_after(), None);
         assert!(error.should_retry_locally());
+    }
+
+    #[test]
+    fn detects_model_temporarily_unavailable() {
+        assert!(is_model_temporarily_unavailable(
+            r#"{"message":"Encountered unexpectedly high load when processing the request, please try again.","reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#
+        ));
+        assert!(!is_model_temporarily_unavailable(
+            "Upstream API request failed."
+        ));
     }
 }
