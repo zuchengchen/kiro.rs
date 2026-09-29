@@ -832,18 +832,9 @@ impl WebSearchUsageSettlement {
         };
     }
 
-    /// 多轮聚合后的对外 usage：Claude 在总量上统一改写一次固定缓存比例
-    /// （逐轮改写再相加会累积舍入误差）。
-    ///
-    /// 没有任何一轮拿到上游响应（`source` 仍为 Unknown，如首轮取号就失败）时不改写：
-    /// 此时的用量只是本地估算的输入，Kiro 根本没处理这个请求，记成 90% 缓存读会让
-    /// 失败请求看起来吃到了缓存。与其他路径失败时记原始估算的做法一致。
+    /// 多轮聚合后的对外 usage：保留各轮累加的真实拆分，失败早退则是本地估算的输入。
     fn usage(&self) -> TokenUsage {
-        let usage = self.usage.sanitized();
-        if self.source == UsageSource::Unknown {
-            return usage;
-        }
-        super::fixed_cache_ratio::apply_token_usage(&self.hook.model, usage)
+        self.usage.sanitized()
     }
 
     fn finish(
@@ -1110,11 +1101,11 @@ where
     result
 }
 
-/// 流式 web_search 的 message_start：usage 按与最终聚合相同的口径拆分请求时的输入估算
-/// （Claude 固定比例），与主流式路径一致
+/// 流式 web_search 的 message_start：此时还没有上游用量，prompt 记为未缓存 input。
 fn initial_stream_event(model: &str, input_tokens: i32) -> SseEvent {
-    let (input_tokens, cache_creation, cache_read) =
-        super::fixed_cache_ratio::apply(model, (input_tokens.max(0), 0, 0));
+    let input_tokens = input_tokens.max(0);
+    let cache_creation = 0;
+    let cache_read = 0;
     let message_id = format!("msg_{}", &Uuid::new_v4().to_string().replace('-', "")[..24]);
     SseEvent::new(
         "message_start",
@@ -2129,10 +2120,9 @@ mod tests {
             .expect("cancellation probe must be notified");
     }
 
-    /// 没有任何一轮到达上游时，失败记录保留原始估算，不套 Claude 的固定缓存比例；
-    /// 有一轮成功后才按固定比例改写聚合用量
+    /// 聚合用量保持各轮累加结果，不做二次改写。
     #[test]
-    fn settlement_applies_fixed_ratio_only_after_an_upstream_round() {
+    fn settlement_keeps_aggregated_usage_without_rewriting() {
         let hook = UsageRecordHook {
             recorder: None,
             aggregator: None,
@@ -2155,14 +2145,14 @@ mod tests {
         assert_eq!(
             (before.uncached_input_tokens, before.cache_read_input_tokens),
             (100, 0),
-            "首轮取号失败：Kiro 没处理这个请求，不能记成 90% 缓存读"
+            "首轮取号失败：Kiro 没处理这个请求，用量保持本地估算"
         );
 
         settlement.note_source(false);
         let after = settlement.usage();
         assert_eq!(
             (after.uncached_input_tokens, after.cache_read_input_tokens),
-            (10, 90)
+            (100, 0)
         );
         settlement.settled = true;
     }

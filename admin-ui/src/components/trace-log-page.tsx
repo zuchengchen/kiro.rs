@@ -361,7 +361,7 @@ function UsageSourceBadge({ source }: { source?: UsageSource | null }) {
     },
     fixed: {
       label: '固定比例',
-      title: 'Claude 模型按运维口径把缓存读取固定为总输入的 90%，不反映真实前缀复用；credit 仍为上游真值',
+      title: '历史口径：曾经把 Claude 缓存读取改写成总输入的 90%。现已取消，新请求不会再出现此标记',
       cls: 'border-violet-500/30 bg-violet-500/10 text-violet-600 dark:text-violet-400',
     },
   }

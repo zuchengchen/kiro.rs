@@ -20,10 +20,16 @@
 //!      最长前缀断点。只能命中此前实际写入过的断点，未声明断点的中间 block 不会写入或命中。
 //!    - 连续的 `tool_use` block 或连续的 `tool_result` block 各按一个回溯位置计算。
 //! 3. **TTL 与滑动续期**：
-//!    - 默认 ephemeral TTL 为 300 秒（5 分钟）；显式 `ttl=\"1h\"` 为 3600 秒（1 小时）。
+//!    - 本地模拟把 ephemeral 默认、显式 `ttl=\"5m\"` 和 `ttl=\"1h\"` 都记成 3600 秒
+//!      （1 小时）。官方默认是 5 分钟；这里加长是为了会话间隙不被打成 miss。
 //!    - 每个 entry 独立保存自身 TTL。命中时按该 entry 自身的 TTL 从请求时间起滑动续期。
-//!    - 混合 TTL 规则：1h 断点必须出现在 5m 断点之前；非法顺序不模拟缓存。
-//! 4. **断点上限与守恒**：
+//! 4. **最小可缓存长度**：低于该模型官方门槛的断点静默跳过（不写不读），与 Anthropic
+//!    行为一致。非 Claude 模型（单元测试夹具）不设门槛。
+//! 5. **写入可见性**：新断点在 [`PendingCacheWrites::commit`] 之后才可被其他请求命中，
+//!    对应官方「响应开始后条目才可用」。`compute_cache_usage` / `compute_cache_usage_sync`
+//!    仍立即提交，供测试与需要立刻可见的路径；生产 handler 走
+//!    [`compute_cache_usage_deferred`]，在首个上游 chunk / 非流式响应开始时提交。
+//! 6. **断点上限与守恒**：
 //!    - 请求最多支持 4 个断点；超限请求不模拟缓存。
 //!    - Token 计量守恒：`input + cache_creation + cache_read == total`。
 
@@ -35,10 +41,10 @@ use std::sync::Arc;
 
 /// 默认条目上限（防止内存无限增长）
 const DEFAULT_CAPACITY: usize = 4096;
-/// 最长 TTL（1h，与 Anthropic ttl=\"1h\" 对齐）
+/// 最长 TTL（1h）
 const MAX_TTL_SECS: i64 = 3600;
-/// 默认 TTL（5min，ephemeral 默认值）
-const DEFAULT_TTL_SECS: i64 = 5 * 60;
+/// 本地模拟 TTL：默认、`5m`、`1h` 都按 1 小时计。
+const DEFAULT_TTL_SECS: i64 = 3600;
 /// 最大断点数量
 const MAX_BREAKPOINTS: usize = 4;
 /// 回溯查找最大 block 数（20-block lookback）
@@ -114,6 +120,78 @@ impl CacheUsage {
 
         (uncached_tail, cache_creation, cache_read)
     }
+}
+
+/// 已算好、尚未写入 CacheMeter / Redis 的断点。响应开始前其他请求看不到这些条目。
+#[derive(Clone, Debug, Default)]
+pub struct PendingCacheWrites {
+    entries: Vec<(u64, u32, i64)>,
+}
+
+impl PendingCacheWrites {
+    fn push(&mut self, hash: u64, tokens: u32, ttl_secs: i64) {
+        self.entries.push((hash, tokens, ttl_secs));
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// 写入进程内缓存，立刻可被后续 lookup 命中。
+    pub fn commit_local(&self, cache: &CacheMeter) {
+        for &(hash, tokens, ttl_secs) in &self.entries {
+            cache.record_entry(hash, tokens, ttl_secs);
+        }
+    }
+
+    /// 写入 Redis 共享层（未配置远端时为空操作）。
+    pub async fn commit_remote(&self, cache: &CacheMeter) {
+        let Some(remote) = &cache.remote else {
+            return;
+        };
+        for &(hash, tokens, ttl_secs) in &self.entries {
+            let _ = remote.try_acquire_lock(hash, 1500).await;
+            remote.record_entry(hash, tokens, ttl_secs).await;
+        }
+    }
+
+    pub async fn commit(&self, cache: &CacheMeter) {
+        self.commit_local(cache);
+        self.commit_remote(cache).await;
+    }
+}
+
+/// Anthropic 各模型最小可缓存前缀长度。低于门槛的断点静默不缓存。
+/// 非 Claude 模型返回 0，单元测试夹具不受门槛影响。
+pub(crate) fn min_cacheable_tokens(model: &str) -> u32 {
+    let mapped = super::converter::map_model(model)
+        .unwrap_or_else(|| model.to_string())
+        .to_ascii_lowercase();
+    if mapped.contains("fable") || mapped.contains("mythos") {
+        return 512;
+    }
+    if mapped.starts_with("claude-haiku-4.5") || mapped.starts_with("claude-haiku-4-5") {
+        return 4096;
+    }
+    if mapped.starts_with("claude-opus-4.6") || mapped.starts_with("claude-opus-4-6") {
+        return 4096;
+    }
+    if mapped.starts_with("claude-opus-4.5") || mapped.starts_with("claude-opus-4-5") {
+        return 4096;
+    }
+    if mapped.starts_with("claude-opus-4.7") || mapped.starts_with("claude-opus-4-7") {
+        return 2048;
+    }
+    if mapped.starts_with("claude-haiku-3") {
+        return 2048;
+    }
+    if mapped.starts_with("claude-opus-5") {
+        return 512;
+    }
+    if mapped.starts_with("claude-") {
+        return 1024;
+    }
+    0
 }
 
 /// 异步装箱 Future 别名
@@ -875,41 +953,53 @@ fn resolve_breakpoints(
     breakpoints
 }
 
-/// 异步调用 CacheMeter 计算本次请求的缓存覆盖情况（优先查询共享 Redis，失败降级本地），并把断点记录回 cache、刷新 TTL。
-/// 返回 [`CacheUsage`]，由调用方在拿到真实 total 后做互斥分摊。
+/// 异步计算缓存覆盖，并立即提交新断点（测试与需要立刻可见的路径）。
 pub async fn compute_cache_usage(
     cache: &CacheMeter,
     req: &MessagesRequest,
     key_id: u64,
 ) -> CacheUsage {
+    let (usage, pending) = compute_cache_usage_deferred(cache, req, key_id).await;
+    pending.commit(cache).await;
+    usage
+}
+
+/// 异步计算缓存覆盖，新断点放入 [`PendingCacheWrites`]，调用方在响应开始后提交。
+pub async fn compute_cache_usage_deferred(
+    cache: &CacheMeter,
+    req: &MessagesRequest,
+    key_id: u64,
+) -> (CacheUsage, PendingCacheWrites) {
     // 总开关关闭：不查不写，全量 prompt 计入 input（缓存两项为 0）。
     if !cache.is_enabled() {
-        return CacheUsage::default();
+        return (CacheUsage::default(), PendingCacheWrites::default());
     }
 
     let blocks = extract_blocks(req);
     if blocks.is_empty() {
-        return CacheUsage::default();
+        return (CacheUsage::default(), PendingCacheWrites::default());
     }
 
     let prompt_total_est: u32 = blocks.iter().map(|b| b.tokens).sum();
+    let empty = || {
+        (
+            CacheUsage {
+                prompt_total_est: prompt_total_est as i32,
+                ..Default::default()
+            },
+            PendingCacheWrites::default(),
+        )
+    };
 
     // 解析断点（显式 + 顶层自动）
-    let breakpoints = resolve_breakpoints(&blocks, req.cache_control.as_ref());
+    let mut breakpoints = resolve_breakpoints(&blocks, req.cache_control.as_ref());
     if breakpoints.is_empty() {
-        // 无断点：官方不会缓存，全部计入 input
-        return CacheUsage {
-            prompt_total_est: prompt_total_est as i32,
-            ..Default::default()
-        };
+        return empty();
     }
 
     // 会话隔离种子
     let Some(seed) = isolation_seed(req, key_id) else {
-        return CacheUsage {
-            prompt_total_est: prompt_total_est as i32,
-            ..Default::default()
-        };
+        return empty();
     };
 
     // 计算每个 block 的 cumulative tokens 和 cumulative hashes
@@ -933,6 +1023,12 @@ pub async fn compute_cache_usage(
         cum_hashes.push(u64::from_be_bytes(buf));
     }
 
+    let min_tokens = min_cacheable_tokens(&req.model);
+    breakpoints.retain(|bp| cum_tokens[bp.block_idx] >= min_tokens);
+    if breakpoints.is_empty() {
+        return empty();
+    }
+
     // Lookup: 从每个断点向后检查最多 20 个 block，寻找此前真正写入过的最长前缀
     let mut max_read_tokens: u32 = 0;
 
@@ -945,7 +1041,7 @@ pub async fn compute_cache_usage(
             // 优先查远端 Redis 共享后端
             if let Some(remote) = &cache.remote {
                 if let Some(tokens) = remote.lookup_and_renew(hash).await {
-                    // 回填本地保持同步
+                    // 回填本地保持同步（已有条目，不是新写入）
                     cache.record_entry(hash, tokens, bp.ttl_secs);
                     hit_tokens = Some(tokens);
                 }
@@ -966,18 +1062,13 @@ pub async fn compute_cache_usage(
         }
     }
 
-    // Record: 仅在实际断点处写入 entry，每个 entry 保留自身的 TTL
+    let mut pending = PendingCacheWrites::default();
     for bp in &breakpoints {
-        let hash = cum_hashes[bp.block_idx];
-        let tokens = cum_tokens[bp.block_idx];
-        // 本地必须记录
-        cache.record_entry(hash, tokens, bp.ttl_secs);
-
-        // 若配置了远端，写入远端（附带轻量去重锁尝试，不阻塞）
-        if let Some(remote) = &cache.remote {
-            let _ = remote.try_acquire_lock(hash, 1500).await;
-            remote.record_entry(hash, tokens, bp.ttl_secs).await;
-        }
+        pending.push(
+            cum_hashes[bp.block_idx],
+            cum_tokens[bp.block_idx],
+            bp.ttl_secs,
+        );
     }
 
     let covered_tokens = breakpoints
@@ -985,11 +1076,14 @@ pub async fn compute_cache_usage(
         .map(|bp| cum_tokens[bp.block_idx])
         .unwrap_or(0);
 
-    CacheUsage {
-        cache_read: max_read_tokens as i32,
-        cache_covered_est: covered_tokens as i32,
-        prompt_total_est: prompt_total_est as i32,
-    }
+    (
+        CacheUsage {
+            cache_read: max_read_tokens as i32,
+            cache_covered_est: covered_tokens as i32,
+            prompt_total_est: prompt_total_est as i32,
+        },
+        pending,
+    )
 }
 
 /// 同步计算本地缓存覆盖情况（仅使用进程内内存存储，供无异步上下文或纯同步测试复用）。
@@ -999,32 +1093,46 @@ pub fn compute_cache_usage_sync(
     req: &MessagesRequest,
     key_id: u64,
 ) -> CacheUsage {
+    let (usage, pending) = compute_cache_usage_sync_deferred(cache, req, key_id);
+    pending.commit_local(cache);
+    usage
+}
+
+/// 同步版延迟写入：新断点在 [`PendingCacheWrites::commit_local`] 之前对其他请求不可见。
+#[allow(dead_code)]
+pub fn compute_cache_usage_sync_deferred(
+    cache: &CacheMeter,
+    req: &MessagesRequest,
+    key_id: u64,
+) -> (CacheUsage, PendingCacheWrites) {
     // 总开关关闭：不查不写，全量 prompt 计入 input（缓存两项为 0）。
     if !cache.is_enabled() {
-        return CacheUsage::default();
+        return (CacheUsage::default(), PendingCacheWrites::default());
     }
 
     let blocks = extract_blocks(req);
     if blocks.is_empty() {
-        return CacheUsage::default();
+        return (CacheUsage::default(), PendingCacheWrites::default());
     }
 
     let prompt_total_est: u32 = blocks.iter().map(|b| b.tokens).sum();
+    let empty = || {
+        (
+            CacheUsage {
+                prompt_total_est: prompt_total_est as i32,
+                ..Default::default()
+            },
+            PendingCacheWrites::default(),
+        )
+    };
 
-    // 解析断点（显式 + 顶层自动）
-    let breakpoints = resolve_breakpoints(&blocks, req.cache_control.as_ref());
+    let mut breakpoints = resolve_breakpoints(&blocks, req.cache_control.as_ref());
     if breakpoints.is_empty() {
-        return CacheUsage {
-            prompt_total_est: prompt_total_est as i32,
-            ..Default::default()
-        };
+        return empty();
     }
 
     let Some(seed) = isolation_seed(req, key_id) else {
-        return CacheUsage {
-            prompt_total_est: prompt_total_est as i32,
-            ..Default::default()
-        };
+        return empty();
     };
 
     use sha2::{Digest, Sha256};
@@ -1047,6 +1155,12 @@ pub fn compute_cache_usage_sync(
         cum_hashes.push(u64::from_be_bytes(buf));
     }
 
+    let min_tokens = min_cacheable_tokens(&req.model);
+    breakpoints.retain(|bp| cum_tokens[bp.block_idx] >= min_tokens);
+    if breakpoints.is_empty() {
+        return empty();
+    }
+
     let mut max_read_tokens: u32 = 0;
 
     for bp in &breakpoints {
@@ -1062,10 +1176,13 @@ pub fn compute_cache_usage_sync(
         }
     }
 
+    let mut pending = PendingCacheWrites::default();
     for bp in &breakpoints {
-        let hash = cum_hashes[bp.block_idx];
-        let tokens = cum_tokens[bp.block_idx];
-        cache.record_entry(hash, tokens, bp.ttl_secs);
+        pending.push(
+            cum_hashes[bp.block_idx],
+            cum_tokens[bp.block_idx],
+            bp.ttl_secs,
+        );
     }
 
     let covered_tokens = breakpoints
@@ -1073,11 +1190,14 @@ pub fn compute_cache_usage_sync(
         .map(|bp| cum_tokens[bp.block_idx])
         .unwrap_or(0);
 
-    CacheUsage {
-        cache_read: max_read_tokens as i32,
-        cache_covered_est: covered_tokens as i32,
-        prompt_total_est: prompt_total_est as i32,
-    }
+    (
+        CacheUsage {
+            cache_read: max_read_tokens as i32,
+            cache_covered_est: covered_tokens as i32,
+            prompt_total_est: prompt_total_est as i32,
+        },
+        pending,
+    )
 }
 
 /// 生成会话隔离种子，作为前缀哈希链的最前置输入。
@@ -1250,6 +1370,11 @@ fn image_source_parts(v: &serde_json::Value) -> (&str, &str) {
 mod tests {
     use super::*;
 
+    /// 超过 Sonnet 类 1024 token 最小缓存长度，避免短夹具被门槛静默跳过。
+    fn claude_cacheable(text: impl AsRef<str>) -> String {
+        format!("{}{}", text.as_ref(), " pad".repeat(1500))
+    }
+
     #[test]
     fn lookup_miss_then_record_then_hit() {
         let cache = CacheMeter::new(None);
@@ -1293,9 +1418,67 @@ mod tests {
             ttl: ttl.map(str::to_string),
         };
         assert_eq!(validated_ttl(&control(Some("1h"))), Some(3600));
-        assert_eq!(validated_ttl(&control(Some("5m"))), Some(300));
-        assert_eq!(validated_ttl(&control(None)), Some(300));
+        assert_eq!(validated_ttl(&control(Some("5m"))), Some(3600));
+        assert_eq!(validated_ttl(&control(None)), Some(3600));
         assert_eq!(validated_ttl(&control(Some("garbage"))), None);
+    }
+
+    #[test]
+    fn min_cacheable_tokens_follows_claude_family_thresholds() {
+        assert_eq!(min_cacheable_tokens("claude-opus-5.5"), 512);
+        assert_eq!(min_cacheable_tokens("claude-opus-5.5-thinking"), 512);
+        assert_eq!(min_cacheable_tokens("claude-sonnet-4-5-20250929"), 1024);
+        assert_eq!(min_cacheable_tokens("claude-opus-4.8"), 1024);
+        assert_eq!(min_cacheable_tokens("claude-opus-4.7"), 2048);
+        assert_eq!(min_cacheable_tokens("claude-opus-4.5"), 4096);
+        assert_eq!(min_cacheable_tokens("claude-haiku-4.5"), 4096);
+        assert_eq!(min_cacheable_tokens("model-a"), 0);
+        assert_eq!(min_cacheable_tokens("gpt-5.6-luna"), 0);
+    }
+
+    #[test]
+    fn below_min_length_does_not_simulate_cache() {
+        let cache = CacheMeter::new(None);
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-5-20250929".to_string(),
+            max_tokens: 32,
+            messages: vec![super::super::types::Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String("short".to_string()),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            cache_control: Some(super::super::types::CacheControl {
+                cache_type: "ephemeral".to_string(),
+                ttl: None,
+            }),
+        };
+        let usage = compute_cache_usage_sync(&cache, &req, 1);
+        assert_eq!(usage.cache_covered_est, 0);
+        assert_eq!(usage.cache_read, 0);
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn pending_writes_are_invisible_until_commit() {
+        let cache = CacheMeter::new(None);
+        let req = build_request_with_system_breakpoint();
+        let (u1, pending) = compute_cache_usage_sync_deferred(&cache, &req, 1);
+        assert_eq!(u1.cache_read, 0);
+        assert!(u1.cache_covered_est > 0);
+        assert_eq!(cache.len(), 0, "提交前条目不可见");
+
+        let (u2, _) = compute_cache_usage_sync_deferred(&cache, &req, 1);
+        assert_eq!(u2.cache_read, 0, "并发未提交的写入不得互相命中");
+
+        pending.commit_local(&cache);
+        let (u3, _) = compute_cache_usage_sync_deferred(&cache, &req, 1);
+        assert_eq!(u3.cache_read, u1.cache_covered_est);
     }
 
     #[test]
@@ -1322,7 +1505,7 @@ mod tests {
             }],
             stream: false,
             system: Some(vec![SystemMessage {
-                text: "You are a helpful assistant. ".repeat(100),
+                text: claude_cacheable("You are a helpful assistant. ".repeat(100)),
                 cache_control: Some(CacheControl {
                     cache_type: "ephemeral".to_string(),
                     ttl: None,
@@ -1441,9 +1624,9 @@ mod tests {
             ttl: Some("5m".to_string()),
         });
 
-        let u1_text = "What is prompt caching? ".repeat(50);
-        let a1_text = "Prompt caching allows reusing prefixes. ".repeat(50);
-        let u2_text = "How does auto-caching advance across turns? ".repeat(20);
+        let u1_text = claude_cacheable("What is prompt caching? ".repeat(50));
+        let a1_text = claude_cacheable("Prompt caching allows reusing prefixes. ".repeat(50));
+        let u2_text = claude_cacheable("How does auto-caching advance across turns? ".repeat(20));
 
         // Turn 1: 单条 User 消息，开启顶层 auto-caching
         let turn1 = MessagesRequest {
@@ -1516,7 +1699,7 @@ mod tests {
         use super::super::types::{CacheControl, Message, MessagesRequest, SystemMessage};
         let cache = CacheMeter::new(None);
 
-        let sys_text = "You are a specialized code analyzer. ".repeat(60);
+        let sys_text = claude_cacheable("You are a specialized code analyzer. ".repeat(60));
         let u1_text = "Analyze module A. ".repeat(30);
         let a1_text = "Module A looks clean. ".repeat(30);
         let u2_text = "Analyze module B. ".repeat(30);
@@ -1617,7 +1800,7 @@ mod tests {
         use super::super::types::{Message, MessagesRequest};
 
         let cache = CacheMeter::new(None);
-        let block_text = "dummy block content for lookback test ".repeat(10);
+        let block_text = claude_cacheable("dummy block content for lookback test ".repeat(10));
 
         // Turn 1: 仅在 Block 0 写入断点
         let turn1 = MessagesRequest {
@@ -1841,8 +2024,8 @@ mod tests {
         use super::super::types::{CacheControl, Message, MessagesRequest, SystemMessage};
         let cache = CacheMeter::new(None);
 
-        let sys_text = "System Prompt 1h stability ".repeat(40);
-        let u1_text = "User Question 5m ephemeral ".repeat(40);
+        let sys_text = claude_cacheable("System Prompt 1h stability ".repeat(40));
+        let u1_text = claude_cacheable("User Question 5m ephemeral ".repeat(40));
 
         let req = MessagesRequest {
             model: "claude-sonnet-4-5-20250929".to_string(),
@@ -1873,8 +2056,15 @@ mod tests {
 
         let u1 = compute_cache_usage_sync(&cache, &req, 1);
         assert_eq!(u1.cache_read, 0);
+        assert_eq!(cache.len(), 2);
+        {
+            let inner = cache.inner.lock();
+            for entry in inner.entries.values() {
+                assert_eq!(entry.ttl_secs, 3600, "本地模拟 5m 与 1h 都按 1 小时写入");
+            }
+        }
 
-        // 模拟 350 秒后：5m 断点过期（300s），1h 断点仍然有效（3600s）
+        // 模拟 350 秒后：官方 5m 会过期，本地 1h 策略下两段都仍有效
         {
             let mut inner = cache.inner.lock();
             for (_, v) in inner.entries.iter_mut() {
@@ -1882,18 +2072,16 @@ mod tests {
             }
         }
 
-        // 再次请求
         let u2 = compute_cache_usage_sync(&cache, &req, 1);
-        let sys_tokens = estimate_tokens(&sys_text) as i32;
         assert_eq!(
-            u2.cache_read, sys_tokens,
-            "350 秒后 5m 消息段过期 miss，但 1h 的 system 段必须仍命中并续期"
+            u2.cache_read, u1.cache_covered_est,
+            "350 秒后 1 小时 TTL 下整段前缀仍应命中"
         );
     }
 
     #[test]
-    fn mixed_ttl_invalid_order_disables_local_metering() {
-        // 混合 TTL 顺序非法时，Anthropic 会拒绝请求；本地回退不得虚报缓存。
+    fn mixed_ttl_labels_are_normalized_to_one_hour() {
+        // 本地把 5m / 1h 都记成 1 小时，不再按官方混合顺序拒绝。
         use super::super::types::{CacheControl, Message, MessagesRequest, SystemMessage};
         let cache = CacheMeter::new(None);
 
@@ -1904,13 +2092,13 @@ mod tests {
                 role: "user".to_string(),
                 content: serde_json::json!([{
                     "type": "text",
-                    "text": "User msg 1h after 5m sys",
-                    "cache_control": {"type": "ephemeral", "ttl": "1h"} // 非法：在 5m 之后
+                    "text": claude_cacheable("User msg 1h after 5m sys"),
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"}
                 }]),
             }],
             stream: false,
             system: Some(vec![SystemMessage {
-                text: "System msg with 5m".to_string(),
+                text: claude_cacheable("System msg with 5m"),
                 cache_control: Some(CacheControl {
                     cache_type: "ephemeral".to_string(),
                     ttl: Some("5m".to_string()),
@@ -1925,9 +2113,8 @@ mod tests {
         };
 
         let usage = compute_cache_usage_sync(&cache, &req, 1);
-        assert_eq!(usage.cache_covered_est, 0);
-        assert_eq!(usage.cache_read, 0);
-        assert_eq!(cache.len(), 0, "非法请求不得写入任何本地缓存条目");
+        assert!(usage.cache_covered_est > 0);
+        assert_eq!(cache.len(), 2);
     }
 
     #[test]
@@ -1979,7 +2166,7 @@ mod tests {
                 messages: vec![
                     Message {
                         role: "user".to_string(),
-                        content: serde_json::json!([{"type":"text","text":"inspect a file"}]),
+                        content: serde_json::json!([{"type":"text","text":claude_cacheable("inspect a file")}]),
                     },
                     Message {
                         role: "assistant".to_string(),
@@ -2352,7 +2539,7 @@ mod tests {
         assert_eq!(explicit_empty.cache_covered_est, 0);
         assert_eq!(empty_text_cache.len(), 0);
 
-        // 5. 顶层自动与显式 TTL 冲突 (5m vs 1h)
+        // 5. 顶层自动与显式 TTL 在本地都映射为 1h，同位置视为 no-op
         let conflict_cache = CacheMeter::new(None);
         let conflict = compute_cache_usage_sync(
             &conflict_cache,
@@ -2369,8 +2556,8 @@ mod tests {
             ),
             1,
         );
-        assert_eq!(conflict.cache_covered_est, 0);
-        assert_eq!(conflict_cache.len(), 0);
+        assert!(conflict.cache_covered_est > 0);
+        assert_eq!(conflict_cache.len(), 1);
 
         // 6. 顶层自动与显式同位置同 TTL (5m + 5m) 是 no-op，成功模拟
         let noop_cache = CacheMeter::new(None);
@@ -2577,7 +2764,7 @@ mod tests {
     fn different_key_id_does_not_cross_hit() {
         use super::super::types::{CacheControl, Message, MessagesRequest, Metadata};
         let cache = CacheMeter::new(None);
-        let body = "shared system prompt and history ".repeat(20);
+        let body = claude_cacheable("shared system prompt and history ".repeat(20));
         let make_req = || MessagesRequest {
             model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 32,
@@ -2627,7 +2814,7 @@ mod tests {
     #[test]
     fn metadata_json_session_scopes_cache() {
         use super::super::types::{CacheControl, Message, MessagesRequest, Metadata};
-        let body = "conversation prefix that stays stable ".repeat(20);
+        let body = claude_cacheable("conversation prefix that stays stable ".repeat(20));
         let make = |session: &str| {
             MessagesRequest {
             model: "claude-opus-4-8".to_string(),
@@ -2686,7 +2873,7 @@ mod tests {
     #[test]
     fn metadata_session_scopes_cache() {
         use super::super::types::{CacheControl, Message, MessagesRequest, Metadata};
-        let body = "conversation prefix that stays stable ".repeat(20);
+        let body = claude_cacheable("conversation prefix that stays stable ".repeat(20));
         let make = |session: &str| MessagesRequest {
             model: "claude-opus-4-8".to_string(),
             max_tokens: 64,
@@ -2734,7 +2921,7 @@ mod tests {
     fn master_key_without_session_does_not_simulate_cross_user_cache_hit() {
         use super::super::types::{CacheControl, Message, MessagesRequest};
         let cache = CacheMeter::new(None);
-        let body = "shared master-key prompt without any session ".repeat(20);
+        let body = claude_cacheable("shared master-key prompt without any session ".repeat(20));
         let make_req = || MessagesRequest {
             model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 32,
@@ -2939,8 +3126,8 @@ mod tests {
 
         let fake_redis = Arc::new(FakeRemoteStore::default());
 
-        let sys_text = "System Prompt 1h stability ".repeat(40);
-        let u1_text = "User Question 5m ephemeral ".repeat(40);
+        let sys_text = claude_cacheable("System Prompt 1h stability ".repeat(40));
+        let u1_text = claude_cacheable("User Question 5m ephemeral ".repeat(40));
 
         let req = MessagesRequest {
             model: "claude-sonnet-4-5-20250929".to_string(),
@@ -2992,7 +3179,7 @@ mod tests {
         assert_eq!(u2.cache_read, u1.cache_covered_est);
         assert_eq!(instance_2.len(), 2, "命中后断点应回填至实例 2 的本地缓存");
 
-        // 模拟 350 秒后：5m 断点过期（300s），1h 断点依然有效（3600s）
+        // 模拟 350 秒后：1 小时 TTL 下两段都仍有效
         {
             let mut remote_map = fake_redis.entries.lock();
             for (_, v) in remote_map.iter_mut() {
@@ -3004,12 +3191,10 @@ mod tests {
             }
         }
 
-        // 实例 2 再次请求：5m 断点过期，1h 断点仍然命中
         let u3 = compute_cache_usage(&instance_2, &req, 1).await;
-        let sys_tokens = estimate_tokens(&sys_text) as i32;
         assert_eq!(
-            u3.cache_read, sys_tokens,
-            "350 秒后 5m 消息过期 miss，1h 的 system 断点必须依然命中并滑动续期"
+            u3.cache_read, u1.cache_covered_est,
+            "350 秒后 1 小时 TTL 下整段前缀仍应命中"
         );
     }
 

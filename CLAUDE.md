@@ -46,8 +46,9 @@ git push origin main-czc
 - `src/kiro/token_manager.rs` — 选号策略 + 取号路径（我们的限流内部等待在这里）
 - `src/kiro/provider.rs` — 重试循环、429 换桶
 - `src/anthropic/responses.rs` — 流式分流
-- `src/anthropic/cache_metering.rs` — 上游反复重写计量；我们的固定比例已移到
-  `fixed_cache_ratio.rs`，该文件与上游保持一致，冲突时直接取上游版本
+- `src/anthropic/cache_metering.rs` — 上游反复重写计量。我们在此文件里保留：本地
+  模拟 TTL 1 小时、按模型最小可缓存长度、新断点在响应开始后才可见。冲突时不要
+  丢掉这三处；不要再引入 Claude 固定 90% 命中改写。
 
 **没报冲突不等于合对了。** v0.9.0 合并时：上游删掉的函数仍被我们调用（编译失败）、
 断言旧语义的测试被静默合入（测试失败）、上游新加的 `bind_session` 没覆盖我们的换桶
@@ -114,6 +115,7 @@ image tag 和 `deployment-*.json` 沿用同一个编号（`kiro-rs:0.9.0.1`）�
 | `a84e02e` | Admin UI 区分「同凭据换桶」与「转其他凭据」救回 |
 | `bd53626` | 按账号周期积分上限参与调度（粘性选号同样受限） |
 | v0.9.0 合并 | Claude 固定 90% 缓存命中（`src/anthropic/fixed_cache_ratio.rs`），其他模型走上游计量；取代 `a90235e` / `6c26708` 的全模型固定比例 |
+| 本轮 | 去掉 Claude 90% 改写，usage 按官方断点语义（provider / CacheMeter）；本地模拟 TTL 1 小时；最小可缓存长度；写入在响应开始后可见 |
 | `0338d8b` | 凭据 ID 跨重启单调（`src/kiro/credential_id_watermark.rs`）：删号 + 重启不再把旧 ID 分给新账号 |
 | `9065d67` | API Key / PKCE 用系统熵源生成（`src/common/secure_random.rs`），不再用 `fastrand` |
 

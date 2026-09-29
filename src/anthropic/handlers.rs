@@ -9,6 +9,7 @@ use crate::admin::trace_db::{
     SharedTraceStore, TraceAttempt, TraceKeySource, TraceRecord, TraceRoute, TraceSink, outcome,
     usage_source,
 };
+use crate::anthropic::cache_metering::{PendingCacheWrites, SharedCacheMeter};
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
 use crate::kiro::model::available_models::{TokenLimits, UpstreamModel};
 use crate::kiro::model::events::{Event, TokenUsage};
@@ -151,6 +152,8 @@ pub(crate) struct RequestTracer {
     /// 第一次有上游尝试成功时触发（只触发一次）。流式 web_search 用它推迟提交 HTTP 200：
     /// 在此之前的失败仍能以真实状态码 + `Retry-After` 返回，而不是流内 error 事件。
     first_success: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// CacheMeter 新断点，等响应开始后再写入，避免并发同前缀互相命中。
+    pending_cache_writes: parking_lot::Mutex<Option<(SharedCacheMeter, PendingCacheWrites)>>,
 }
 
 /// usage 三项的来源，落到 trace 行便于区分「上游真值」与「本地估算」。
@@ -229,7 +232,38 @@ impl RequestTracer {
             attempts: parking_lot::Mutex::new(Vec::new()),
             route: parking_lot::Mutex::new(None),
             first_success: parking_lot::Mutex::new(None),
+            pending_cache_writes: parking_lot::Mutex::new(None),
         }
+    }
+
+    pub(crate) fn attach_pending_cache(&self, cache: SharedCacheMeter, writes: PendingCacheWrites) {
+        if writes.is_empty() {
+            return;
+        }
+        *self.pending_cache_writes.lock() = Some((cache, writes));
+    }
+
+    fn take_pending_cache(&self) -> Option<(SharedCacheMeter, PendingCacheWrites)> {
+        self.pending_cache_writes.lock().take()
+    }
+
+    /// 流式首 chunk：本地立即可见，Redis 后台写。
+    fn commit_pending_cache_writes(&self) {
+        let Some((cache, pending)) = self.take_pending_cache() else {
+            return;
+        };
+        pending.commit_local(&cache);
+        tokio::spawn(async move {
+            pending.commit_remote(&cache).await;
+        });
+    }
+
+    /// 非流式：本地 + Redis 一并提交。
+    async fn commit_pending_cache_writes_async(&self) {
+        let Some((cache, pending)) = self.take_pending_cache() else {
+            return;
+        };
+        pending.commit(&cache).await;
     }
 
     /// 订阅「第一次上游尝试成功」。返回的 receiver 在成功时收到 `()`；
@@ -253,6 +287,8 @@ impl RequestTracer {
         let mut slot = self.first_token_at.lock();
         if slot.is_none() {
             *slot = Some(Instant::now());
+            drop(slot);
+            self.commit_pending_cache_writes();
         }
     }
 
@@ -297,11 +333,7 @@ impl RequestTracer {
             session_id: route.as_ref().and_then(|r| r.session_id.clone()),
             sticky_outcome: route.as_ref().map(|r| r.sticky_outcome.to_string()),
             previous_credential_id: route.as_ref().and_then(|r| r.previous_credential_id),
-            usage_source: super::fixed_cache_ratio::trace_usage_source(
-                &self.model,
-                usage.source.as_db(),
-            )
-            .map(|s| s.to_string()),
+            usage_source: usage.source.as_db().map(|s| s.to_string()),
             client_ip: self.client_ip.clone(),
             attempts,
         };
@@ -950,15 +982,6 @@ pub async fn post_messages(
     let tool_name_map = conversion_result.tool_name_map;
     let known_tool_names = conversion_result.known_tool_names;
 
-    // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存。
-    // 返回 estimate 口径的覆盖量；真实 input/cache 互斥分摊在拿到 total 真值时进行。
-    let cache_usage = match state.cache_meter.as_ref() {
-        Some(cache) => {
-            super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id).await
-        }
-        None => super::cache_metering::CacheUsage::default(),
-    };
-
     if payload.stream {
         // 流式响应
         let tracer = std::sync::Arc::new(RequestTracer::new(
@@ -969,6 +992,7 @@ pub async fn post_messages(
                 is_stream: true,
             },
         ));
+        let cache_usage = measure_prompt_cache(&state, &payload, key_ctx.key_id, &tracer).await;
         handle_stream_request(
             provider,
             &request_body,
@@ -997,6 +1021,7 @@ pub async fn post_messages(
                 is_stream: false,
             },
         ));
+        let cache_usage = measure_prompt_cache(&state, &payload, key_ctx.key_id, &tracer).await;
         handle_non_stream_request(
             provider,
             &request_body,
@@ -1322,6 +1347,21 @@ pub(crate) enum NonStreamExecutionError {
     Response(Response),
 }
 
+async fn measure_prompt_cache(
+    state: &AppState,
+    payload: &super::types::MessagesRequest,
+    key_id: u64,
+    tracer: &RequestTracer,
+) -> super::cache_metering::CacheUsage {
+    let Some(cache) = state.cache_meter.as_ref() else {
+        return super::cache_metering::CacheUsage::default();
+    };
+    let (usage, pending) =
+        super::cache_metering::compute_cache_usage_deferred(cache, payload, key_id).await;
+    tracer.attach_pending_cache(cache.clone(), pending);
+    usage
+}
+
 pub(crate) fn new_non_stream_request_tracer(
     state: &AppState,
     key_ctx: KeyContext,
@@ -1435,6 +1475,7 @@ pub(crate) async fn execute_non_stream_request(
     };
     let response = call_result.response;
     let credential_id = call_result.credential_id;
+    tracer.commit_pending_cache_writes_async().await;
 
     // 读取响应体
     let body_bytes = match response.bytes().await {
@@ -1621,7 +1662,7 @@ pub(crate) async fn execute_non_stream_request(
     if let Some(err) = tool_json_error {
         let message = err.message();
         if let Some(usage) = provider_token_usage {
-            let usage = super::fixed_cache_ratio::apply_token_usage(model, usage.sanitized());
+            let usage = usage.sanitized();
             let trace_usage = TraceUsage {
                 input_tokens: usage.uncached_input_tokens as u64,
                 output_tokens: usage.output_tokens as u64,
@@ -1697,11 +1738,6 @@ pub(crate) async fn execute_non_stream_request(
             fallback_output_tokens,
             cache_usage,
             provider_token_usage,
-        );
-    let (final_input_tokens, cache_creation_tokens, cache_read_tokens) =
-        super::fixed_cache_ratio::apply(
-            model,
-            (final_input_tokens, cache_creation_tokens, cache_read_tokens),
         );
 
     // 构建 Anthropic 响应
@@ -2059,14 +2095,6 @@ pub async fn post_messages_cc(
     let tool_name_map = conversion_result.tool_name_map;
     let known_tool_names = conversion_result.known_tool_names;
 
-    // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存（estimate 口径）。
-    let cache_usage = match state.cache_meter.as_ref() {
-        Some(cache) => {
-            super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id).await
-        }
-        None => super::cache_metering::CacheUsage::default(),
-    };
-
     if payload.stream {
         // 流式响应（缓冲模式）
         let tracer = std::sync::Arc::new(RequestTracer::new(
@@ -2077,6 +2105,7 @@ pub async fn post_messages_cc(
                 is_stream: true,
             },
         ));
+        let cache_usage = measure_prompt_cache(&state, &payload, key_ctx.key_id, &tracer).await;
         handle_stream_request_buffered(
             provider,
             &request_body,
@@ -2102,6 +2131,7 @@ pub async fn post_messages_cc(
                 is_stream: false,
             },
         ));
+        let cache_usage = measure_prompt_cache(&state, &payload, key_ctx.key_id, &tracer).await;
         handle_non_stream_request(
             provider,
             &request_body,
@@ -2393,6 +2423,7 @@ mod tests {
             attempts: parking_lot::Mutex::new(Vec::new()),
             route: parking_lot::Mutex::new(None),
             first_success: parking_lot::Mutex::new(None),
+            pending_cache_writes: parking_lot::Mutex::new(None),
         };
 
         let attempt = |attempt, credential_id, outcome: &str| TraceAttempt {
@@ -2465,6 +2496,7 @@ mod tests {
             attempts: parking_lot::Mutex::new(Vec::new()),
             route: parking_lot::Mutex::new(None),
             first_success: parking_lot::Mutex::new(None),
+            pending_cache_writes: parking_lot::Mutex::new(None),
         };
 
         tracer.mark_first_token();
@@ -2498,6 +2530,7 @@ mod tests {
             attempts: parking_lot::Mutex::new(Vec::new()),
             route: parking_lot::Mutex::new(None),
             first_success: parking_lot::Mutex::new(None),
+            pending_cache_writes: parking_lot::Mutex::new(None),
         };
         let attempt = |credential_id, endpoint: &str, status, attempt_outcome: &str| TraceAttempt {
             attempt: 0,

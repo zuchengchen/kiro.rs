@@ -663,8 +663,8 @@ export interface TraceRecord {
   /** 本次请求前该会话绑定的凭据；与 finalCredentialId 不同即为「换号」 */
   previousCredentialId?: number | null
   /**
-   * token/cache 三项来源：provider（上游真值）/ simulated（本地估算）/ none（无断点）
-   * / fixed（Claude 模型按固定缓存比例改写）
+   * token/cache 三项来源：provider（上游真值）/ simulated（本地估算）/ none（无断点）。
+   * fixed 仅出现在历史记录（曾经把 Claude 改写成固定 90% 命中）。
    */
   usageSource?: UsageSource | null
   /** 客户端 IP（X-Forwarded-For / X-Real-IP 优先，回落到 TCP 对端）；老记录为 null */

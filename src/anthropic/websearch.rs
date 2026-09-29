@@ -557,20 +557,17 @@ fn render_websearch_response(
 
 /// 纯 web_search 请求对外上报的用量
 ///
-/// 输入是本地估算的总 prompt token，按与其他路径相同的口径拆分（Claude 模型走固定比例）。
-/// 这条路径不经过 `StreamContext`，之前直接写死 cache 为 0，是固定比例唯一漏掉的出口。
+/// 这条路径不经过上游 Kiro，也没有 CacheMeter 断点，prompt 全部记为未缓存 input。
 fn websearch_usage(
-    model: &str,
+    _model: &str,
     query: &str,
     search_results: &Option<WebSearchResults>,
     input_tokens: i32,
 ) -> TokenUsage {
-    let (input, creation, read) =
-        super::fixed_cache_ratio::apply(model, (input_tokens.max(0), 0, 0));
     TokenUsage {
-        uncached_input_tokens: input,
-        cache_write_input_tokens: creation,
-        cache_read_input_tokens: read,
+        uncached_input_tokens: input_tokens.max(0),
+        cache_write_input_tokens: 0,
+        cache_read_input_tokens: 0,
         output_tokens: (generate_search_summary(query, search_results).len() as i32 + 3) / 4,
     }
 }
@@ -621,7 +618,7 @@ pub(crate) async fn handle_websearch_request(
     let search_results = match finish_mcp_call(result) {
         Ok(results) => results,
         Err(response) => {
-            // 失败时与其他路径一致记原始估算，不按固定比例改写
+            // 失败时与其他路径一致记原始估算
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
             tracer.finalize(
                 "error",
@@ -761,10 +758,9 @@ mod tests {
         assert!(response.result.is_some());
     }
 
-    /// 纯 web_search 路径也要走与其他出口相同的拆分：Claude 固定 90% 缓存读，
-    /// 其他模型原样记为 input；流式 message_start 与非流式 body 用同一份数字
+    /// 纯 web_search 不经上游、无断点，prompt 全部记为 input。
     #[tokio::test]
-    async fn websearch_usage_uses_the_fixed_ratio_on_both_outputs() {
+    async fn websearch_usage_is_uncached_input_on_both_outputs() {
         let claude = websearch_usage("claude-opus-4-7", "rust", &None, 100);
         assert_eq!(
             (
@@ -772,7 +768,7 @@ mod tests {
                 claude.cache_write_input_tokens,
                 claude.cache_read_input_tokens
             ),
-            (10, 0, 90)
+            (100, 0, 0)
         );
         assert!(claude.output_tokens > 0);
         let other = websearch_usage("gpt-5.6-luna", "rust", &None, 100);
@@ -788,8 +784,8 @@ mod tests {
         let events =
             generate_websearch_events("claude-opus-4-7", "rust", "srvtoolu_x", None, claude);
         let start = &events[0].data["message"]["usage"];
-        assert_eq!(start["input_tokens"], json!(10));
-        assert_eq!(start["cache_read_input_tokens"], json!(90));
+        assert_eq!(start["input_tokens"], json!(100));
+        assert_eq!(start["cache_read_input_tokens"], json!(0));
         let delta = events.iter().find(|e| e.event == "message_delta").unwrap();
         assert_eq!(
             delta.data["usage"]["output_tokens"],
@@ -808,8 +804,8 @@ mod tests {
             .await
             .unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["usage"]["input_tokens"], json!(10));
-        assert_eq!(body["usage"]["cache_read_input_tokens"], json!(90));
+        assert_eq!(body["usage"]["input_tokens"], json!(100));
+        assert_eq!(body["usage"]["cache_read_input_tokens"], json!(0));
     }
 
     #[tokio::test]

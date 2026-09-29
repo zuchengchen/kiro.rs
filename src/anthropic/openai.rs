@@ -697,7 +697,7 @@ fn build_stream_sse(p: &ParsedResponse) -> String {
 ///
 /// `prompt_tokens` 是全部输入（含缓存读），命中缓存的部分按 OpenAI 格式放在
 /// `prompt_tokens_details.cached_tokens`。之前没带这一项，客户端和下游计费看到的永远是
-/// 0% 缓存命中，而 usage_log / trace 里记的是已拆分的数字（Claude 为固定 90%）。
+/// 0% 缓存命中，而 usage_log / trace 里记的是已拆分的数字。
 fn build_usage_json(p: &ParsedResponse) -> Value {
     let mut usage = json!({
         "prompt_tokens": p.prompt_tokens,

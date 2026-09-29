@@ -1448,10 +1448,10 @@ pub struct StreamContext {
 }
 
 impl StreamContext {
-    /// 对外上报的 `(uncached_input, cache_write, cache_read)`：Claude 模型按
-    /// [`super::fixed_cache_ratio`] 改写为固定缓存比例，其余模型即上游口径。
+    /// 对外上报的 `(uncached_input, cache_write, cache_read)`：上游
+    /// `tokenUsage` 优先，否则按 CacheMeter 断点模拟。
     pub fn resolved_usage(&self) -> (i32, i32, i32) {
-        super::fixed_cache_ratio::apply(&self.model, self.resolved_usage_raw())
+        self.resolved_usage_raw()
     }
 
     /// 解析 Anthropic 口径的 `(uncached_input, cache_write, cache_read)`。
@@ -1531,9 +1531,7 @@ impl StreamContext {
     /// 生成 message_start 事件
     ///
     /// usage 与 message_delta 走同一套拆分（[`Self::resolved_usage`]）：发出时上游还没回任何
-    /// 用量，拆分的是请求时的输入估算，Claude 模型同样是固定比例。之前这里写死 cache 为 0，
-    /// 只从 message_start 取 input / cache 的下游会看到 0% 缓存命中，而 message_delta 和
-    /// usage_log 记的是 90%。
+    /// 用量，拆分的是请求时的输入估算（CacheMeter 或全量 input）。
     pub fn create_message_start_event(&self) -> serde_json::Value {
         let (input_tokens, cache_creation, cache_read) = self.resolved_usage();
         json!({
@@ -5454,7 +5452,7 @@ mod tests {
         use crate::anthropic::cache_metering::CacheUsage;
         use crate::kiro::model::events::MetadataEvent;
 
-        // 非 Claude 模型：验证上游快照优先级本身（Claude 的固定比例见 fixed_cache_ratio 测试）。
+        // 上游精确快照优先于本地 CacheMeter 回退。
         let mut ctx = StreamContext::new_with_thinking(
             "gpt-5.6-luna",
             100,
@@ -5498,7 +5496,7 @@ mod tests {
     fn stream_usage_falls_back_to_context_cache_split_and_local_output() {
         use crate::anthropic::cache_metering::CacheUsage;
 
-        // 非 Claude 模型：验证上游口径本身（Claude 的固定比例见 fixed_cache_ratio 测试）。
+        // 无上游快照时按 CacheMeter 比例拆分。
         let mut ctx = StreamContext::new_with_thinking(
             "gpt-5.6-luna",
             100,
@@ -5528,7 +5526,7 @@ mod tests {
             cache_read_input_tokens: 7,
             cache_write_input_tokens: 4,
         };
-        // 非 Claude 模型：验证事件与最终 usage 同源（Claude 的固定比例见 fixed_cache_ratio 测试）。
+        // 事件与最终 usage 同源。
         let mut ctx = BufferedStreamContext::new(
             "gpt-5.6-luna",
             100,
@@ -5558,8 +5556,7 @@ mod tests {
         assert_eq!(delta_usage["output_tokens"], json!(11));
     }
 
-    /// live 流式的 message_start 与 message_delta 用同一套拆分：Claude 固定 90% 缓存读，
-    /// 其他模型按原口径（无缓存覆盖时全部是 input）
+    /// live 流式的 message_start 与 message_delta 用同一套拆分：无缓存覆盖时全部是 input。
     #[test]
     fn message_start_usage_uses_the_same_split_as_the_final_delta() {
         let claude = StreamContext::new_with_thinking(
@@ -5570,9 +5567,9 @@ mod tests {
             test_known_tools(),
         );
         let usage = &claude.create_message_start_event()["message"]["usage"];
-        assert_eq!(usage["input_tokens"], json!(10));
+        assert_eq!(usage["input_tokens"], json!(100));
         assert_eq!(usage["cache_creation_input_tokens"], json!(0));
-        assert_eq!(usage["cache_read_input_tokens"], json!(90));
+        assert_eq!(usage["cache_read_input_tokens"], json!(0));
 
         let other = StreamContext::new_with_thinking(
             "gpt-5.6-luna",
@@ -5584,6 +5581,61 @@ mod tests {
         let usage = &other.create_message_start_event()["message"]["usage"];
         assert_eq!(usage["input_tokens"], json!(100));
         assert_eq!(usage["cache_read_input_tokens"], json!(0));
+    }
+
+    #[test]
+    fn claude_stream_usage_keeps_provider_and_simulated_splits() {
+        use crate::anthropic::cache_metering::CacheUsage;
+        use crate::kiro::model::events::MetadataEvent;
+
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4-7",
+            100,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        ctx.context_input_tokens = Some(80);
+        ctx.cache_usage = CacheUsage {
+            cache_read: 25,
+            cache_covered_est: 50,
+            prompt_total_est: 100,
+        };
+        assert_eq!(ctx.resolved_usage(), (40, 20, 20));
+
+        ctx.provider_token_usage = Some(TokenUsage {
+            uncached_input_tokens: 3,
+            output_tokens: 11,
+            cache_write_input_tokens: 4,
+            cache_read_input_tokens: 7,
+        });
+        assert_eq!(ctx.resolved_usage(), (3, 4, 7));
+
+        let mut buffered = BufferedStreamContext::new(
+            "claude-opus-4-7",
+            100,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        buffered.process_and_buffer(&Event::Metadata(MetadataEvent {
+            token_usage: Some(TokenUsage {
+                uncached_input_tokens: 3,
+                output_tokens: 11,
+                cache_write_input_tokens: 4,
+                cache_read_input_tokens: 7,
+            }),
+        }));
+        let events = buffered.finish_and_get_all_events();
+        assert_eq!(buffered.final_usage(), (3, 11, 4, 7, 0.0));
+        let start_usage = &events
+            .iter()
+            .find(|event| event.event == "message_start")
+            .unwrap()
+            .data["message"]["usage"];
+        assert_eq!(start_usage["input_tokens"], json!(3));
+        assert_eq!(start_usage["cache_creation_input_tokens"], json!(4));
+        assert_eq!(start_usage["cache_read_input_tokens"], json!(7));
     }
 
     /// 缓冲模式（/cc/v1）上游断流：必须以 error 收尾，不能伪装成正常完成
