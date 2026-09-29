@@ -954,6 +954,7 @@ fn resolve_breakpoints(
 }
 
 /// 异步计算缓存覆盖，并立即提交新断点（测试与需要立刻可见的路径）。
+#[allow(dead_code)]
 pub async fn compute_cache_usage(
     cache: &CacheMeter,
     req: &MessagesRequest,
