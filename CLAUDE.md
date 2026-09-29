@@ -79,9 +79,9 @@ patch version number`），所以三个版本文件里写的是 semver build met
 
 | 文件 | 值 |
 |---|---|
-| `Cargo.toml` | `0.9.0+4` |
-| `Cargo.lock`（kiro-rs 自身条目） | `0.9.0+4` |
-| `admin-ui/package.json` | `0.9.0+4` |
+| `Cargo.toml` | `0.9.0+5` |
+| `Cargo.lock`（kiro-rs 自身条目） | `0.9.0+5` |
+| `admin-ui/package.json` | `0.9.0+5` |
 
 `display_version()`（`src/admin/service.rs`）在对外暴露时把 `+1` 还原成 `.1`，
 Admin UI 显示 `v0.9.0.1`。`parse_semver_core()` 返回 `[u32; 4]`，两种形式都解析
@@ -115,7 +115,7 @@ image tag 和 `deployment-*.json` 沿用同一个编号（`kiro-rs:0.9.0.1`）�
 | `a84e02e` | Admin UI 区分「同凭据换桶」与「转其他凭据」救回 |
 | `bd53626` | 按账号周期积分上限参与调度（粘性选号同样受限） |
 | v0.9.0 合并 | Claude 固定 90% 缓存命中（`src/anthropic/fixed_cache_ratio.rs`），其他模型走上游计量；取代 `a90235e` / `6c26708` 的全模型固定比例 |
-| 本轮 | 去掉 Claude 90% 改写，usage 按官方断点语义（provider / CacheMeter）；本地模拟 TTL 1 小时；最小可缓存长度；写入在响应开始后可见 |
+| `d695717` | 去掉 Claude 90% 改写，usage 按官方断点语义（provider / CacheMeter）；本地模拟 TTL 1 小时；最小可缓存长度；写入在响应开始后可见 |
 | `0338d8b` | 凭据 ID 跨重启单调（`src/kiro/credential_id_watermark.rs`）：删号 + 重启不再把旧 ID 分给新账号 |
 | `9065d67` | API Key / PKCE 用系统熵源生成（`src/common/secure_random.rs`），不再用 `fastrand` |
 
