@@ -13,8 +13,9 @@
 //!      （首轮写入最后一条 User，次轮从上一轮最后一条 User 读取）。自动断点占用 1 个断点槽。
 //!    - **显式 block 级缓存 (`cache_control`)**：仅在标记了 cache_control 的 block
 //!      处写入缓存 entry。
-//!    - **无 cache_control**：若无顶层且无任何 block 级 cache_control，则不模拟任何缓存，
-//!      全部计入 uncached input。
+//!    - **无 cache_control**：单元测试与显式关闭路径不计缓存。生产计量入口
+//!      （`inject_automatic`）会补一个顶层 ephemeral 自动断点，等价于官方
+//!      automatic caching，让客户端漏标时仍按多轮前缀命中。
 //! 2. **20-Block Lookback 回溯查找**：
 //!    - 读取匹配时，从每个断点向后（回溯）最多检查 20 个 block，寻找此前真正写入过的
 //!      最长前缀断点。只能命中此前实际写入过的断点，未声明断点的中间 block 不会写入或命中。
@@ -953,6 +954,35 @@ fn resolve_breakpoints(
     breakpoints
 }
 
+fn automatic_ephemeral() -> CacheControl {
+    CacheControl {
+        cache_type: "ephemeral".to_string(),
+        ttl: Some("1h".to_string()),
+    }
+}
+
+/// 客户端完全未声明断点时，生产路径补顶层自动缓存；已有顶层或 block 级标记则不改。
+fn effective_top_cache_control<'a>(
+    req: &'a MessagesRequest,
+    blocks: &[PromptBlock],
+    inject_automatic: bool,
+    injected: &'a CacheControl,
+) -> Option<&'a CacheControl> {
+    if let Some(cc) = req.cache_control.as_ref() {
+        return Some(cc);
+    }
+    if !inject_automatic {
+        return None;
+    }
+    if blocks
+        .iter()
+        .any(|block| block.cache_control.is_some() || block.invalid_cache_control)
+    {
+        return None;
+    }
+    Some(injected)
+}
+
 /// 异步计算缓存覆盖，并立即提交新断点（测试与需要立刻可见的路径）。
 #[allow(dead_code)]
 pub async fn compute_cache_usage(
@@ -960,16 +990,19 @@ pub async fn compute_cache_usage(
     req: &MessagesRequest,
     key_id: u64,
 ) -> CacheUsage {
-    let (usage, pending) = compute_cache_usage_deferred(cache, req, key_id).await;
+    let (usage, pending) = compute_cache_usage_deferred(cache, req, key_id, false).await;
     pending.commit(cache).await;
     usage
 }
 
 /// 异步计算缓存覆盖，新断点放入 [`PendingCacheWrites`]，调用方在响应开始后提交。
+///
+/// `inject_automatic`：客户端完全未声明 `cache_control` 时补顶层自动断点。
 pub async fn compute_cache_usage_deferred(
     cache: &CacheMeter,
     req: &MessagesRequest,
     key_id: u64,
+    inject_automatic: bool,
 ) -> (CacheUsage, PendingCacheWrites) {
     // 总开关关闭：不查不写，全量 prompt 计入 input（缓存两项为 0）。
     if !cache.is_enabled() {
@@ -992,8 +1025,10 @@ pub async fn compute_cache_usage_deferred(
         )
     };
 
-    // 解析断点（显式 + 顶层自动）
-    let mut breakpoints = resolve_breakpoints(&blocks, req.cache_control.as_ref());
+    // 解析断点（显式 + 顶层自动；生产路径可补漏标的自动断点）
+    let injected = automatic_ephemeral();
+    let top = effective_top_cache_control(req, &blocks, inject_automatic, &injected);
+    let mut breakpoints = resolve_breakpoints(&blocks, top);
     if breakpoints.is_empty() {
         return empty();
     }
@@ -1094,7 +1129,7 @@ pub fn compute_cache_usage_sync(
     req: &MessagesRequest,
     key_id: u64,
 ) -> CacheUsage {
-    let (usage, pending) = compute_cache_usage_sync_deferred(cache, req, key_id);
+    let (usage, pending) = compute_cache_usage_sync_deferred(cache, req, key_id, false);
     pending.commit_local(cache);
     usage
 }
@@ -1105,6 +1140,7 @@ pub fn compute_cache_usage_sync_deferred(
     cache: &CacheMeter,
     req: &MessagesRequest,
     key_id: u64,
+    inject_automatic: bool,
 ) -> (CacheUsage, PendingCacheWrites) {
     // 总开关关闭：不查不写，全量 prompt 计入 input（缓存两项为 0）。
     if !cache.is_enabled() {
@@ -1127,7 +1163,9 @@ pub fn compute_cache_usage_sync_deferred(
         )
     };
 
-    let mut breakpoints = resolve_breakpoints(&blocks, req.cache_control.as_ref());
+    let injected = automatic_ephemeral();
+    let top = effective_top_cache_control(req, &blocks, inject_automatic, &injected);
+    let mut breakpoints = resolve_breakpoints(&blocks, top);
     if breakpoints.is_empty() {
         return empty();
     }
@@ -1469,16 +1507,16 @@ mod tests {
     fn pending_writes_are_invisible_until_commit() {
         let cache = CacheMeter::new(None);
         let req = build_request_with_system_breakpoint();
-        let (u1, pending) = compute_cache_usage_sync_deferred(&cache, &req, 1);
+        let (u1, pending) = compute_cache_usage_sync_deferred(&cache, &req, 1, false);
         assert_eq!(u1.cache_read, 0);
         assert!(u1.cache_covered_est > 0);
         assert_eq!(cache.len(), 0, "提交前条目不可见");
 
-        let (u2, _) = compute_cache_usage_sync_deferred(&cache, &req, 1);
+        let (u2, _) = compute_cache_usage_sync_deferred(&cache, &req, 1, false);
         assert_eq!(u2.cache_read, 0, "并发未提交的写入不得互相命中");
 
         pending.commit_local(&cache);
-        let (u3, _) = compute_cache_usage_sync_deferred(&cache, &req, 1);
+        let (u3, _) = compute_cache_usage_sync_deferred(&cache, &req, 1, false);
         assert_eq!(u3.cache_read, u1.cache_covered_est);
     }
 
@@ -1613,6 +1651,45 @@ mod tests {
         assert_eq!(u2.cache_covered_est, 0);
         assert_eq!(u2.cache_read, 0);
         assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn inject_automatic_caches_when_client_omits_cache_control() {
+        use super::super::types::{Message, MessagesRequest};
+        let cache = CacheMeter::new(None);
+        let body = claude_cacheable("Question 1".repeat(50));
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-5-20250929".to_string(),
+            max_tokens: 32,
+            messages: vec![
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::Value::String(body.clone()),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::Value::String("Answer 1".repeat(50)),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::Value::String("Question 2".repeat(20)),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            cache_control: None,
+        };
+        let (cold, pending) = compute_cache_usage_sync_deferred(&cache, &req, 1, true);
+        assert!(cold.cache_covered_est > 0);
+        assert_eq!(cold.cache_read, 0);
+        pending.commit_local(&cache);
+        let (warm, _) = compute_cache_usage_sync_deferred(&cache, &req, 1, true);
+        assert_eq!(warm.cache_read, cold.cache_covered_est);
     }
 
     #[test]

@@ -263,6 +263,7 @@ async fn run_attempt(
                 cache,
                 &anthropic_req,
                 key_ctx.key_id,
+                true,
             )
             .await;
             tracer.attach_pending_cache(cache.clone(), pending);

@@ -1357,7 +1357,7 @@ async fn measure_prompt_cache(
         return super::cache_metering::CacheUsage::default();
     };
     let (usage, pending) =
-        super::cache_metering::compute_cache_usage_deferred(cache, payload, key_id).await;
+        super::cache_metering::compute_cache_usage_deferred(cache, payload, key_id, true).await;
     tracer.attach_pending_cache(cache.clone(), pending);
     usage
 }

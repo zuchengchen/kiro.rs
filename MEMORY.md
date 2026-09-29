@@ -24,7 +24,8 @@
   按请求前缀模拟 Anthropic 的 `cache_creation_input_tokens` 与
   `cache_read_input_tokens`；该模拟不会降低上游推理成本。
 - 只有顶层自动缓存或显式 block `cache_control` 才写入条目；自动断点落在最后一个
-  合格 block，显式断点最多 4 个，读取从各断点回溯最多 20 个位置。
+  合格 block，显式断点最多 4 个，读取从各断点回溯最多 20 个位置。生产计量入口在
+  客户端完全未声明断点时补顶层 ephemeral（1 小时），与官方 automatic caching 同形。
 - 连续 `tool_use` 和连续 `tool_result` 块分别只占一个回溯位置；断点只匹配此前真实
   写入的前缀，不为未声明的中间 block 建条目。
 - 本地模拟把 ephemeral 默认、`ttl=5m` 和 `ttl=1h` 都记成 1 小时；命中后按自身
