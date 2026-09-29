@@ -1027,12 +1027,12 @@ impl WebSearchSseEmitter {
         }
 
         let token_usage = token_usage.sanitized();
-        let mut usage = json!({
-            "input_tokens": token_usage.uncached_input_tokens,
-            "output_tokens": token_usage.output_tokens,
-            "cache_creation_input_tokens": token_usage.cache_write_input_tokens,
-            "cache_read_input_tokens": token_usage.cache_read_input_tokens
-        });
+        let mut usage = super::usage_cache_breakdown::usage_json(
+            token_usage.uncached_input_tokens,
+            token_usage.output_tokens,
+            token_usage.cache_write_input_tokens,
+            token_usage.cache_read_input_tokens,
+        );
         if let Some(metering) = metering {
             usage["credit_usage"] = json!(metering.usage);
             usage["credit_unit"] = json!(metering.unit);
@@ -1119,12 +1119,12 @@ fn initial_stream_event(model: &str, input_tokens: i32) -> SseEvent {
                 "content": [],
                 "stop_reason": null,
                 "stop_sequence": null,
-                "usage": {
-                    "input_tokens": input_tokens,
-                    "output_tokens": 0,
-                    "cache_creation_input_tokens": cache_creation,
-                    "cache_read_input_tokens": cache_read
-                }
+                "usage": super::usage_cache_breakdown::usage_json(
+                    input_tokens,
+                    0,
+                    cache_creation,
+                    cache_read,
+                )
             }
         }),
     )
@@ -1681,12 +1681,12 @@ pub(crate) fn render_json(
     metering: Option<&MeteringEvent>,
 ) -> Response {
     let token_usage = token_usage.sanitized();
-    let mut usage = json!({
-        "input_tokens": token_usage.uncached_input_tokens,
-        "output_tokens": token_usage.output_tokens,
-        "cache_creation_input_tokens": token_usage.cache_write_input_tokens,
-        "cache_read_input_tokens": token_usage.cache_read_input_tokens
-    });
+    let mut usage = super::usage_cache_breakdown::usage_json(
+        token_usage.uncached_input_tokens,
+        token_usage.output_tokens,
+        token_usage.cache_write_input_tokens,
+        token_usage.cache_read_input_tokens,
+    );
     // 透传上游 meteringEvent 的 credit_* 字段，让客户端拿到与 Kiro 后端口径
     // 一致的计费元数据；只在收到过 meteringEvent 时才追加。
     if let Some(m) = metering {
@@ -1735,12 +1735,12 @@ fn build_sse_events(
                 "content": [],
                 "stop_reason": null,
                 "stop_sequence": null,
-                "usage": {
-                    "input_tokens": token_usage.uncached_input_tokens,
-                    "output_tokens": 0,
-                    "cache_creation_input_tokens": token_usage.cache_write_input_tokens,
-                    "cache_read_input_tokens": token_usage.cache_read_input_tokens
-                }
+                "usage": super::usage_cache_breakdown::usage_json(
+                    token_usage.uncached_input_tokens,
+                    0,
+                    token_usage.cache_write_input_tokens,
+                    token_usage.cache_read_input_tokens,
+                )
             }
         }),
     ));

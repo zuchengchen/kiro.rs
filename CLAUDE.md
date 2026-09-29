@@ -117,6 +117,7 @@ image tag 和 `deployment-*.json` 沿用同一个编号（`kiro-rs:0.9.0.1`）�
 | v0.9.0 合并 | Claude 固定 90% 缓存命中（`src/anthropic/fixed_cache_ratio.rs`），其他模型走上游计量；取代 `a90235e` / `6c26708` 的全模型固定比例 |
 | `d695717` | 去掉 Claude 90% 改写，usage 按官方断点语义（provider / CacheMeter）；本地模拟 TTL 1 小时；最小可缓存长度；写入在响应开始后可见 |
 | `fb9291c` | 生产路径对漏标 `cache_control` 的请求补顶层自动断点（1h ephemeral） |
+| 本轮 | Anthropic usage 带上 `cache_creation.ephemeral_1h_input_tokens`，Sub2API 使用记录才能显示 1h 缓存创建 |
 | `0338d8b` | 凭据 ID 跨重启单调（`src/kiro/credential_id_watermark.rs`）：删号 + 重启不再把旧 ID 分给新账号 |
 | `9065d67` | API Key / PKCE 用系统熵源生成（`src/common/secure_random.rs`），不再用 `fastrand` |
 

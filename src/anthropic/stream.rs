@@ -1294,12 +1294,12 @@ impl SseStateManager {
         // 发送 message_delta
         if !self.message_delta_sent {
             self.message_delta_sent = true;
-            let mut usage_json = json!({
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "cache_creation_input_tokens": cache_creation_input_tokens,
-                "cache_read_input_tokens": cache_read_input_tokens
-            });
+            let mut usage_json = super::usage_cache_breakdown::usage_json(
+                input_tokens,
+                output_tokens,
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+            );
             // 透传上游 meteringEvent 的 credit_* 字段，让客户端拿到与 Kiro
             // 后端口径一致的计费元数据；只在收到过 meteringEvent 时才追加。
             if let Some(m) = metering {
@@ -1544,12 +1544,12 @@ impl StreamContext {
                 "model": self.model,
                 "stop_reason": null,
                 "stop_sequence": null,
-                "usage": {
-                    "input_tokens": input_tokens,
-                    "output_tokens": 1,
-                    "cache_creation_input_tokens": cache_creation,
-                    "cache_read_input_tokens": cache_read
-                }
+                "usage": super::usage_cache_breakdown::usage_json(
+                    input_tokens,
+                    1,
+                    cache_creation,
+                    cache_read,
+                )
             }
         })
     }
@@ -2720,6 +2720,7 @@ impl BufferedStreamContext {
                         usage["input_tokens"] = serde_json::json!(input_tokens);
                         usage["cache_creation_input_tokens"] = serde_json::json!(cache_creation);
                         usage["cache_read_input_tokens"] = serde_json::json!(cache_read);
+                        super::usage_cache_breakdown::attach_cache_creation_object(usage);
                     }
                 }
             }
@@ -5570,6 +5571,8 @@ mod tests {
         assert_eq!(usage["input_tokens"], json!(100));
         assert_eq!(usage["cache_creation_input_tokens"], json!(0));
         assert_eq!(usage["cache_read_input_tokens"], json!(0));
+        assert_eq!(usage["cache_creation"]["ephemeral_5m_input_tokens"], json!(0));
+        assert_eq!(usage["cache_creation"]["ephemeral_1h_input_tokens"], json!(0));
 
         let other = StreamContext::new_with_thinking(
             "gpt-5.6-luna",
@@ -5636,6 +5639,14 @@ mod tests {
         assert_eq!(start_usage["input_tokens"], json!(3));
         assert_eq!(start_usage["cache_creation_input_tokens"], json!(4));
         assert_eq!(start_usage["cache_read_input_tokens"], json!(7));
+        assert_eq!(
+            start_usage["cache_creation"]["ephemeral_1h_input_tokens"],
+            json!(4)
+        );
+        assert_eq!(
+            start_usage["cache_creation"]["ephemeral_5m_input_tokens"],
+            json!(0)
+        );
     }
 
     /// 缓冲模式（/cc/v1）上游断流：必须以 error 收尾，不能伪装成正常完成

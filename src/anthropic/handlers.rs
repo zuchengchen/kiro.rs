@@ -1741,12 +1741,12 @@ pub(crate) async fn execute_non_stream_request(
         );
 
     // 构建 Anthropic 响应
-    let mut usage_json = json!({
-        "input_tokens": final_input_tokens,
-        "output_tokens": output_tokens,
-        "cache_creation_input_tokens": cache_creation_tokens,
-        "cache_read_input_tokens": cache_read_tokens
-    });
+    let mut usage_json = super::usage_cache_breakdown::usage_json(
+        final_input_tokens,
+        output_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
+    );
     // 透传上游 meteringEvent 的 credit_* 字段，让客户端拿到与 Kiro
     // 后端口径一致的计费元数据；只在收到过 meteringEvent 时才追加。
     if let Some(m) = &metering {

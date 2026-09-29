@@ -279,12 +279,12 @@ fn generate_websearch_events(
                 "model": model,
                 "content": [],
                 "stop_reason": null,
-                "usage": {
-                    "input_tokens": usage.uncached_input_tokens,
-                    "output_tokens": 0,
-                    "cache_creation_input_tokens": usage.cache_write_input_tokens,
-                    "cache_read_input_tokens": usage.cache_read_input_tokens
-                }
+                "usage": super::usage_cache_breakdown::usage_json(
+                    usage.uncached_input_tokens,
+                    0,
+                    usage.cache_write_input_tokens,
+                    usage.cache_read_input_tokens,
+                )
             }
         }),
     ));
