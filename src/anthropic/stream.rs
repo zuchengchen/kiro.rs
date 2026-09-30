@@ -193,7 +193,23 @@ fn is_quote_char(buffer: &str, pos: usize) -> bool {
 /// # 返回值
 /// - `Some(pos)`: 真正的结束标签的起始位置
 /// - `None`: 没有找到真正的结束标签
+#[cfg(test)]
 fn find_real_thinking_end_tag(buffer: &str) -> Option<usize> {
+    find_real_thinking_end_tag_with_len(buffer).map(|(pos, _)| pos)
+}
+
+/// 与 `find_real_thinking_end_tag` 相同，但同时返回需要从缓冲区剥离的长度
+/// （标签本身 + 其后被消费的换行符）。
+///
+/// 接受两种真正的结束形态：
+/// - `</thinking>\n\n`（常见形态，标签可以紧跟在思考内容后）
+/// - 独占一行的 `</thinking>\n` 后紧跟正文（标签前是 `\n`，后面只有一个换行）。
+///   Opus 5.5 等模型会输出 `...\n\n</thinking>\n正文`；若只认 `\n\n`，整段正文会
+///   被当成 thinking，流结束时又被判为「只有 thinking」而伪造 `max_tokens`。
+///
+/// 仍然跳过：被引用字符包裹、行内提及（如 "关于 </thinking> 标签"），以及标签后
+/// 只有一个 `\n` 且尚无后续内容时（可能是 `\n\n` 的前半，需等待更多内容）。
+fn find_real_thinking_end_tag_with_len(buffer: &str) -> Option<(usize, usize)> {
     const TAG: &str = "</thinking>";
     let mut search_start = 0;
 
@@ -223,10 +239,17 @@ fn find_real_thinking_end_tag(buffer: &str) -> Option<usize> {
 
         // 真正的 thinking 结束标签后面会有双换行符 `\n\n`
         if after_content.starts_with("\n\n") {
-            return Some(absolute_pos);
+            return Some((absolute_pos, TAG.len() + 2));
         }
 
-        // 不是双换行符，跳过继续搜索
+        // 独占一行的结束标签：`\n</thinking>\n` 后紧跟非换行正文。
+        // 走到这里 after_content 至少 2 字节且不是 `\n\n`，所以第二个字节已确定。
+        let on_own_line = absolute_pos > 0 && buffer.as_bytes()[absolute_pos - 1] == b'\n';
+        if on_own_line && after_content.starts_with('\n') {
+            return Some((absolute_pos, TAG.len() + 1));
+        }
+
+        // 不是结束形态，跳过继续搜索
         search_start = absolute_pos + 1;
     }
 
@@ -728,18 +751,16 @@ pub(crate) fn extract_thinking_from_complete_text(text: &str) -> (Option<String>
     let after_open = &text[start_pos + "<thinking>".len()..];
 
     // 查找结束标签：优先匹配带 \n\n 后缀的，退而使用末尾匹配
-    let (thinking_raw, text_after) = if let Some(end_pos) = find_real_thinking_end_tag(after_open) {
-        (
-            &after_open[..end_pos],
-            &after_open[end_pos + "</thinking>\n\n".len()..],
-        )
-    } else if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(after_open) {
-        let after_tag = end_pos + "</thinking>".len();
-        (&after_open[..end_pos], after_open[after_tag..].trim_start())
-    } else {
-        // 找不到有效的结束标签，不做提取
-        return (None, text.to_string());
-    };
+    let (thinking_raw, text_after) =
+        if let Some((end_pos, strip_len)) = find_real_thinking_end_tag_with_len(after_open) {
+            (&after_open[..end_pos], &after_open[end_pos + strip_len..])
+        } else if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(after_open) {
+            let after_tag = end_pos + "</thinking>".len();
+            (&after_open[..end_pos], after_open[after_tag..].trim_start())
+        } else {
+            // 找不到有效的结束标签，不做提取
+            return (None, text.to_string());
+        };
 
     // 剥离开头的换行符（与流式处理一致：模型输出 <thinking>\n）
     let thinking_content = thinking_raw.strip_prefix('\n').unwrap_or(thinking_raw);
@@ -1777,7 +1798,9 @@ impl StreamContext {
                 }
 
                 // 在 thinking 块内，查找 </thinking> 结束标签（跳过被反引号包裹的）
-                if let Some(end_pos) = find_real_thinking_end_tag(&self.thinking_buffer) {
+                if let Some((end_pos, strip_len)) =
+                    find_real_thinking_end_tag_with_len(&self.thinking_buffer)
+                {
                     // 提取 thinking 内容
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
                     if !thinking_content.is_empty() {
@@ -1806,20 +1829,20 @@ impl StreamContext {
                         }
                     }
 
-                    // 剥离 `</thinking>\n\n`（find_real_thinking_end_tag 已确认 \n\n 存在）
-                    self.thinking_buffer =
-                        self.thinking_buffer[end_pos + "</thinking>\n\n".len()..].to_string();
+                    // 剥离 `</thinking>` 及其后被确认的换行（`\n\n` 或独占一行时的 `\n`）
+                    self.thinking_buffer = self.thinking_buffer[end_pos + strip_len..].to_string();
                 } else {
                     // 没有找到结束标签，发送当前缓冲区内容作为 thinking_delta。
                     // 保留末尾可能是部分 `</thinking>\n\n` 的内容：
-                    // find_real_thinking_end_tag 要求标签后有 `\n\n` 才返回 Some，
-                    // 因此保留区必须覆盖 `</thinking>\n\n` 的完整长度（13 字节），
-                    // 否则当 `</thinking>` 已在 buffer 但 `\n\n` 尚未到达时，
+                    // 结束标签最长形态是 `</thinking>\n\n`（13 字节），保留区必须覆盖它，
+                    // 否则当 `</thinking>` 已在 buffer 但后续换行尚未到达时，
                     // 标签的前几个字符会被错误地作为 thinking_delta 发出。
                     let target_len = self
                         .thinking_buffer
                         .len()
                         .saturating_sub("</thinking>\n\n".len());
+                    // 独占一行形态的 `\n</thinking>` 只有 12 字节，同样落在保留区内，
+                    // 标签到达时前导换行仍在 buffer 中。
                     let safe_len = find_char_boundary(&self.thinking_buffer, target_len);
                     if safe_len > 0 {
                         let safe_content = self.thinking_buffer[..safe_len].to_string();
@@ -2542,6 +2565,15 @@ impl StreamContext {
             && self.thinking_block_index.is_some()
             && !self.state_manager.has_non_thinking_blocks()
         {
+            // 这里是推断而非上游信号：只有 ContentLengthExceededException 会预先把
+            // stop_reason 置为 max_tokens。记录下来，便于区分「真的耗尽预算」与
+            // 「结束标签漏判 / 上游只回了 thinking」。
+            tracing::warn!(
+                model = %self.model,
+                upstream_stop_reason = %self.state_manager.get_stop_reason(),
+                output_tokens = self.resolved_output_tokens(),
+                "流中只产生了 thinking 块，按 max_tokens 结束"
+            );
             self.state_manager.set_stop_reason("max_tokens");
             events.extend(self.create_text_delta_events(" "));
         }
@@ -4662,6 +4694,97 @@ mod tests {
             message_delta.data["delta"]["stop_reason"], "end_turn",
             "stop_reason should be end_turn when text is also produced"
         );
+    }
+
+    #[test]
+    fn test_find_real_thinking_end_tag_own_line_single_newline() {
+        // 独占一行的结束标签后只跟一个换行，再接正文
+        assert_eq!(
+            find_real_thinking_end_tag_with_len("abc\n</thinking>\nanswer"),
+            Some((4, "</thinking>\n".len()))
+        );
+        assert_eq!(
+            find_real_thinking_end_tag_with_len("abc</thinking>\n\nanswer"),
+            Some((3, "</thinking>\n\n".len()))
+        );
+        // 行内提及（前面不是换行）且只有一个换行：不是结束标签
+        assert_eq!(find_real_thinking_end_tag("about </thinking>\nnext"), None);
+        // 独占一行但后面只有一个换行、尚无后续：可能是 \n\n 的前半，等待
+        assert_eq!(find_real_thinking_end_tag("abc\n</thinking>\n"), None);
+        // 独占一行但标签后同行还有内容：不是结束标签
+        assert_eq!(find_real_thinking_end_tag("abc\n</thinking> more"), None);
+    }
+
+    #[test]
+    fn test_thinking_end_tag_on_own_line_with_single_newline_yields_text() {
+        // 复现线上故障：Opus 5.5 输出 `...\n\n</thinking>\n正文`。
+        // 旧逻辑要求标签后必须是 `\n\n`，整段正文被当成 thinking，
+        // 最终伪造 stop_reason=max_tokens，客户端报「推理时耗尽输出上限」。
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-5.5",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(
+            "<thinking>\nno custom rules are set.\n\n</thinking>\n结论：最多重试 10 次。",
+        ));
+        all.extend(ctx.generate_final_events());
+
+        assert_eq!(
+            collect_thinking_content(&all),
+            "no custom rules are set.\n\n"
+        );
+        assert_eq!(collect_text_content(&all), "结论：最多重试 10 次。");
+
+        let message_delta = all
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("should have message_delta event");
+        assert_eq!(message_delta.data["delta"]["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn test_thinking_end_tag_own_line_split_across_chunks() {
+        // 前导 `\n` 与 `</thinking>\n正文` 落在不同 chunk，且 thinking 足够长，
+        // 保留区之外的内容已先作为 thinking_delta 发出。前导换行必须留在 buffer。
+        let long_line = "x".repeat(40);
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-5.5",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response("<thinking>\n"));
+        all.extend(ctx.process_assistant_response(&format!("{long_line}\n")));
+        all.extend(ctx.process_assistant_response("</thinking>"));
+        all.extend(ctx.process_assistant_response("\n"));
+        all.extend(ctx.process_assistant_response("answer"));
+        all.extend(ctx.generate_final_events());
+
+        assert_eq!(collect_thinking_content(&all), format!("{long_line}\n"));
+        assert_eq!(collect_text_content(&all), "answer");
+        let message_delta = all
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("should have message_delta event");
+        assert_eq!(message_delta.data["delta"]["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn test_extract_thinking_from_complete_text_own_line_single_newline() {
+        let (thinking, text) =
+            extract_thinking_from_complete_text("<thinking>\nplan\n</thinking>\nanswer");
+        assert_eq!(thinking.as_deref(), Some("plan\n"));
+        assert_eq!(text, "answer");
     }
 
     #[test]
