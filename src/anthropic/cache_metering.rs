@@ -821,47 +821,41 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
         };
         let is_current_turn_input =
             (m_idx + 1 == total_messages) && msg.role == "user" && !is_tool_result;
-        match &msg.content {
+        // Anthropic 把字符串 content 视为单个 text block，二者是同一前缀。Claude Code
+        // 只给打断点的尾消息发数组形式（带 cache_control），下一轮同一条消息退回字符串；
+        // 若签名不归一，上一轮尾断点永远无法命中，长会话每轮只剩 tools+system 命中。
+        let normalized;
+        let content_blocks = match &msg.content {
             serde_json::Value::String(s) => {
-                let content = serde_json::Value::String(s.clone());
-                blocks.push(PromptBlock {
-                    signature: prompt_block_signature("message", Some(&msg.role), &content),
-                    tokens: estimate_tokens(s).max(0) as u32,
-                    cache_control: None,
-                    invalid_cache_control: false,
-                    cacheable: !s.trim().is_empty(),
-                    lookback_group: None,
-                    is_current_turn_input,
-                });
+                normalized = [serde_json::json!({"type": "text", "text": s})];
+                &normalized[..]
             }
-            serde_json::Value::Array(arr) => {
-                for v in arr {
-                    let (cache_control, invalid_cache_control) = match v.get("cache_control") {
-                        Some(raw) => match serde_json::from_value::<CacheControl>(raw.clone()) {
-                            Ok(cc) => (Some(cc), false),
-                            Err(_) => (None, true),
-                        },
-                        None => (None, false),
-                    };
-                    let content = without_cache_control(v);
-                    let lookback_group = match content.get("type").and_then(|value| value.as_str())
-                    {
-                        Some("tool_use") => Some(LookbackGroup::ToolUse),
-                        Some("tool_result") => Some(LookbackGroup::ToolResult),
-                        _ => None,
-                    };
-                    blocks.push(PromptBlock {
-                        signature: prompt_block_signature("message", Some(&msg.role), &content),
-                        tokens: block_tokens(&content),
-                        cache_control,
-                        invalid_cache_control,
-                        cacheable: block_is_cacheable(&content),
-                        lookback_group,
-                        is_current_turn_input,
-                    });
-                }
-            }
-            _ => {}
+            serde_json::Value::Array(arr) => arr.as_slice(),
+            _ => &[],
+        };
+        for v in content_blocks {
+            let (cache_control, invalid_cache_control) = match v.get("cache_control") {
+                Some(raw) => match serde_json::from_value::<CacheControl>(raw.clone()) {
+                    Ok(cc) => (Some(cc), false),
+                    Err(_) => (None, true),
+                },
+                None => (None, false),
+            };
+            let content = without_cache_control(v);
+            let lookback_group = match content.get("type").and_then(|value| value.as_str()) {
+                Some("tool_use") => Some(LookbackGroup::ToolUse),
+                Some("tool_result") => Some(LookbackGroup::ToolResult),
+                _ => None,
+            };
+            blocks.push(PromptBlock {
+                signature: prompt_block_signature("message", Some(&msg.role), &content),
+                tokens: block_tokens(&content),
+                cache_control,
+                invalid_cache_control,
+                cacheable: block_is_cacheable(&content),
+                lookback_group,
+                is_current_turn_input,
+            });
         }
     }
 
@@ -3445,5 +3439,119 @@ mod tests {
         assert_eq!(read, 100_000, "命中前缀必须全额如实上报");
         assert_eq!(creation, 0, "无新增覆盖段");
         assert_eq!(input, 1_000, "最新提问如实计入 input");
+    }
+
+    /// Claude Code 只给「打断点的尾消息」发数组形式（带 cache_control），同一条消息
+    /// 不再是尾部后退回字符串形式重发。Anthropic 把 `"x"` 与 `[{"type":"text","text":"x"}]`
+    /// 视为同一前缀，所以下一轮必须命中上一轮尾断点；否则长会话每轮都只命中
+    /// tools+system，其余整段被误报为 cache_creation。
+    fn string_vs_array_turns(role: &str) -> (MessagesRequest, MessagesRequest) {
+        use super::super::types::{CacheControl, Message};
+        let history = || {
+            vec![
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::Value::String(claude_cacheable("first question")),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([{"type":"text","text":"first answer"}]),
+                },
+            ]
+        };
+        let tail_text = "stable tail message";
+        let cc = serde_json::json!({"type":"ephemeral","ttl":"1h"});
+
+        let mut first_messages = history();
+        first_messages.push(Message {
+            role: role.to_string(),
+            content: serde_json::json!([
+                {"type":"text","text":tail_text,"cache_control":cc}
+            ]),
+        });
+
+        let mut second_messages = history();
+        second_messages.push(Message {
+            role: role.to_string(),
+            content: serde_json::Value::String(tail_text.to_string()),
+        });
+        second_messages.push(Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!([{"type":"text","text":"second answer"}]),
+        });
+        second_messages.push(Message {
+            role: "user".to_string(),
+            content: serde_json::json!([
+                {"type":"text","text":"follow-up","cache_control":cc}
+            ]),
+        });
+
+        let make = |messages: Vec<Message>| MessagesRequest {
+            model: "claude-opus-5.5".to_string(),
+            max_tokens: 32,
+            messages,
+            stream: true,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            cache_control: None::<CacheControl>,
+        };
+        (make(first_messages), make(second_messages))
+    }
+
+    #[test]
+    fn string_content_matches_single_text_block_prefix() {
+        for role in ["system", "user", "assistant"] {
+            let cache = CacheMeter::new(None);
+            let (first, second) = string_vs_array_turns(role);
+
+            let cold = compute_cache_usage_sync(&cache, &first, 1);
+            assert_eq!(cold.cache_read, 0, "role={role}");
+            assert!(cold.cache_covered_est > 0, "role={role}");
+
+            let warm = compute_cache_usage_sync(&cache, &second, 1);
+            assert_eq!(
+                warm.cache_read, cold.cache_covered_est,
+                "role={role}: 上一轮尾断点改为字符串重发后必须命中"
+            );
+            assert!(warm.cache_covered_est > warm.cache_read, "role={role}");
+        }
+    }
+
+    #[test]
+    fn string_content_token_and_cacheability_unchanged() {
+        let as_string = extract_blocks(&MessagesRequest {
+            model: "claude-opus-5.5".to_string(),
+            max_tokens: 32,
+            messages: vec![
+                super::super::types::Message {
+                    role: "user".to_string(),
+                    content: serde_json::Value::String("hello world".to_string()),
+                },
+                super::super::types::Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::Value::String("   ".to_string()),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            cache_control: None,
+        });
+        assert_eq!(as_string.len(), 2);
+        assert_eq!(
+            as_string[0].tokens,
+            estimate_tokens("hello world").max(0) as u32
+        );
+        assert!(as_string[0].cacheable);
+        assert!(!as_string[0].is_current_turn_input);
+        assert!(!as_string[1].cacheable, "空白字符串不可作断点");
     }
 }

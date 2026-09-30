@@ -38,3 +38,6 @@
   硬编码制造 75%～90% 命中率。
 - 按模型执行 512～4096 token 的最小缓存阈值；新断点在上游响应开始后才可被其他
   请求命中。JSON 解析会规范化对象键序，无法复现原始线序变化导致的失效。
+- 字符串 message content 按单个 text block 计算签名。Claude Code 只给打断点的尾消息
+  （含 `role:"system"` 中段系统消息）发数组 + `cache_control`，不再是尾部时退回字符串；
+  不归一会让长会话每轮只命中 tools+system，其余整段误报为 cache_creation。
