@@ -164,6 +164,8 @@ pub mod usage_source {
     pub const PROVIDER: &str = "provider";
     /// 本地 CacheMeter 按 cache_control 断点估算
     pub const SIMULATED: &str = "simulated";
+    /// 本地估算的 creation 经上游 credits 判为命中，已改记为 read
+    pub const RECONCILED: &str = "reconciled";
     /// 无断点 / 计量关闭：全量计入 input，缓存两项为 0
     pub const NONE: &str = "none";
 }

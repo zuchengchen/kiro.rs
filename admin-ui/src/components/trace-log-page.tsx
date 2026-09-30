@@ -354,6 +354,11 @@ function UsageSourceBadge({ source }: { source?: UsageSource | null }) {
       title: '上游未下发精确用量；按客户端 cache_control 断点在本地模拟缓存命中，反映的是「前缀是否稳定」而非上游真实缓存',
       cls: 'border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400',
     },
+    reconciled: {
+      label: 'credits 修正',
+      title: '本地估算为缓存写入，但上游 credits 显示已命中缓存，已改记为缓存读取',
+      cls: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400',
+    },
     none: {
       label: '无断点',
       title: '请求未声明 cache_control 断点或计量已关闭，全量计入输入',

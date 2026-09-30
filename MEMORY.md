@@ -41,3 +41,9 @@
 - 字符串 message content 按单个 text block 计算签名。Claude Code 只给打断点的尾消息
   （含 `role:"system"` 中段系统消息）发数组 + `cache_control`，不再是尾部时退回字符串；
   不归一会让长会话每轮只命中 tools+system，其余整段误报为 cache_creation。
+- 同一 session 并发的同前缀请求：后一个开始时前一个还没出首字，本地判为整段
+  cache_creation，但 Kiro 上游已按命中扣费。`credit_cache_reconcile.rs` 在流结束后用
+  `meteringEvent.credits` 判定（只覆盖 claude-opus-5.5，只向下修正 creation → read），
+  trace 记 `usage_source = reconciled`。开关 `KIRO_RS_CREDIT_CACHE_RECONCILE` 默认关，
+  必须等 Sub2API 支持 `message_delta.usage.usage_final` 后再开，否则 delta 的 0 被忽略、
+  start 的 creation 残留，会重复计费。单价漂移用 `tools/credit_rate_fit.py` 重新拟合。

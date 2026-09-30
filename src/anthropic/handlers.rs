@@ -166,6 +166,8 @@ pub(crate) enum UsageSource {
     Provider,
     /// 本地 CacheMeter 按断点估算
     Simulated,
+    /// 本地估算的 creation 经上游 credits 判定为命中，已改记为 read
+    Reconciled,
     /// 无断点 / 计量关闭
     None,
 }
@@ -176,14 +178,21 @@ impl UsageSource {
             Self::Unknown => Option::None,
             Self::Provider => Some(usage_source::PROVIDER),
             Self::Simulated => Some(usage_source::SIMULATED),
+            Self::Reconciled => Some(usage_source::RECONCILED),
             Self::None => Some(usage_source::NONE),
         }
     }
 
-    /// 由「上游是否给了精确用量」与「本地模拟是否覆盖到前缀」推断来源。
-    pub fn resolve(has_provider_usage: bool, cache_usage: &super::cache_metering::CacheUsage) -> Self {
+    /// 由「上游是否给了精确用量」「是否经 credits 修正」与「本地模拟是否覆盖到前缀」推断来源。
+    pub fn resolve(
+        has_provider_usage: bool,
+        reconciled: bool,
+        cache_usage: &super::cache_metering::CacheUsage,
+    ) -> Self {
         if has_provider_usage {
             Self::Provider
+        } else if reconciled {
+            Self::Reconciled
         } else if cache_usage.cache_covered_est > 0 {
             Self::Simulated
         } else {
@@ -581,31 +590,40 @@ pub(super) fn map_provider_error(err: Error) -> Response {
 ///
 /// 返回 `(uncached_input, output, cache_write, cache_read)`。精确 provider 快照优先；
 /// 缺失时才使用 contextUsage/输入估算和本地 CacheMeter 分摊。
+///
+/// 第二个返回值表示本地拆分是否经上游 credits 修正（`reconcile` 开启且判为命中）。
+#[allow(clippy::too_many_arguments)]
 fn resolve_non_stream_usage(
+    model: &str,
     fallback_total_input_tokens: i32,
     context_total_input_tokens: Option<i32>,
     fallback_output_tokens: i32,
     cache_usage: super::cache_metering::CacheUsage,
     provider_usage: Option<TokenUsage>,
-) -> (i32, i32, i32, i32) {
+    credits: f64,
+    reconcile: bool,
+) -> ((i32, i32, i32, i32), bool) {
     if let Some(usage) = provider_usage {
         let usage = usage.sanitized();
         return (
-            usage.uncached_input_tokens,
-            usage.output_tokens,
-            usage.cache_write_input_tokens,
-            usage.cache_read_input_tokens,
+            (
+                usage.uncached_input_tokens,
+                usage.output_tokens,
+                usage.cache_write_input_tokens,
+                usage.cache_read_input_tokens,
+            ),
+            false,
         );
     }
 
     let total_input = context_total_input_tokens.unwrap_or(fallback_total_input_tokens);
-    let (input, cache_write, cache_read) = cache_usage.split_against_total(total_input);
-    (
-        input,
-        fallback_output_tokens.max(0),
-        cache_write,
-        cache_read,
-    )
+    let output = fallback_output_tokens.max(0);
+    let split = cache_usage.split_against_total(total_input);
+    let reconciled = reconcile
+        .then(|| super::credit_cache_reconcile::reconcile_split(model, split, output, credits))
+        .flatten();
+    let (input, cache_write, cache_read) = reconciled.unwrap_or(split);
+    ((input, output, cache_write, cache_read), reconciled.is_some())
 }
 
 fn validate_max_tokens(max_tokens: i32) -> Result<(), ErrorResponse> {
@@ -1344,7 +1362,11 @@ fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
         output_tokens: ctx.resolved_output_tokens() as u64,
         cache_creation_tokens: cache_creation.max(0) as u64,
         cache_read_tokens: cache_read.max(0) as u64,
-        source: UsageSource::resolve(ctx.provider_token_usage.is_some(), &ctx.cache_usage),
+        source: UsageSource::resolve(
+            ctx.provider_token_usage.is_some(),
+            ctx.usage_reconciled(),
+            &ctx.cache_usage,
+        ),
         credits: if ctx.credits.is_finite() && ctx.credits > 0.0 {
             ctx.credits
         } else {
@@ -1742,14 +1764,19 @@ pub(crate) async fn execute_non_stream_request(
 
     // provider 未下发 metadataEvent 时才使用本地输出估算。
     let fallback_output_tokens = token::estimate_output_tokens(&content);
-    let (final_input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens) =
-        resolve_non_stream_usage(
-            input_tokens,
-            context_input_tokens,
-            fallback_output_tokens,
-            cache_usage,
-            provider_token_usage,
-        );
+    let (
+        (final_input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens),
+        usage_reconciled,
+    ) = resolve_non_stream_usage(
+        model,
+        input_tokens,
+        context_input_tokens,
+        fallback_output_tokens,
+        cache_usage,
+        provider_token_usage,
+        credits,
+        super::credit_cache_reconcile::enabled_from_env(),
+    );
 
     // 构建 Anthropic 响应
     let mut usage_json = super::usage_cache_breakdown::usage_json(
@@ -1800,7 +1827,11 @@ pub(crate) async fn execute_non_stream_request(
             } else {
                 0.0
             },
-            source: UsageSource::resolve(provider_token_usage.is_some(), &cache_usage),
+            source: UsageSource::resolve(
+                provider_token_usage.is_some(),
+                usage_reconciled,
+                &cache_usage,
+            ),
         },
     );
     Ok(response_body)
@@ -2315,7 +2346,7 @@ fn create_buffered_sse_stream(
                                         cache_creation_tokens: cc.max(0) as u64,
                                         cache_read_tokens: cr.max(0) as u64,
                                         credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
-                                        source: UsageSource::resolve(ctx.has_provider_usage(), ctx.cache_usage()),
+                                        source: UsageSource::resolve(ctx.has_provider_usage(), ctx.usage_reconciled(), ctx.cache_usage()),
                                     },
                                 );
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
@@ -2336,7 +2367,7 @@ fn create_buffered_sse_stream(
                                     cache_creation_tokens: cc.max(0) as u64,
                                     cache_read_tokens: cr.max(0) as u64,
                                     credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
-                                    source: UsageSource::resolve(ctx.has_provider_usage(), ctx.cache_usage()),
+                                    source: UsageSource::resolve(ctx.has_provider_usage(), ctx.usage_reconciled(), ctx.cache_usage()),
                                 };
                                 if let Some(message) = ctx.upstream_terminal_error_message() {
                                     hook.record(credential_id, i, o, cc, cr, credits, "error");
@@ -3074,8 +3105,17 @@ mod tests {
         };
 
         assert_eq!(
-            resolve_non_stream_usage(100, Some(80), 9, fallback_cache, Some(provider)),
-            (3, 11, 4, 7)
+            resolve_non_stream_usage(
+                "claude-opus-5.5",
+                100,
+                Some(80),
+                9,
+                fallback_cache,
+                Some(provider),
+                0.0,
+                true,
+            ),
+            ((3, 11, 4, 7), false)
         );
     }
 
@@ -3088,13 +3128,79 @@ mod tests {
         };
 
         assert_eq!(
-            resolve_non_stream_usage(100, Some(80), 9, cache_usage, None),
-            (40, 9, 20, 20)
+            resolve_non_stream_usage(
+                "claude-opus-5.5",
+                100,
+                Some(80),
+                9,
+                cache_usage,
+                None,
+                0.0,
+                true,
+            ),
+            ((40, 9, 20, 20), false)
         );
         assert_eq!(
-            resolve_non_stream_usage(100, None, -9, Default::default(), None),
-            (100, 0, 0, 0)
+            resolve_non_stream_usage(
+                "claude-opus-5.5",
+                100,
+                None,
+                -9,
+                Default::default(),
+                None,
+                0.0,
+                true,
+            ),
+            ((100, 0, 0, 0), false)
         );
+    }
+
+    #[test]
+    fn non_stream_usage_reconciles_from_credits_when_enabled() {
+        let cache_usage = super::super::cache_metering::CacheUsage {
+            cache_read: 0,
+            cache_covered_est: 828_840,
+            prompt_total_est: 828_840,
+        };
+        let on = resolve_non_stream_usage(
+            "claude-opus-5.5",
+            828_840,
+            None,
+            387,
+            cache_usage,
+            None,
+            2.913,
+            true,
+        );
+        assert_eq!(on, ((0, 387, 0, 828_840), true));
+        let off = resolve_non_stream_usage(
+            "claude-opus-5.5",
+            828_840,
+            None,
+            387,
+            cache_usage,
+            None,
+            2.913,
+            false,
+        );
+        assert_eq!(off, ((0, 387, 828_840, 0), false));
+    }
+
+    #[test]
+    fn usage_source_prefers_provider_then_reconciled() {
+        let covered = super::super::cache_metering::CacheUsage {
+            cache_read: 0,
+            cache_covered_est: 10,
+            prompt_total_est: 10,
+        };
+        assert_eq!(UsageSource::resolve(true, true, &covered), UsageSource::Provider);
+        assert_eq!(UsageSource::resolve(false, true, &covered), UsageSource::Reconciled);
+        assert_eq!(UsageSource::resolve(false, false, &covered), UsageSource::Simulated);
+        assert_eq!(
+            UsageSource::resolve(false, false, &Default::default()),
+            UsageSource::None
+        );
+        assert_eq!(UsageSource::Reconciled.as_db(), Some("reconciled"));
     }
 
     #[test]

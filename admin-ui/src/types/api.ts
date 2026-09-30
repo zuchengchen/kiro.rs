@@ -673,7 +673,7 @@ export interface TraceRecord {
 }
 
 export type StickyOutcome = 'hit' | 'miss_first' | 'miss_unavailable' | 'off'
-export type UsageSource = 'provider' | 'simulated' | 'none' | 'fixed'
+export type UsageSource = 'provider' | 'simulated' | 'reconciled' | 'none' | 'fixed'
 
 /** 链路查询参数 */
 export interface TraceQuery {

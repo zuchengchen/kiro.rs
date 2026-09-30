@@ -1424,6 +1424,8 @@ fn usage_json_with_metering(
         cache_creation_input_tokens,
         cache_read_input_tokens,
     );
+    // 流内唯一一次的终值：下游应以它整体覆盖 message_start 的请求时估算（含 0）。
+    usage_json["usage_final"] = json!(true);
     if let Some(m) = metering {
         usage_json["credit_usage"] = json!(m.usage);
         usage_json["credit_unit"] = json!(m.unit);
@@ -1511,6 +1513,8 @@ pub struct StreamContext {
     upstream_stop_reason: Option<String>,
     /// 流内上游失败；置位后收尾走 error 事件，不发 message_delta / message_stop。
     upstream_terminal_error: Option<UpstreamTerminalError>,
+    /// 流结束后按上游 credits 修正 CacheMeter 拆分（默认读环境变量，测试可直接赋值）。
+    pub credit_reconcile: bool,
 }
 
 impl StreamContext {
@@ -1535,7 +1539,31 @@ impl StreamContext {
         }
 
         let total_real = self.context_input_tokens.unwrap_or(self.input_tokens);
-        self.cache_usage.split_against_total(total_real)
+        let split = self.cache_usage.split_against_total(total_real);
+        self.credit_reconciled_split(split).unwrap_or(split)
+    }
+
+    /// message_start 发出时 credits 还是 0，这里恒为 None；流结束后才可能生效。
+    fn credit_reconciled_split(&self, split: (i32, i32, i32)) -> Option<(i32, i32, i32)> {
+        if !self.credit_reconcile {
+            return None;
+        }
+        super::credit_cache_reconcile::reconcile_split(
+            &self.model,
+            split,
+            self.output_tokens,
+            self.credits,
+        )
+    }
+
+    /// 本次 usage 是否经过 credits 修正（写入 trace 的 usage_source）。
+    pub fn usage_reconciled(&self) -> bool {
+        if self.provider_token_usage.is_some() {
+            return false;
+        }
+        let total_real = self.context_input_tokens.unwrap_or(self.input_tokens);
+        self.credit_reconciled_split(self.cache_usage.split_against_total(total_real))
+            .is_some()
     }
 
     /// 精确 provider 输出 token 优先，否则返回流内容的本地估算。
@@ -1627,6 +1655,7 @@ impl StreamContext {
             tool_use_xml_filter: ToolUseXmlLeakFilter::default(),
             upstream_stop_reason: None,
             upstream_terminal_error: None,
+            credit_reconcile: super::credit_cache_reconcile::enabled_from_env(),
         }
     }
 
@@ -2939,6 +2968,11 @@ impl BufferedStreamContext {
     /// 本地 CacheMeter 的覆盖情况
     pub fn cache_usage(&self) -> &super::cache_metering::CacheUsage {
         &self.inner.cache_usage
+    }
+
+    /// 本次 usage 是否经过 credits 修正（转发内部 StreamContext）。
+    pub fn usage_reconciled(&self) -> bool {
+        self.inner.usage_reconciled()
     }
 
     /// 工具调用 JSON 错误信息（转发内部 StreamContext）。缓冲流据此记 error。
@@ -5885,6 +5919,109 @@ mod tests {
         assert!(usage.get("credit_usage").is_none());
         assert!(usage.get("credit_unit").is_none());
         assert!(usage.get("credit_unit_plural").is_none());
+        // 终值 marker 与是否收到 meteringEvent 无关
+        assert_eq!(usage["usage_final"], json!(true));
+    }
+
+    #[test]
+    fn final_delta_reconciles_concurrent_write_from_credits() {
+        use crate::anthropic::cache_metering::CacheUsage;
+
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-5.5",
+            828_840,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        ctx.credit_reconcile = true;
+        ctx.cache_usage = CacheUsage {
+            cache_read: 0,
+            cache_covered_est: 828_840,
+            prompt_total_est: 828_840,
+        };
+        let initial = ctx.generate_initial_events();
+        let start = initial
+            .iter()
+            .find(|e| e.event == "message_start")
+            .expect("must have message_start");
+        let start_usage = &start.data["message"]["usage"];
+        assert_eq!(start_usage["cache_creation_input_tokens"], json!(828_840));
+        assert_eq!(start_usage["cache_read_input_tokens"], json!(0));
+        assert!(start_usage.get("usage_final").is_none());
+
+        ctx.output_tokens = 387;
+        let _ = ctx.process_kiro_event(&Event::Metering(parse_metering(
+            r#"{"unit":"credit","unitPlural":"credits","usage":2.913}"#,
+        )));
+        let events = ctx.generate_final_events();
+        let usage = &events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("must have message_delta")
+            .data["usage"];
+        assert_eq!(usage["input_tokens"], json!(0));
+        assert_eq!(usage["cache_creation_input_tokens"], json!(0));
+        assert_eq!(usage["cache_read_input_tokens"], json!(828_840));
+        assert_eq!(usage["cache_creation"]["ephemeral_1h_input_tokens"], json!(0));
+        assert_eq!(usage["usage_final"], json!(true));
+        assert!(ctx.usage_reconciled());
+    }
+
+    #[test]
+    fn reconcile_disabled_keeps_simulated_write() {
+        use crate::anthropic::cache_metering::CacheUsage;
+
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-5.5",
+            828_840,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        ctx.credit_reconcile = false;
+        ctx.cache_usage = CacheUsage {
+            cache_read: 0,
+            cache_covered_est: 828_840,
+            prompt_total_est: 828_840,
+        };
+        ctx.output_tokens = 387;
+        ctx.credits = 2.913;
+        assert_eq!(ctx.resolved_usage(), (0, 828_840, 0));
+        assert!(!ctx.usage_reconciled());
+    }
+
+    #[test]
+    fn reconcile_is_skipped_when_provider_usage_is_present() {
+        use crate::anthropic::cache_metering::CacheUsage;
+        use crate::kiro::model::events::MetadataEvent;
+
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-5.5",
+            828_840,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        ctx.credit_reconcile = true;
+        ctx.cache_usage = CacheUsage {
+            cache_read: 0,
+            cache_covered_est: 828_840,
+            prompt_total_est: 828_840,
+        };
+        ctx.output_tokens = 387;
+        ctx.credits = 2.913;
+        let _ = ctx.process_kiro_event(&Event::Metadata(MetadataEvent {
+            token_usage: Some(TokenUsage {
+                uncached_input_tokens: 0,
+                output_tokens: 387,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 828_840,
+            }),
+            stop_reason: None,
+        }));
+        assert_eq!(ctx.resolved_usage(), (0, 828_840, 0));
+        assert!(!ctx.usage_reconciled());
     }
 
     #[test]
