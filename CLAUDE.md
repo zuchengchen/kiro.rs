@@ -79,9 +79,9 @@ patch version number`），所以三个版本文件里写的是 semver build met
 
 | 文件 | 值 |
 |---|---|
-| `Cargo.toml` | `0.9.0+7` |
-| `Cargo.lock`（kiro-rs 自身条目） | `0.9.0+7` |
-| `admin-ui/package.json` | `0.9.0+7` |
+| `Cargo.toml` | `0.9.0+8` |
+| `Cargo.lock`（kiro-rs 自身条目） | `0.9.0+8` |
+| `admin-ui/package.json` | `0.9.0+8` |
 
 `display_version()`（`src/admin/service.rs`）在对外暴露时把 `+1` 还原成 `.1`，
 Admin UI 显示 `v0.9.0.1`。`parse_semver_core()` 返回 `[u32; 4]`，两种形式都解析
@@ -118,6 +118,7 @@ image tag 和 `deployment-*.json` 沿用同一个编号（`kiro-rs:0.9.0.1`）�
 | `d695717` | 去掉 Claude 90% 改写，usage 按官方断点语义（provider / CacheMeter）；本地模拟 TTL 1 小时；最小可缓存长度；写入在响应开始后可见 |
 | `fb9291c` | 生产路径对漏标 `cache_control` 的请求补顶层自动断点（1h ephemeral） |
 | `b60dc1c` | Anthropic usage 带上 `cache_creation.ephemeral_1h_input_tokens`，Sub2API 使用记录才能显示 1h 缓存创建 |
+| `d869950` | CacheMeter 把字符串 message content 按单个 text block 签名；否则 Claude Code 尾断点下一轮退回字符串后永不命中，长会话每轮误报 ~47 万 cache_creation |
 | `0338d8b` | 凭据 ID 跨重启单调（`src/kiro/credential_id_watermark.rs`）：删号 + 重启不再把旧 ID 分给新账号 |
 | `9065d67` | API Key / PKCE 用系统熵源生成（`src/common/secure_random.rs`），不再用 `fastrand` |
 
