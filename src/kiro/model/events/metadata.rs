@@ -75,6 +75,9 @@ pub struct MetadataEvent {
     /// 有些 metadataEvent 只携带 stopReason，因此 tokenUsage 必须保持可选。
     #[serde(default)]
     pub token_usage: Option<TokenUsage>,
+    /// 上游真实结束原因（如 "end_turn" / "max_tokens" / "tool_use"）。
+    #[serde(default)]
+    pub stop_reason: Option<String>,
 }
 
 impl EventPayload for MetadataEvent {
@@ -108,12 +111,14 @@ mod tests {
         assert_eq!(usage.cache_read_input_tokens, 300);
         assert_eq!(usage.cache_write_input_tokens, 40);
         assert_eq!(usage.total_input_tokens(), 441);
+        assert_eq!(event.stop_reason.as_deref(), Some("end_turn"));
     }
 
     #[test]
     fn metadata_without_token_usage_is_not_treated_as_zero_truth() {
         let event: MetadataEvent = serde_json::from_str(r#"{"stopReason":"end_turn"}"#).unwrap();
         assert!(event.token_usage.is_none());
+        assert_eq!(event.stop_reason.as_deref(), Some("end_turn"));
     }
 
     #[test]

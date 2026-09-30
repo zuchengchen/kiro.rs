@@ -1201,7 +1201,18 @@ fn create_sse_stream(
                             // 累积器，据此判定是否有半截 / 非法工具调用 JSON）。
                             let final_events = ctx.generate_final_events();
                             settlement.update(&ctx, sent_bytes);
-                            if let Some(message) = ctx.tool_json_error_message() {
+                            // 上游流内失败优先于工具 JSON 错误（与 generate_final_events 的判定顺序一致）：
+                            // 半截 tool_use 往往只是上游故障的症状。
+                            if let Some(message) = ctx.upstream_terminal_error_message() {
+                                // 上游流内报错 / 推理后无输出：客户端已收到 error 事件，记为瞬态错误。
+                                settlement.finish(
+                                    "error",
+                                    "error",
+                                    Some(outcome::TRANSIENT),
+                                    Some(&message),
+                                    None,
+                                );
+                            } else if let Some(message) = ctx.tool_json_error_message() {
                                 // 工具调用 JSON 半截 / 非法：实时流已回 200，无法改状态码，
                                 // 只能记 error 并让 generate_final_events 补发的 `error` 事件透传给客户端。
                                 settlement.finish(
@@ -2327,7 +2338,16 @@ fn create_buffered_sse_stream(
                                     credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
                                     source: UsageSource::resolve(ctx.has_provider_usage(), ctx.cache_usage()),
                                 };
-                                if let Some(message) = ctx.tool_json_error_message() {
+                                if let Some(message) = ctx.upstream_terminal_error_message() {
+                                    hook.record(credential_id, i, o, cc, cr, credits, "error");
+                                    tracer.finalize(
+                                        "error",
+                                        Some(outcome::TRANSIENT),
+                                        Some(&message),
+                                        None,
+                                        trace_usage,
+                                    );
+                                } else if let Some(message) = ctx.tool_json_error_message() {
                                     hook.record(credential_id, i, o, cc, cr, credits, "error");
                                     tracer.finalize(
                                         "error",

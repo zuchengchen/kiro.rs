@@ -963,6 +963,28 @@ impl ToolJsonAccumulatorError {
     }
 }
 
+/// 流内上游失败：错误 / 异常帧，或上游在推理后直接结束、没有正文也没有工具调用。
+/// 这类结束不能再伪装成 `max_tokens`（客户端会报「输出上限」并停止），而要以
+/// Anthropic `error` 事件结束，让客户端按瞬态错误重试。
+#[derive(Debug, Clone)]
+pub struct UpstreamTerminalError {
+    pub error_type: &'static str,
+    /// 下发给客户端的固定文案。不含上游原文：异常帧 payload 可能带账号 / ARN /
+    /// request id（与 `map_provider_error` 不回显上游原文的约定一致）。
+    pub client_message: &'static str,
+    /// 上游原始错误（类型 + payload），仅用于日志 / traces / usage_log。
+    pub detail: String,
+}
+
+const UPSTREAM_API_ERROR_TYPE: &str = "api_error";
+const UPSTREAM_OVERLOADED_ERROR_TYPE: &str = "overloaded_error";
+// 以下文案都必须带 "unavailable"：Kilo / opencode 的重试判定按消息关键词识别瞬态错误。
+const THINKING_ONLY_ERROR_MESSAGE: &str = "Upstream model became unavailable: the stream ended after reasoning without any answer text or tool call. Please retry.";
+const UPSTREAM_OVERLOADED_ERROR_MESSAGE: &str =
+    "Upstream model temporarily unavailable (overloaded) mid-stream. Please retry.";
+const UPSTREAM_MID_STREAM_ERROR_MESSAGE: &str =
+    "Upstream model unavailable: the stream failed mid-response. Please retry.";
+
 impl std::fmt::Display for ToolJsonAccumulatorError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.message())
@@ -1315,19 +1337,13 @@ impl SseStateManager {
         // 发送 message_delta
         if !self.message_delta_sent {
             self.message_delta_sent = true;
-            let mut usage_json = super::usage_cache_breakdown::usage_json(
+            let usage_json = usage_json_with_metering(
                 input_tokens,
                 output_tokens,
                 cache_creation_input_tokens,
                 cache_read_input_tokens,
+                metering,
             );
-            // 透传上游 meteringEvent 的 credit_* 字段，让客户端拿到与 Kiro
-            // 后端口径一致的计费元数据；只在收到过 meteringEvent 时才追加。
-            if let Some(m) = metering {
-                usage_json["credit_usage"] = json!(m.usage);
-                usage_json["credit_unit"] = json!(m.unit);
-                usage_json["credit_unit_plural"] = json!(m.unit_plural);
-            }
             events.push(SseEvent::new(
                 "message_delta",
                 json!({
@@ -1390,6 +1406,31 @@ impl SseStateManager {
 }
 
 use super::converter::get_context_window_size;
+
+/// message_delta / 上游失败 error 事件共用的 usage 对象。
+///
+/// 透传上游 meteringEvent 的 credit_* 字段，让客户端拿到与 Kiro 后端口径一致的
+/// 计费元数据；只在收到过 meteringEvent 时才追加。
+fn usage_json_with_metering(
+    input_tokens: i32,
+    output_tokens: i32,
+    cache_creation_input_tokens: i32,
+    cache_read_input_tokens: i32,
+    metering: Option<&MeteringEvent>,
+) -> serde_json::Value {
+    let mut usage_json = super::usage_cache_breakdown::usage_json(
+        input_tokens,
+        output_tokens,
+        cache_creation_input_tokens,
+        cache_read_input_tokens,
+    );
+    if let Some(m) = metering {
+        usage_json["credit_usage"] = json!(m.usage);
+        usage_json["credit_unit"] = json!(m.unit);
+        usage_json["credit_unit_plural"] = json!(m.unit_plural);
+    }
+    usage_json
+}
 
 /// 流处理上下文
 pub struct StreamContext {
@@ -1466,6 +1507,10 @@ pub struct StreamContext {
     tool_json_error: Option<ToolJsonAccumulatorError>,
     /// 跨 chunk 过滤混入 assistant 文本的字面 `<tool_use>` XML 泄漏。
     tool_use_xml_filter: ToolUseXmlLeakFilter,
+    /// 上游 metadataEvent.stopReason 原值（仅用于判定与日志）。
+    upstream_stop_reason: Option<String>,
+    /// 流内上游失败；置位后收尾走 error 事件，不发 message_delta / message_stop。
+    upstream_terminal_error: Option<UpstreamTerminalError>,
 }
 
 impl StreamContext {
@@ -1507,6 +1552,40 @@ impl StreamContext {
         self.tool_json_error.as_ref().map(|err| err.message())
     }
 
+    /// 流内上游失败的错误信息（错误 / 异常帧，或无超限信号的 thinking-only 结束）。
+    /// 上层据此把本次请求记为 error 而非 success。
+    /// 返回的是内部详情（含上游原文），只能进日志 / traces，不能下发客户端。
+    pub fn upstream_terminal_error_message(&self) -> Option<String> {
+        self.upstream_terminal_error
+            .as_ref()
+            .map(|err| err.detail.clone())
+    }
+
+    /// 记录首个流内上游失败；后续帧通常是同一故障的附带信息，不覆盖根因。
+    fn record_upstream_terminal_error(&mut self, kind: &str, detail: &str) {
+        if self.upstream_terminal_error.is_some() {
+            return;
+        }
+        let lowered = detail.to_ascii_lowercase();
+        let overloaded = lowered.contains("temporarily_unavailable")
+            || lowered.contains("high load")
+            || lowered.contains("throttl")
+            || lowered.contains("overloaded");
+        let (error_type, client_message) = if overloaded {
+            (
+                UPSTREAM_OVERLOADED_ERROR_TYPE,
+                UPSTREAM_OVERLOADED_ERROR_MESSAGE,
+            )
+        } else {
+            (UPSTREAM_API_ERROR_TYPE, UPSTREAM_MID_STREAM_ERROR_MESSAGE)
+        };
+        self.upstream_terminal_error = Some(UpstreamTerminalError {
+            error_type,
+            client_message,
+            detail: format!("Upstream model unavailable mid-stream ({kind}): {detail}"),
+        });
+    }
+
     /// 创建 StreamContext
     pub fn new_with_thinking(
         model: impl Into<String>,
@@ -1546,6 +1625,8 @@ impl StreamContext {
             tool_json_accumulator: ToolJsonAccumulator::new(),
             tool_json_error: None,
             tool_use_xml_filter: ToolUseXmlLeakFilter::default(),
+            upstream_stop_reason: None,
+            upstream_terminal_error: None,
         }
     }
 
@@ -1621,6 +1702,15 @@ impl StreamContext {
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::ReasoningContent(reasoning) => self.process_reasoning_content(reasoning),
             Event::Metadata(metadata) => {
+                if let Some(reason) = metadata.stop_reason.as_deref() {
+                    tracing::debug!(stop_reason = reason, "收到 metadataEvent.stopReason");
+                    self.upstream_stop_reason = Some(reason.to_string());
+                    // 只信任上游明确的超限信号；end_turn / tool_use 仍由内容块推导，
+                    // 避免覆盖 contextUsage 设置的 model_context_window_exceeded。
+                    if reason == "max_tokens" {
+                        self.state_manager.set_stop_reason("max_tokens");
+                    }
+                }
                 if let Some(usage) = metadata.token_usage {
                     let usage = usage.sanitized();
                     tracing::debug!(
@@ -1673,17 +1763,22 @@ impl StreamContext {
                 error_message,
             } => {
                 tracing::error!("收到错误事件: {} - {}", error_code, error_message);
+                self.record_upstream_terminal_error(error_code, error_message);
                 Vec::new()
             }
             Event::Exception {
                 exception_type,
                 message,
             } => {
-                // 处理 ContentLengthExceededException
-                if exception_type == "ContentLengthExceededException" {
-                    self.state_manager.set_stop_reason("max_tokens");
-                }
                 tracing::warn!("收到异常事件: {} - {}", exception_type, message);
+                if exception_type == "ContentLengthExceededException" {
+                    // 唯一的真实输出超限信号
+                    self.state_manager.set_stop_reason("max_tokens");
+                } else {
+                    // 其余异常（如 MODEL_TEMPORARILY_UNAVAILABLE）说明本次生成已失败，
+                    // 不能再让流按正常完成收尾。
+                    self.record_upstream_terminal_error(exception_type, message);
+                }
                 Vec::new()
             }
             _ => Vec::new(),
@@ -2558,30 +2653,33 @@ impl StreamContext {
             self.thinking_buffer.clear();
         }
 
-        // 如果整个流中只产生了 thinking 块，没有 text 也没有 tool_use，
-        // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上），
-        // 并补发一套完整的 text 事件（内容为一个空格），确保 content 数组中有 text 块
-        if self.thinking_enabled
-            && self.thinking_block_index.is_some()
-            && !self.state_manager.has_non_thinking_blocks()
-        {
-            // 这里是推断而非上游信号：只有 ContentLengthExceededException 会预先把
-            // stop_reason 置为 max_tokens。记录下来，便于区分「真的耗尽预算」与
-            // 「结束标签漏判 / 上游只回了 thinking」。
-            tracing::warn!(
-                model = %self.model,
-                upstream_stop_reason = %self.state_manager.get_stop_reason(),
-                output_tokens = self.resolved_output_tokens(),
-                "流中只产生了 thinking 块，按 max_tokens 结束"
-            );
-            self.state_manager.set_stop_reason("max_tokens");
-            events.extend(self.create_text_delta_events(" "));
-        }
-
-        // Flush invoke 嗅探缓冲区的残留：先再嗅探一次完整块（万一最后一块就是完整 invoke），
-        // 剩下的走 emit_text_delta_raw flush 出去（防尾字节丢）。
+        // Flush invoke 嗅探缓冲区（原先在 thinking-only 判定之后）：残留可能是正文或
+        // `<invoke>` 工具调用，必须先发出，否则会被误判为「只有 thinking」。
         if !self.invoke_sniff_buffer.is_empty() {
             events.extend(self.drain_invoke_sniff_buffer(true));
+        }
+
+        let thinking_only = self.thinking_enabled
+            && self.thinking_block_index.is_some()
+            && !self.state_manager.has_non_thinking_blocks();
+
+        // 上游在流内报过错误 / 异常帧：不论已产出多少内容都以 error 结束，
+        // 不能用 message_delta 伪装成正常完成或输出超限。
+        // 必须先于工具调用累积器检查：上游故障常常打断写到一半的 tool_use，
+        // 那时半截 JSON 只是症状，按 upstream_tool_json_error 上报会让客户端
+        // 当成不可重试错误，并把瞬态故障记成 BAD_REQUEST。
+        if let Some(err) = self.upstream_terminal_error.clone() {
+            tracing::warn!(
+                model = %self.model,
+                error_type = err.error_type,
+                thinking_only,
+                upstream_stop_reason = self.upstream_stop_reason.as_deref().unwrap_or("-"),
+                output_tokens = self.resolved_output_tokens(),
+                "上游流内报错，以 error 事件结束: {}",
+                err.detail
+            );
+            events.extend(self.generate_upstream_terminal_error_events(&err));
+            return events;
         }
 
         // 收尾检查工具调用累积器：若仍有 tool_use 从未收到 stop=true（上游在参数
@@ -2603,6 +2701,42 @@ impl StreamContext {
             return events;
         }
 
+        if thinking_only {
+            let stop_reason = self.state_manager.get_stop_reason();
+            let real_limit =
+                stop_reason == "max_tokens" || stop_reason == "model_context_window_exceeded";
+            tracing::warn!(
+                model = %self.model,
+                resolved_stop_reason = %stop_reason,
+                upstream_stop_reason = self.upstream_stop_reason.as_deref().unwrap_or("-"),
+                output_tokens = self.resolved_output_tokens(),
+                real_limit,
+                "流中只产生了 thinking 块"
+            );
+            if real_limit {
+                // 上游明确超限：保留 stop_reason，补一个空格文本块，满足客户端
+                // 「content 里必须有 text 块」的要求（原有行为）。
+                events.extend(self.create_text_delta_events(" "));
+                // 嗅探缓冲区已在上面 flush 过；这里补发的空格也必须立即吐出，不能留在缓冲区。
+                if !self.invoke_sniff_buffer.is_empty() {
+                    events.extend(self.drain_invoke_sniff_buffer(true));
+                }
+            } else {
+                // 没有任何超限信号：上游推理后直接结束。改为可重试的 error。
+                let err = UpstreamTerminalError {
+                    error_type: UPSTREAM_API_ERROR_TYPE,
+                    client_message: THINKING_ONLY_ERROR_MESSAGE,
+                    detail: format!(
+                        "{THINKING_ONLY_ERROR_MESSAGE} (resolved_stop_reason={stop_reason}, upstream_stop_reason={})",
+                        self.upstream_stop_reason.as_deref().unwrap_or("-")
+                    ),
+                };
+                events.extend(self.generate_upstream_terminal_error_events(&err));
+                self.upstream_terminal_error = Some(err);
+                return events;
+            }
+        }
+
         // 精确 metadata 真值优先；缺失时才使用 contextUsage/估算回退。
         let (final_input_tokens, cache_creation, cache_read) = self.resolved_usage();
         let final_output_tokens = self.resolved_output_tokens();
@@ -2616,6 +2750,30 @@ impl StreamContext {
             self.metering.as_ref(),
         ));
 
+        events
+    }
+
+    /// 上游流内失败的异常终态：固定文案的 `error` 事件，并在事件顶层附带与
+    /// message_delta 同口径的 `usage`。error 路径不发 message_delta，下游
+    /// （sub2api 等）只能从这里拿到已消耗的输出用量；Anthropic 客户端会忽略该扩展字段。
+    fn generate_upstream_terminal_error_events(
+        &mut self,
+        err: &UpstreamTerminalError,
+    ) -> Vec<SseEvent> {
+        let (input_tokens, cache_creation, cache_read) = self.resolved_usage();
+        let usage = usage_json_with_metering(
+            input_tokens,
+            self.resolved_output_tokens(),
+            cache_creation,
+            cache_read,
+            self.metering.as_ref(),
+        );
+        let mut events = self.generate_error_events(err.error_type, err.client_message);
+        if let Some(last) = events.last_mut()
+            && last.event == "error"
+        {
+            last.data["usage"] = usage;
+        }
         events
     }
 
@@ -2786,6 +2944,11 @@ impl BufferedStreamContext {
     /// 工具调用 JSON 错误信息（转发内部 StreamContext）。缓冲流据此记 error。
     pub fn tool_json_error_message(&self) -> Option<String> {
         self.inner.tool_json_error_message()
+    }
+
+    /// 流内上游失败信息（转发内部 StreamContext）。缓冲流据此记 error。
+    pub fn upstream_terminal_error_message(&self) -> Option<String> {
+        self.inner.upstream_terminal_error_message()
     }
 }
 
@@ -4608,65 +4771,218 @@ mod tests {
         assert_eq!(text, "world", "text should be 'world', got: {:?}", text);
     }
 
-    #[test]
-    fn test_thinking_only_sets_max_tokens_stop_reason() {
-        // 整个流只有 thinking 块，没有 text 也没有 tool_use，stop_reason 应为 max_tokens
+    fn thinking_ctx() -> StreamContext {
         let mut ctx = StreamContext::new_with_thinking(
-            "test-model",
+            "claude-opus-5.5",
             1,
             true,
             HashMap::new(),
             test_known_tools(),
         );
-        let _initial_events = ctx.generate_initial_events();
+        let _ = ctx.generate_initial_events();
+        ctx
+    }
 
-        let mut all_events = Vec::new();
-        all_events.extend(ctx.process_assistant_response("<thinking>\nabc</thinking>"));
-        all_events.extend(ctx.generate_final_events());
+    fn reasoning_evt(text: &str) -> Event {
+        Event::ReasoningContent(crate::kiro::model::events::ReasoningContentEvent {
+            text: Some(text.to_string()),
+            ..Default::default()
+        })
+    }
 
-        let message_delta = all_events
+    /// 断言以 error 事件结束且没有正常完成事件，返回 error.message。
+    fn assert_ends_with_error(events: &[SseEvent], error_type: &str) -> String {
+        let last = events.last().expect("should emit events");
+        assert_eq!(last.event, "error");
+        assert_eq!(last.data["error"]["type"], json!(error_type));
+        assert!(
+            events
+                .iter()
+                .all(|e| e.event != "message_delta" && e.event != "message_stop"),
+            "error termination must not emit message_delta/message_stop"
+        );
+        last.data["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn test_thinking_only_without_limit_signal_ends_with_retryable_error() {
+        let mut ctx = thinking_ctx();
+        let mut all = ctx.process_assistant_response("<thinking>\nabc</thinking>");
+        all.extend(ctx.generate_final_events());
+
+        let message = assert_ends_with_error(&all, "api_error");
+        assert!(message.to_lowercase().contains("unavailable"), "{message}");
+        assert!(ctx.upstream_terminal_error_message().is_some());
+        assert!(!all.iter().any(|e| {
+            e.event == "content_block_delta"
+                && e.data["delta"]["type"] == "text_delta"
+                && e.data["delta"]["text"] == " "
+        }));
+    }
+
+    #[test]
+    fn test_native_reasoning_only_ends_with_retryable_error() {
+        let mut ctx = thinking_ctx();
+        let mut all = ctx.process_kiro_event(&reasoning_evt("plan the review"));
+        all.extend(ctx.generate_final_events());
+        assert_ends_with_error(&all, "api_error");
+    }
+
+    #[test]
+    fn test_thinking_only_with_content_length_exceeded_keeps_max_tokens() {
+        let mut ctx = thinking_ctx();
+        let mut all = ctx.process_kiro_event(&reasoning_evt("long plan"));
+        all.extend(ctx.process_kiro_event(&Event::Exception {
+            exception_type: "ContentLengthExceededException".to_string(),
+            message: "too long".to_string(),
+        }));
+        all.extend(ctx.generate_final_events());
+
+        let delta = all
             .iter()
             .find(|e| e.event == "message_delta")
-            .expect("should have message_delta event");
+            .expect("should have message_delta");
+        assert_eq!(delta.data["delta"]["stop_reason"], "max_tokens");
+        assert!(all.iter().any(|e| {
+            e.event == "content_block_delta"
+                && e.data["delta"]["type"] == "text_delta"
+                && e.data["delta"]["text"] == " "
+        }));
+        assert!(ctx.upstream_terminal_error_message().is_none());
+    }
 
-        assert_eq!(
-            message_delta.data["delta"]["stop_reason"], "max_tokens",
-            "stop_reason should be max_tokens when only thinking is produced"
-        );
+    #[test]
+    fn test_thinking_only_with_metadata_max_tokens_keeps_max_tokens() {
+        let mut ctx = thinking_ctx();
+        let mut all = ctx.process_kiro_event(&reasoning_evt("long plan"));
+        all.extend(ctx.process_kiro_event(&Event::Metadata(
+            crate::kiro::model::events::MetadataEvent {
+                token_usage: None,
+                stop_reason: Some("max_tokens".to_string()),
+            },
+        )));
+        all.extend(ctx.generate_final_events());
 
-        // 应补发一套完整的 text 事件（content_block_start + delta 空格 + content_block_stop）
-        assert!(
-            all_events.iter().any(|e| {
-                e.event == "content_block_start" && e.data["content_block"]["type"] == "text"
-            }),
-            "should emit text content_block_start"
-        );
-        assert!(
-            all_events.iter().any(|e| {
-                e.event == "content_block_delta"
-                    && e.data["delta"]["type"] == "text_delta"
-                    && e.data["delta"]["text"] == " "
-            }),
-            "should emit text_delta with a single space"
-        );
-        // text block 应被 generate_final_events 自动关闭
-        let text_block_index = all_events
+        let delta = all
             .iter()
-            .find_map(|e| {
-                if e.event == "content_block_start" && e.data["content_block"]["type"] == "text" {
-                    e.data["index"].as_i64()
-                } else {
-                    None
-                }
-            })
-            .expect("text block should exist");
+            .find(|e| e.event == "message_delta")
+            .expect("should have message_delta");
+        assert_eq!(delta.data["delta"]["stop_reason"], "max_tokens");
+    }
+
+    #[test]
+    fn test_model_temporarily_unavailable_exception_ends_with_overloaded_error() {
+        let mut ctx = thinking_ctx();
+        let mut all = ctx.process_kiro_event(&reasoning_evt("thinking"));
+        all.extend(ctx.process_kiro_event(&Event::Exception {
+            exception_type: "error".to_string(),
+            message: r#"{"message":"Encountered unexpectedly high load when processing the request, please try again.","reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#.to_string(),
+        }));
+        all.extend(ctx.generate_final_events());
+
+        let message = assert_ends_with_error(&all, "overloaded_error");
+        assert!(message.to_lowercase().contains("unavailable"), "{message}");
+        // 客户端只拿固定文案；上游原文只留在内部详情里（日志 / traces）。
+        assert_eq!(message, UPSTREAM_OVERLOADED_ERROR_MESSAGE);
+        assert!(!message.contains("MODEL_TEMPORARILY_UNAVAILABLE"));
+        assert!(!message.contains("high load"));
+        let detail = ctx.upstream_terminal_error_message().unwrap();
+        assert!(detail.contains("MODEL_TEMPORARILY_UNAVAILABLE"), "{detail}");
+    }
+
+    #[test]
+    fn test_upstream_error_frame_does_not_expose_raw_payload() {
+        let mut ctx = thinking_ctx();
+        let mut all = ctx.process_assistant_response("<thinking>\nplan\n</thinking>\n\nhi");
+        all.extend(ctx.process_kiro_event(&Event::Exception {
+            exception_type: "AccessDeniedException".to_string(),
+            message:
+                "aws-account=123456789012 request-id=req-secret profileArn=arn:aws:x".to_string(),
+        }));
+        all.extend(ctx.generate_final_events());
+
+        let message = assert_ends_with_error(&all, "api_error");
+        assert_eq!(message, UPSTREAM_MID_STREAM_ERROR_MESSAGE);
+        let wire: String = all.iter().map(|e| e.data.to_string()).collect();
+        for secret in [
+            "123456789012",
+            "req-secret",
+            "arn:aws",
+            "AccessDeniedException",
+        ] {
+            assert!(!wire.contains(secret), "leaked {secret}: {wire}");
+        }
         assert!(
-            all_events.iter().any(|e| {
-                e.event == "content_block_stop"
-                    && e.data["index"].as_i64() == Some(text_block_index)
-            }),
-            "text block should be stopped"
+            ctx.upstream_terminal_error_message()
+                .unwrap()
+                .contains("req-secret")
         );
+    }
+
+    #[test]
+    fn test_upstream_error_event_carries_usage() {
+        let mut ctx = thinking_ctx();
+        let mut all = ctx.process_kiro_event(&reasoning_evt("a fairly long reasoning plan"));
+        all.extend(ctx.process_kiro_event(&Event::Metadata(
+            crate::kiro::model::events::MetadataEvent {
+                token_usage: Some(TokenUsage {
+                    uncached_input_tokens: 3,
+                    output_tokens: 42,
+                    cache_read_input_tokens: 7,
+                    cache_write_input_tokens: 4,
+                }),
+                stop_reason: None,
+            },
+        )));
+        all.extend(ctx.generate_final_events());
+
+        assert_ends_with_error(&all, "api_error");
+        let usage = &all.last().unwrap().data["usage"];
+        assert_eq!(usage["output_tokens"], json!(42));
+        assert_eq!(usage["input_tokens"], json!(3));
+        assert_eq!(usage["cache_read_input_tokens"], json!(7));
+        assert_eq!(usage["cache_creation_input_tokens"], json!(4));
+    }
+
+    #[test]
+    fn test_upstream_error_mid_tool_use_wins_over_incomplete_tool_json() {
+        let mut ctx = thinking_ctx();
+        let mut all = ctx.process_kiro_event(&reasoning_evt("call a tool"));
+        all.extend(ctx.process_kiro_event(&Event::ToolUse(tool_evt(
+            "t1",
+            "read_file",
+            "{\"path\":\"/a",
+            false,
+        ))));
+        all.extend(ctx.process_kiro_event(&Event::Exception {
+            exception_type: "error".to_string(),
+            message: r#"{"reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#.to_string(),
+        }));
+        all.extend(ctx.generate_final_events());
+
+        let message = assert_ends_with_error(&all, "overloaded_error");
+        assert!(message.to_lowercase().contains("unavailable"), "{message}");
+        assert!(ctx.upstream_terminal_error_message().is_some());
+        assert!(
+            !all.iter()
+                .any(|e| e.data["error"]["type"] == json!("upstream_tool_json_error"))
+        );
+    }
+
+    #[test]
+    fn test_error_frame_after_text_ends_with_error_not_end_turn() {
+        let mut ctx = thinking_ctx();
+        let mut all =
+            ctx.process_assistant_response("<thinking>\nplan\n</thinking>\n\npartial answer");
+        all.extend(ctx.process_kiro_event(&Event::Error {
+            error_code: "InternalServerException".to_string(),
+            error_message: "stream aborted".to_string(),
+        }));
+        all.extend(ctx.generate_final_events());
+        assert_ends_with_error(&all, "api_error");
     }
 
     #[test]
@@ -5599,8 +5915,12 @@ mod tests {
                 cache_read_input_tokens: 7,
                 cache_write_input_tokens: 4,
             }),
+            stop_reason: None,
         }));
-        let _ = ctx.process_kiro_event(&Event::Metadata(MetadataEvent { token_usage: None }));
+        let _ = ctx.process_kiro_event(&Event::Metadata(MetadataEvent {
+            token_usage: None,
+            stop_reason: None,
+        }));
         assert_eq!(ctx.resolved_usage(), (3, 4, 7));
         assert_eq!(ctx.resolved_output_tokens(), 11);
 
@@ -5611,6 +5931,7 @@ mod tests {
                 cache_read_input_tokens: 23,
                 cache_write_input_tokens: 24,
             }),
+            stop_reason: None,
         }));
         assert_eq!(ctx.resolved_usage(), (0, 24, 23));
         assert_eq!(ctx.resolved_output_tokens(), 22);
@@ -5660,6 +5981,7 @@ mod tests {
         );
         ctx.process_and_buffer(&Event::Metadata(MetadataEvent {
             token_usage: Some(usage),
+            stop_reason: None,
         }));
         let events = ctx.finish_and_get_all_events();
 
@@ -5751,6 +6073,7 @@ mod tests {
                 cache_write_input_tokens: 4,
                 cache_read_input_tokens: 7,
             }),
+            stop_reason: None,
         }));
         let events = buffered.finish_and_get_all_events();
         assert_eq!(buffered.final_usage(), (3, 11, 4, 7, 0.0));
