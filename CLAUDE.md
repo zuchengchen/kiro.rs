@@ -79,9 +79,9 @@ patch version number`），所以三个版本文件里写的是 semver build met
 
 | 文件 | 值 |
 |---|---|
-| `Cargo.toml` | `0.9.0+10` |
-| `Cargo.lock`（kiro-rs 自身条目） | `0.9.0+10` |
-| `admin-ui/package.json` | `0.9.0+10` |
+| `Cargo.toml` | `0.9.0+11` |
+| `Cargo.lock`（kiro-rs 自身条目） | `0.9.0+11` |
+| `admin-ui/package.json` | `0.9.0+11` |
 
 `display_version()`（`src/admin/service.rs`）在对外暴露时把 `+1` 还原成 `.1`，
 Admin UI 显示 `v0.9.0.1`。`parse_semver_core()` 返回 `[u32; 4]`，两种形式都解析
@@ -123,6 +123,7 @@ image tag 和 `deployment-*.json` 沿用同一个编号（`kiro-rs:0.9.0.1`）�
 | `9deb935` | 不再伪造 `max_tokens`：读取 `metadataEvent.stopReason`，只有真实超限信号才保留；无超限信号的 thinking-only 与流内 error / 异常帧以可重试的 `error` 事件结束（固定文案，上游原文只进日志；附带 `usage`），traces 记 `transient`。须先上线配套的 sub2api `czc-v2026.09.30.2` |
 | `0338d8b` | 凭据 ID 跨重启单调（`src/kiro/credential_id_watermark.rs`）：删号 + 重启不再把旧 ID 分给新账号 |
 | `9065d67` | API Key / PKCE 用系统熵源生成（`src/common/secure_random.rs`），不再用 `fastrand` |
+| `7e8fb15` | 按上游 `meteringEvent.credits` 把并发同前缀请求误计的 cache_creation 改记为 read（`src/anthropic/credit_cache_reconcile.rs`，trace `usage_source = reconciled`）；`message_delta.usage` 带 `usage_final: true`。开关 `KIRO_RS_CREDIT_CACHE_RECONCILE` 默认关，依赖 Sub2API 支持 `usage_final`。合并上游时保住 `stream.rs::resolved_usage_raw` 与 `handlers.rs::resolve_non_stream_usage` 的调用点 |
 
 2026-09-28 全项目审查的其余修复（`8085197..HEAD`）都是对已有代码的缺陷修正，
 没有新功能，逐条见各自的提交说明。其中会影响合并判断的两处上游代码改动：
