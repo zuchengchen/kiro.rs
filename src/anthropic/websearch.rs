@@ -283,6 +283,7 @@ fn generate_websearch_events(
                     usage.uncached_input_tokens,
                     0,
                     usage.cache_write_input_tokens,
+                    0, // websearch 没有 CacheMeter 断点：写入全部按默认 5m
                     usage.cache_read_input_tokens,
                 )
             }

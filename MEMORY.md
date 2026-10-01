@@ -25,11 +25,19 @@
   `cache_read_input_tokens`；该模拟不会降低上游推理成本。
 - 只有顶层自动缓存或显式 block `cache_control` 才写入条目；自动断点落在最后一个
   合格 block，显式断点最多 4 个，读取从各断点回溯最多 20 个位置。生产计量入口在
-  客户端完全未声明断点时补顶层 ephemeral（1 小时），与官方 automatic caching 同形。
+  客户端完全未声明断点时补顶层 ephemeral（不写 ttl，走智能路由），与官方 automatic
+  caching 同形。
 - 连续 `tool_use` 和连续 `tool_result` 块分别只占一个回溯位置；断点只匹配此前真实
   写入的前缀，不为未声明的中间 block 建条目。
-- 本地模拟把 ephemeral 默认、`ttl=5m` 和 `ttl=1h` 都记成 1 小时；命中后按自身
-  TTL 滑动续期。
+- TTL：显式 `ttl=5m` 记 300 秒、`ttl=1h` 记 3600 秒，原样尊重。未写 ttl 默认 5m；
+  只有两条规则升 1h：R1 断点处累计前缀 ≥500K estimate token（生产 traces 回放的成本
+  拐点，约 8% 轮次）；R2 请求无 session、按 Key 共享，断点在 tools/system 段且前缀
+  ≥8192。升级取满足规则的最深断点，连同它之前未写 ttl 的断点一起升，遇显式 5m 停止，
+  保证 1h 永远在 5m 之前。客户端显式写成 1h 在 5m（或未写）之后时整次不模拟（官方 400）。
+  命中后按自身 TTL 滑动续期。
+- usage 的 `cache_creation.ephemeral_{5m,1h}_input_tokens` 按 1h 断点覆盖到的前缀位置
+  拆分（`CacheUsage::split_creation_ttl`）；上游精确 usage 与 credits 修正后的拆分同样
+  适用。websearch 路径没有 CacheMeter 断点，写入全部记 5m。
 - 缓存键覆盖完整结构化 block 与模型配置，并遵守 tools -> system -> messages 的
   失效层级；`tool_choice` 和图片存在性只使 message 前缀失效。
 - 本地条目按客户端 Key 与 session 组合隔离；共享系统 Key 缺少 session 时禁用模拟，

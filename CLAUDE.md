@@ -46,9 +46,12 @@ git push origin main-czc
 - `src/kiro/token_manager.rs` — 选号策略 + 取号路径（我们的限流内部等待在这里）
 - `src/kiro/provider.rs` — 重试循环、429 换桶
 - `src/anthropic/responses.rs` — 流式分流
-- `src/anthropic/cache_metering.rs` — 上游反复重写计量。我们在此文件里保留：本地
-  模拟 TTL 1 小时、按模型最小可缓存长度、新断点在响应开始后才可见。冲突时不要
-  丢掉这三处；不要再引入 Claude 固定 90% 命中改写。
+- `src/anthropic/cache_metering.rs` — 上游反复重写计量。我们在此文件里保留：TTL
+  智能路由（显式 5m/1h 原样、未写默认 5m、`resolve_unspecified_ttls` 的 1h 规则、
+  1h 断点必须在 5m 之前）、按模型最小可缓存长度、新断点在响应开始后才可见。冲突时
+  不要丢掉这三处；不要退回「全部记 1 小时」，也不要再引入 Claude 固定 90% 命中改写。
+  对外 5m/1h 拆分在 `usage_cache_breakdown.rs` + `CacheUsage::split_creation_ttl`，
+  新增 usage 出口要传 1h 份额，不能写死。
 
 **没报冲突不等于合对了。** v0.9.0 合并时：上游删掉的函数仍被我们调用（编译失败）、
 断言旧语义的测试被静默合入（测试失败）、上游新加的 `bind_session` 没覆盖我们的换桶
@@ -118,6 +121,7 @@ image tag 和 `deployment-*.json` 沿用同一个编号（`kiro-rs:0.9.0.1`）�
 | `d695717` | 去掉 Claude 90% 改写，usage 按官方断点语义（provider / CacheMeter）；本地模拟 TTL 1 小时；最小可缓存长度；写入在响应开始后可见 |
 | `fb9291c` | 生产路径对漏标 `cache_control` 的请求补顶层自动断点（1h ephemeral） |
 | `b60dc1c` | Anthropic usage 带上 `cache_creation.ephemeral_1h_input_tokens`，Sub2API 使用记录才能显示 1h 缓存创建 |
+| feature/cache-ttl-routing | 取代 `d695717` 的「本地 TTL 1 小时」与 `fb9291c` 的「补 1h 自动断点」：显式 ttl 原样，未写默认 5m（300s），只有超长上下文（断点前缀 ≥500K estimate token）或无 session 按 Key 共享的 tools/system 前缀（≥8192）升 1h；usage 按断点 TTL 拆 `ephemeral_5m` / `ephemeral_1h` |
 | `d869950` | CacheMeter 把字符串 message content 按单个 text block 签名；否则 Claude Code 尾断点下一轮退回字符串后永不命中，长会话每轮误报 ~47 万 cache_creation |
 | `e8505a6` | 流式/非流式 thinking 解析接受独占一行、后面只跟一个 `\n` 的 `</thinking>`；否则 Opus 5.5 的正文被当成 thinking，流末伪造 `max_tokens`，客户端报「推理时耗尽输出上限」 |
 | `9deb935` | 不再伪造 `max_tokens`：读取 `metadataEvent.stopReason`，只有真实超限信号才保留；无超限信号的 thinking-only 与流内 error / 异常帧以可重试的 `error` 事件结束（固定文案，上游原文只进日志；附带 `usage`），traces 记 `transient`。须先上线配套的 sub2api `czc-v2026.09.30.2` |

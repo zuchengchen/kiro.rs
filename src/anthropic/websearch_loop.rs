@@ -1031,6 +1031,7 @@ impl WebSearchSseEmitter {
             token_usage.uncached_input_tokens,
             token_usage.output_tokens,
             token_usage.cache_write_input_tokens,
+            0, // websearch 没有 CacheMeter 断点：写入全部按默认 5m
             token_usage.cache_read_input_tokens,
         );
         if let Some(metering) = metering {
@@ -1123,6 +1124,7 @@ fn initial_stream_event(model: &str, input_tokens: i32) -> SseEvent {
                     input_tokens,
                     0,
                     cache_creation,
+                    0,
                     cache_read,
                 )
             }
@@ -1685,6 +1687,7 @@ pub(crate) fn render_json(
         token_usage.uncached_input_tokens,
         token_usage.output_tokens,
         token_usage.cache_write_input_tokens,
+        0, // websearch 没有 CacheMeter 断点：写入全部按默认 5m
         token_usage.cache_read_input_tokens,
     );
     // 透传上游 meteringEvent 的 credit_* 字段，让客户端拿到与 Kiro 后端口径
@@ -1739,6 +1742,7 @@ fn build_sse_events(
                     token_usage.uncached_input_tokens,
                     0,
                     token_usage.cache_write_input_tokens,
+                    0, // websearch 没有 CacheMeter 断点：写入全部按默认 5m
                     token_usage.cache_read_input_tokens,
                 )
             }

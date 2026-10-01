@@ -1315,6 +1315,7 @@ impl SseStateManager {
         input_tokens: i32,
         output_tokens: i32,
         cache_creation_input_tokens: i32,
+        cache_creation_1h_input_tokens: i32,
         cache_read_input_tokens: i32,
         metering: Option<&MeteringEvent>,
     ) -> Vec<SseEvent> {
@@ -1341,6 +1342,7 @@ impl SseStateManager {
                 input_tokens,
                 output_tokens,
                 cache_creation_input_tokens,
+                cache_creation_1h_input_tokens,
                 cache_read_input_tokens,
                 metering,
             );
@@ -1415,6 +1417,7 @@ fn usage_json_with_metering(
     input_tokens: i32,
     output_tokens: i32,
     cache_creation_input_tokens: i32,
+    cache_creation_1h_input_tokens: i32,
     cache_read_input_tokens: i32,
     metering: Option<&MeteringEvent>,
 ) -> serde_json::Value {
@@ -1422,6 +1425,7 @@ fn usage_json_with_metering(
         input_tokens,
         output_tokens,
         cache_creation_input_tokens,
+        cache_creation_1h_input_tokens,
         cache_read_input_tokens,
     );
     // 流内唯一一次的终值：下游应以它整体覆盖 message_start 的请求时估算（含 0）。
@@ -1522,6 +1526,12 @@ impl StreamContext {
     /// `tokenUsage` 优先，否则按 CacheMeter 断点模拟。
     pub fn resolved_usage(&self) -> (i32, i32, i32) {
         self.resolved_usage_raw()
+    }
+
+    /// `cache_write` 中按 1h TTL 写入的部分（其余为 5m），由 CacheMeter 断点 TTL 决定。
+    pub fn cache_creation_1h(&self, usage: (i32, i32, i32)) -> i32 {
+        let (input, creation, read) = usage;
+        self.cache_usage.split_creation_ttl(input, creation, read).1
     }
 
     /// 解析 Anthropic 口径的 `(uncached_input, cache_write, cache_read)`。
@@ -1664,7 +1674,9 @@ impl StreamContext {
     /// usage 与 message_delta 走同一套拆分（[`Self::resolved_usage`]）：发出时上游还没回任何
     /// 用量，拆分的是请求时的输入估算（CacheMeter 或全量 input）。
     pub fn create_message_start_event(&self) -> serde_json::Value {
-        let (input_tokens, cache_creation, cache_read) = self.resolved_usage();
+        let usage = self.resolved_usage();
+        let (input_tokens, cache_creation, cache_read) = usage;
+        let cache_creation_1h = self.cache_creation_1h(usage);
         json!({
             "type": "message_start",
             "message": {
@@ -1679,6 +1691,7 @@ impl StreamContext {
                     input_tokens,
                     1,
                     cache_creation,
+                    cache_creation_1h,
                     cache_read,
                 )
             }
@@ -2767,7 +2780,9 @@ impl StreamContext {
         }
 
         // 精确 metadata 真值优先；缺失时才使用 contextUsage/估算回退。
-        let (final_input_tokens, cache_creation, cache_read) = self.resolved_usage();
+        let usage = self.resolved_usage();
+        let (final_input_tokens, cache_creation, cache_read) = usage;
+        let cache_creation_1h = self.cache_creation_1h(usage);
         let final_output_tokens = self.resolved_output_tokens();
 
         // 生成最终事件（message_delta + message_stop）
@@ -2775,6 +2790,7 @@ impl StreamContext {
             final_input_tokens,
             final_output_tokens,
             cache_creation,
+            cache_creation_1h,
             cache_read,
             self.metering.as_ref(),
         ));
@@ -2789,11 +2805,13 @@ impl StreamContext {
         &mut self,
         err: &UpstreamTerminalError,
     ) -> Vec<SseEvent> {
-        let (input_tokens, cache_creation, cache_read) = self.resolved_usage();
+        let resolved = self.resolved_usage();
+        let (input_tokens, cache_creation, cache_read) = resolved;
         let usage = usage_json_with_metering(
             input_tokens,
             self.resolved_output_tokens(),
             cache_creation,
+            self.cache_creation_1h(resolved),
             cache_read,
             self.metering.as_ref(),
         );
@@ -2898,13 +2916,13 @@ impl BufferedStreamContext {
         }
 
         // 互斥口径分摊：total 真值 − 缓存覆盖 = 未缓存 input（与 inner 收尾一致）。
-        let (final_input_tokens, cache_creation, cache_read) = self.inner.resolved_usage();
+        let usage = self.inner.resolved_usage();
 
         // 生成最终事件（StreamContext 内部会用同样的优先级与分摊）
         let final_events = self.inner.generate_final_events();
         self.event_buffer.extend(final_events);
 
-        self.patch_message_start_usage(final_input_tokens, cache_creation, cache_read);
+        self.patch_message_start_usage(usage);
         std::mem::take(&mut self.event_buffer)
     }
 
@@ -2918,20 +2936,17 @@ impl BufferedStreamContext {
             self.event_buffer.extend(initial_events);
             self.initial_events_generated = true;
         }
-        let (input_tokens, cache_creation, cache_read) = self.inner.resolved_usage();
+        let usage = self.inner.resolved_usage();
         let error_events = self.inner.generate_error_events(error_type, message);
         self.event_buffer.extend(error_events);
-        self.patch_message_start_usage(input_tokens, cache_creation, cache_read);
+        self.patch_message_start_usage(usage);
         std::mem::take(&mut self.event_buffer)
     }
 
     /// 用最终用量更正缓冲中 message_start 的 input_tokens 与 cache_* 字段
-    fn patch_message_start_usage(
-        &mut self,
-        input_tokens: i32,
-        cache_creation: i32,
-        cache_read: i32,
-    ) {
+    fn patch_message_start_usage(&mut self, resolved: (i32, i32, i32)) {
+        let (input_tokens, cache_creation, cache_read) = resolved;
+        let cache_creation_1h = self.inner.cache_creation_1h(resolved);
         for event in &mut self.event_buffer {
             if event.event == "message_start" {
                 if let Some(message) = event.data.get_mut("message") {
@@ -2939,7 +2954,10 @@ impl BufferedStreamContext {
                         usage["input_tokens"] = serde_json::json!(input_tokens);
                         usage["cache_creation_input_tokens"] = serde_json::json!(cache_creation);
                         usage["cache_read_input_tokens"] = serde_json::json!(cache_read);
-                        super::usage_cache_breakdown::attach_cache_creation_object(usage);
+                        super::usage_cache_breakdown::attach_cache_creation_object(
+                            usage,
+                            cache_creation_1h,
+                        );
                     }
                 }
             }
@@ -5803,7 +5821,7 @@ mod tests {
     fn test_generate_final_events_omits_credit_fields_without_metering() {
         // 没有 meteringEvent 时不应在 usage 里写 credit_* 字段。
         let mut manager = SseStateManager::new();
-        let events = manager.generate_final_events(10, 5, 0, 0, None);
+        let events = manager.generate_final_events(10, 5, 0, 0, 0, None);
         let delta = events
             .iter()
             .find(|e| e.event == "message_delta")
@@ -5818,7 +5836,7 @@ mod tests {
     fn test_generate_final_events_carries_credit_fields_when_metering_present() {
         let mut manager = SseStateManager::new();
         let metering = parse_metering(r#"{"unit":"credit","unitPlural":"credits","usage":0.75}"#);
-        let events = manager.generate_final_events(10, 5, 0, 0, Some(&metering));
+        let events = manager.generate_final_events(10, 5, 0, 0, 0, Some(&metering));
         let delta = events
             .iter()
             .find(|e| e.event == "message_delta")
@@ -5939,6 +5957,7 @@ mod tests {
             cache_read: 0,
             cache_covered_est: 828_840,
             prompt_total_est: 828_840,
+            cache_covered_1h_est: 0,
         };
         let initial = ctx.generate_initial_events();
         let start = initial
@@ -5984,6 +6003,7 @@ mod tests {
             cache_read: 0,
             cache_covered_est: 828_840,
             prompt_total_est: 828_840,
+            cache_covered_1h_est: 0,
         };
         ctx.output_tokens = 387;
         ctx.credits = 2.913;
@@ -6008,6 +6028,7 @@ mod tests {
             cache_read: 0,
             cache_covered_est: 828_840,
             prompt_total_est: 828_840,
+            cache_covered_1h_est: 0,
         };
         ctx.output_tokens = 387;
         ctx.credits = 2.913;
@@ -6043,6 +6064,7 @@ mod tests {
             cache_read: 25,
             cache_covered_est: 50,
             prompt_total_est: 100,
+            cache_covered_1h_est: 0,
         };
 
         let _ = ctx.process_kiro_event(&Event::Metadata(MetadataEvent {
@@ -6092,6 +6114,7 @@ mod tests {
             cache_read: 25,
             cache_covered_est: 50,
             prompt_total_est: 100,
+            cache_covered_1h_est: 0,
         };
 
         assert_eq!(ctx.resolved_usage(), (40, 20, 20));
@@ -6185,6 +6208,7 @@ mod tests {
             cache_read: 25,
             cache_covered_est: 50,
             prompt_total_est: 100,
+            cache_covered_1h_est: 0,
         };
         assert_eq!(ctx.resolved_usage(), (40, 20, 20));
 
@@ -6222,13 +6246,64 @@ mod tests {
         assert_eq!(start_usage["input_tokens"], json!(3));
         assert_eq!(start_usage["cache_creation_input_tokens"], json!(4));
         assert_eq!(start_usage["cache_read_input_tokens"], json!(7));
+        // 没有 1h 断点：上游精确写入量全部按默认 5m 上报。
         assert_eq!(
-            start_usage["cache_creation"]["ephemeral_1h_input_tokens"],
+            start_usage["cache_creation"]["ephemeral_5m_input_tokens"],
             json!(4)
         );
         assert_eq!(
-            start_usage["cache_creation"]["ephemeral_5m_input_tokens"],
+            start_usage["cache_creation"]["ephemeral_1h_input_tokens"],
             json!(0)
+        );
+    }
+
+    #[test]
+    fn stream_usage_splits_cache_creation_by_breakpoint_ttl() {
+        use crate::anthropic::cache_metering::CacheUsage;
+
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4-7",
+            100,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        ctx.credit_reconcile = false;
+        // 冷启动：前 30% 在 1h 断点之下，30%..80% 在 5m 断点之下，尾部 20% 未缓存。
+        ctx.cache_usage = CacheUsage {
+            cache_read: 0,
+            cache_covered_est: 80,
+            prompt_total_est: 100,
+            cache_covered_1h_est: 30,
+        };
+        assert_eq!(ctx.resolved_usage(), (20, 80, 0));
+
+        let start = ctx.create_message_start_event();
+        let usage = &start["message"]["usage"];
+        assert_eq!(usage["cache_creation_input_tokens"], json!(80));
+        assert_eq!(
+            usage["cache_creation"]["ephemeral_1h_input_tokens"],
+            json!(30)
+        );
+        assert_eq!(
+            usage["cache_creation"]["ephemeral_5m_input_tokens"],
+            json!(50)
+        );
+
+        let _ = ctx.generate_initial_events();
+        let events = ctx.generate_final_events();
+        let delta = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .unwrap();
+        let usage = &delta.data["usage"];
+        assert_eq!(
+            usage["cache_creation"]["ephemeral_1h_input_tokens"],
+            json!(30)
+        );
+        assert_eq!(
+            usage["cache_creation"]["ephemeral_5m_input_tokens"],
+            json!(50)
         );
     }
 

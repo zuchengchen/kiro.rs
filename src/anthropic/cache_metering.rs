@@ -14,16 +14,21 @@
 //!    - **显式 block 级缓存 (`cache_control`)**：仅在标记了 cache_control 的 block
 //!      处写入缓存 entry。
 //!    - **无 cache_control**：单元测试与显式关闭路径不计缓存。生产计量入口
-//!      （`inject_automatic`）会补一个顶层 ephemeral 自动断点，等价于官方
-//!      automatic caching，让客户端漏标时仍按多轮前缀命中。
+//!      （`inject_automatic`）会补一个顶层 ephemeral 自动断点（不带 ttl，走下方
+//!      智能路由），等价于官方 automatic caching，让客户端漏标时仍按多轮前缀命中。
 //! 2. **20-Block Lookback 回溯查找**：
 //!    - 读取匹配时，从每个断点向后（回溯）最多检查 20 个 block，寻找此前真正写入过的
 //!      最长前缀断点。只能命中此前实际写入过的断点，未声明断点的中间 block 不会写入或命中。
 //!    - 连续的 `tool_use` block 或连续的 `tool_result` block 各按一个回溯位置计算。
-//! 3. **TTL 与滑动续期**：
-//!    - 本地模拟把 ephemeral 默认、显式 `ttl=\"5m\"` 和 `ttl=\"1h\"` 都记成 3600 秒
-//!      （1 小时）。官方默认是 5 分钟；这里加长是为了会话间隙不被打成 miss。
+//! 3. **TTL、智能路由与滑动续期**：
+//!    - 显式 `ttl="5m"` 记 300 秒，显式 `ttl="1h"` 记 3600 秒，原样尊重、不改写。
+//!    - 未写 ttl 的断点默认 5 分钟；只有命中 [`resolve_unspecified_ttls`] 的 1 小时规则
+//!      （超长上下文、跨会话共享的大段 tools/system 前缀）才升为 1 小时。
+//!    - 混合 TTL 必须 1h 在前、5m 在后（官方约束）；客户端显式写反时整次不模拟。
+//!      智能升级只会把一段从头开始的连续断点升为 1h，不会制造倒序。
 //!    - 每个 entry 独立保存自身 TTL。命中时按该 entry 自身的 TTL 从请求时间起滑动续期。
+//!    - 对外 usage 的 `cache_creation.ephemeral_{5m,1h}_input_tokens` 按写入段落在
+//!      哪个 TTL 的断点之下拆分（见 [`CacheUsage::split_creation_ttl`]）。
 //! 4. **最小可缓存长度**：低于该模型官方门槛的断点静默跳过（不写不读），与 Anthropic
 //!    行为一致。非 Claude 模型（单元测试夹具）不设门槛。
 //! 5. **写入可见性**：新断点在 [`PendingCacheWrites::commit`] 之后才可被其他请求命中，
@@ -44,8 +49,21 @@ use std::sync::Arc;
 const DEFAULT_CAPACITY: usize = 4096;
 /// 最长 TTL（1h）
 const MAX_TTL_SECS: i64 = 3600;
-/// 本地模拟 TTL：默认、`5m`、`1h` 都按 1 小时计。
-const DEFAULT_TTL_SECS: i64 = 3600;
+/// 官方默认 TTL（5m）：未写 ttl 且未命中 1 小时规则的断点按它计。
+const DEFAULT_TTL_SECS: i64 = 300;
+/// 智能路由规则 R1：断点处累计前缀（estimate 口径）达到该值，未写 ttl 的断点升为 1h。
+///
+/// 依据生产 traces（2026-09-29..10-01，16,804 个会话内相邻轮次）：会话内间隔落在
+/// 5m–1h 的概率随上下文增长，≥500K 时约 5.5%，<200K 时约 0.5%。按官方价
+/// （5m 写 1.25×、1h 写 2×、读 0.1×）回放，阈值 500K 时混合策略比全 5m 便宜约 2.7%，
+/// 阈值 300K/200K 时反而贵 2.4%/3.5%。被升级的轮次约占 8%，大部分请求仍走 5m。
+const LONG_CONTEXT_1H_MIN_TOKENS: u32 = 500_000;
+/// 智能路由规则 R2：无 session、按 Key 共享的 tools/system 前缀达到该值时升为 1h。
+///
+/// 只有这种缓存键会在不同会话间复用（带 session 的键按会话隔离）。1h 写入多付
+/// 0.75×，一次 5m–1h 间隔省下 1.15×，跨会话复用的大段静态前缀很快回本；
+/// 太短的前缀省下的绝对量可以忽略，不值得打 1h 标签。
+const SHARED_PREFIX_1H_MIN_TOKENS: u32 = 8_192;
 /// 最大断点数量
 const MAX_BREAKPOINTS: usize = 4;
 /// 回溯查找最大 block 数（20-block lookback）
@@ -89,6 +107,9 @@ pub struct CacheUsage {
     pub cache_covered_est: i32,
     /// 整个 prompt 的 estimate token 总量（比例分摊的分母）。
     pub prompt_total_est: i32,
+    /// 最深 1h 断点处的累计前缀（estimate 口径）；没有 1h 断点为 0。
+    /// 这一段之内的写入算 1h 缓存创建，之后到最深断点之间的写入算 5m。
+    pub cache_covered_1h_est: i32,
 }
 
 impl CacheUsage {
@@ -120,6 +141,26 @@ impl CacheUsage {
         let cache_creation = cache_total - cache_read;
 
         (uncached_tail, cache_creation, cache_read)
+    }
+
+    /// 把最终上报的 `cache_creation` 拆成 `(ephemeral_5m, ephemeral_1h)`，两者相加 == creation。
+    ///
+    /// prompt 前缀依次是 `[read][creation][input]`。1h 断点覆盖到的累计位置按
+    /// estimate 比例换算到真实口径，落在 `[read, read + creation)` 区间内的部分是 1h 写入，
+    /// 其余是 5m 写入。适用于模拟拆分、credits 修正后的拆分，也适用于上游精确 usage。
+    /// 没有 1h 断点时全部归 5m。
+    pub fn split_creation_ttl(&self, input: i32, creation: i32, read: i32) -> (i32, i32) {
+        let creation = creation.max(0);
+        if creation == 0 || self.cache_covered_1h_est <= 0 || self.prompt_total_est <= 0 {
+            return (creation, 0);
+        }
+        let read = read.max(0);
+        let total = input.max(0) as i64 + creation as i64 + read as i64;
+        let ratio =
+            (self.cache_covered_1h_est as f64 / self.prompt_total_est as f64).clamp(0.0, 1.0);
+        let boundary = ((total as f64) * ratio).round() as i64;
+        let creation_1h = (boundary - read as i64).clamp(0, creation as i64) as i32;
+        (creation - creation_1h, creation_1h)
     }
 }
 
@@ -769,6 +810,8 @@ struct PromptBlock {
 struct Breakpoint {
     block_idx: usize,
     ttl_secs: i64,
+    /// 客户端是否显式写了 ttl。显式值原样尊重；未写的由 [`resolve_unspecified_ttls`] 决定。
+    explicit_ttl: bool,
 }
 
 /// 从请求体提取按 tools → system → messages 严格顺序拼接的 prompt blocks
@@ -889,6 +932,7 @@ fn resolve_breakpoints(
             breakpoints.push(Breakpoint {
                 block_idx: idx,
                 ttl_secs: ttl,
+                explicit_ttl: cc.ttl.is_some(),
             });
         }
     }
@@ -908,14 +952,17 @@ fn resolve_breakpoints(
             blocks.iter().rposition(|block| block.cacheable)
         };
         if let Some(last_idx) = target_idx {
-            if let Some(existing) = breakpoints.iter().find(|bp| bp.block_idx == last_idx) {
+            if let Some(existing) = breakpoints.iter_mut().find(|bp| bp.block_idx == last_idx) {
+                // 未写 ttl 与 `5m` 同义（官方默认），二者落在同一位置视为同一断点。
                 if existing.ttl_secs != auto_ttl {
                     return Vec::new();
                 }
+                existing.explicit_ttl |= top_cc.ttl.is_some();
             } else {
                 breakpoints.push(Breakpoint {
                     block_idx: last_idx,
                     ttl_secs: auto_ttl,
+                    explicit_ttl: top_cc.ttl.is_some(),
                 });
             }
         }
@@ -934,24 +981,90 @@ fn resolve_breakpoints(
         return Vec::new();
     }
 
-    // 混合 TTL 顺序校验：1h 断点必须位于 5m 断点之前
-    // 若 5m 之后出现了 1h，请求本身非法；整次禁用本地模拟。
-    let mut seen_5m = false;
-    for bp in &breakpoints {
-        if bp.ttl_secs <= DEFAULT_TTL_SECS {
-            seen_5m = true;
-        } else if seen_5m && bp.ttl_secs > DEFAULT_TTL_SECS {
-            return Vec::new();
-        }
+    // 混合 TTL 顺序校验：1h 断点必须位于 5m 断点之前（未写 ttl 按官方默认 5m 判定）。
+    // 若 5m 之后出现了 1h，请求本身非法（官方返回 400）；整次禁用本地模拟。
+    if !ttl_order_is_valid(&breakpoints) {
+        return Vec::new();
     }
 
     breakpoints
 }
 
+/// 按 prompt 顺序，所有 1h 断点必须排在任何 5m 断点之前。
+fn ttl_order_is_valid(breakpoints: &[Breakpoint]) -> bool {
+    let mut seen_5m = false;
+    for bp in breakpoints {
+        if bp.ttl_secs < MAX_TTL_SECS {
+            seen_5m = true;
+        } else if seen_5m {
+            return false;
+        }
+    }
+    true
+}
+
+/// 未写 ttl 断点的智能 TTL 路由。默认 5m，命中下列任一规则时升为 1h：
+///
+/// - **R1 超长上下文**：断点处累计前缀 ≥ [`LONG_CONTEXT_1H_MIN_TOKENS`]。前缀越长，
+///   5m 过期后重建越贵，会话内 5m–1h 停顿也越常见（见常量注释的生产数据）。
+/// - **R2 跨会话共享的大段静态前缀**：缓存键按 Key 共享（请求不带 session），断点落在
+///   tools/system 段内，且累计前缀 ≥ [`SHARED_PREFIX_1H_MIN_TOKENS`]。只有这种前缀会被
+///   不同会话复用；带 session 的请求按会话隔离，不适用。
+///
+/// 客户端显式写的 `5m` / `1h` 一律不改。升级时取满足规则的最深断点，把它及其之前
+/// 所有未写 ttl 的断点一起升为 1h（1h 断点本就包含之前的全部前缀），因此 1h 永远是
+/// 从头开始的连续一段，不会出现 1h 排在 5m 之后。遇到显式 5m 断点即停止，其后的断点
+/// 不能再升 1h。
+fn resolve_unspecified_ttls(
+    breakpoints: &mut [Breakpoint],
+    cum_tokens: &[u32],
+    static_prefix_blocks: usize,
+    key_scoped: bool,
+) {
+    let mut target = None;
+    for (pos, bp) in breakpoints.iter().enumerate() {
+        if bp.explicit_ttl && bp.ttl_secs < MAX_TTL_SECS {
+            break;
+        }
+        let prefix = cum_tokens[bp.block_idx];
+        let long_context = prefix >= LONG_CONTEXT_1H_MIN_TOKENS;
+        let shared_static_prefix = key_scoped
+            && bp.block_idx < static_prefix_blocks
+            && prefix >= SHARED_PREFIX_1H_MIN_TOKENS;
+        if !bp.explicit_ttl && (long_context || shared_static_prefix) {
+            target = Some(pos);
+        }
+    }
+    let Some(target) = target else {
+        return;
+    };
+    for bp in breakpoints.iter_mut().take(target + 1) {
+        if !bp.explicit_ttl {
+            bp.ttl_secs = MAX_TTL_SECS;
+        }
+    }
+}
+
+/// 最深 1h 断点处的累计前缀；没有 1h 断点为 0。
+fn covered_1h_tokens(breakpoints: &[Breakpoint], cum_tokens: &[u32]) -> u32 {
+    breakpoints
+        .iter()
+        .filter(|bp| bp.ttl_secs >= MAX_TTL_SECS)
+        .map(|bp| cum_tokens[bp.block_idx])
+        .max()
+        .unwrap_or(0)
+}
+
+/// tools + system 段的 block 数（[`extract_blocks`] 先放这两段，之后才是 messages）。
+fn static_prefix_block_count(req: &MessagesRequest) -> usize {
+    req.tools.as_ref().map_or(0, Vec::len) + req.system.as_ref().map_or(0, Vec::len)
+}
+
+/// 生产路径为漏标请求补的自动断点。不写 ttl：默认 5m，由智能路由决定是否升 1h。
 fn automatic_ephemeral() -> CacheControl {
     CacheControl {
         cache_type: "ephemeral".to_string(),
-        ttl: Some("1h".to_string()),
+        ttl: None,
     }
 }
 
@@ -1058,6 +1171,12 @@ pub async fn compute_cache_usage_deferred(
     if breakpoints.is_empty() {
         return empty();
     }
+    resolve_unspecified_ttls(
+        &mut breakpoints,
+        &cum_tokens,
+        static_prefix_block_count(req),
+        !is_session_scoped(req),
+    );
 
     // Lookup: 从每个断点向后检查最多 20 个 block，寻找此前真正写入过的最长前缀
     let mut max_read_tokens: u32 = 0;
@@ -1111,6 +1230,7 @@ pub async fn compute_cache_usage_deferred(
             cache_read: max_read_tokens as i32,
             cache_covered_est: covered_tokens as i32,
             prompt_total_est: prompt_total_est as i32,
+            cache_covered_1h_est: covered_1h_tokens(&breakpoints, &cum_tokens) as i32,
         },
         pending,
     )
@@ -1193,6 +1313,12 @@ pub fn compute_cache_usage_sync_deferred(
     if breakpoints.is_empty() {
         return empty();
     }
+    resolve_unspecified_ttls(
+        &mut breakpoints,
+        &cum_tokens,
+        static_prefix_block_count(req),
+        !is_session_scoped(req),
+    );
 
     let mut max_read_tokens: u32 = 0;
 
@@ -1228,6 +1354,7 @@ pub fn compute_cache_usage_sync_deferred(
             cache_read: max_read_tokens as i32,
             cache_covered_est: covered_tokens as i32,
             prompt_total_est: prompt_total_est as i32,
+            cache_covered_1h_est: covered_1h_tokens(&breakpoints, &cum_tokens) as i32,
         },
         pending,
     )
@@ -1253,6 +1380,15 @@ fn isolation_seed(req: &MessagesRequest, key_id: u64) -> Option<String> {
     Some(format!("key:{key_id}"))
 }
 
+/// 缓存键是否按会话隔离（与 [`isolation_seed`] 同一判定）。否则按 Key 共享，跨会话复用。
+fn is_session_scoped(req: &MessagesRequest) -> bool {
+    req.metadata
+        .as_ref()
+        .and_then(|m| m.user_id.as_deref())
+        .and_then(extract_session_id)
+        .is_some()
+}
+
 /// 从 Claude Code 的 user_id 中提取 session 标识。
 fn extract_session_id(user_id: &str) -> Option<String> {
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(user_id)
@@ -1275,6 +1411,7 @@ fn validated_ttl(cache_control: &CacheControl) -> Option<i64> {
     if !cache_control.cache_type.eq_ignore_ascii_case("ephemeral") {
         return None;
     }
+    // 未写 ttl 先按官方默认 5m 记，之后再由 resolve_unspecified_ttls 决定是否升 1h。
     match cache_control.ttl.as_deref() {
         None => Some(DEFAULT_TTL_SECS),
         Some(ttl) if ttl.eq_ignore_ascii_case("5m") => Some(DEFAULT_TTL_SECS),
@@ -1451,8 +1588,8 @@ mod tests {
             ttl: ttl.map(str::to_string),
         };
         assert_eq!(validated_ttl(&control(Some("1h"))), Some(3600));
-        assert_eq!(validated_ttl(&control(Some("5m"))), Some(3600));
-        assert_eq!(validated_ttl(&control(None)), Some(3600));
+        assert_eq!(validated_ttl(&control(Some("5m"))), Some(300));
+        assert_eq!(validated_ttl(&control(None)), Some(300));
         assert_eq!(validated_ttl(&control(Some("garbage"))), None);
     }
 
@@ -1586,6 +1723,7 @@ mod tests {
             cache_read: 30,
             cache_covered_est: 80,
             prompt_total_est: 100,
+            cache_covered_1h_est: 0,
         };
         let (input, creation, read) = u.split_against_total(1000);
         assert_eq!(input + creation + read, 1000);
@@ -1600,6 +1738,7 @@ mod tests {
             cache_read: 0,
             cache_covered_est: 0,
             prompt_total_est: 100,
+            cache_covered_1h_est: 0,
         };
         assert_eq!(u.split_against_total(500), (500, 0, 0));
     }
@@ -2131,12 +2270,14 @@ mod tests {
         assert_eq!(cache.len(), 2);
         {
             let inner = cache.inner.lock();
-            for entry in inner.entries.values() {
-                assert_eq!(entry.ttl_secs, 3600, "本地模拟 5m 与 1h 都按 1 小时写入");
-            }
+            let mut ttls: Vec<i64> = inner.entries.values().map(|e| e.ttl_secs).collect();
+            ttls.sort();
+            assert_eq!(ttls, vec![300, 3600], "显式 5m / 1h 各按自身 TTL 写入");
         }
+        let sys_prefix = u1.cache_covered_1h_est;
+        assert!(sys_prefix > 0 && sys_prefix < u1.cache_covered_est);
 
-        // 模拟 350 秒后：官方 5m 会过期，本地 1h 策略下两段都仍有效
+        // 模拟 350 秒后：5m 段过期，1h 的 system 段仍有效
         {
             let mut inner = cache.inner.lock();
             for (_, v) in inner.entries.iter_mut() {
@@ -2146,14 +2287,14 @@ mod tests {
 
         let u2 = compute_cache_usage_sync(&cache, &req, 1);
         assert_eq!(
-            u2.cache_read, u1.cache_covered_est,
-            "350 秒后 1 小时 TTL 下整段前缀仍应命中"
+            u2.cache_read, sys_prefix,
+            "350 秒后只剩 1h 的 system 前缀命中，5m 的 user 段重新写入"
         );
     }
 
     #[test]
-    fn mixed_ttl_labels_are_normalized_to_one_hour() {
-        // 本地把 5m / 1h 都记成 1 小时，不再按官方混合顺序拒绝。
+    fn mixed_ttl_reversed_order_disables_simulation() {
+        // 官方要求 1h 断点在 5m 之前；system 5m 在前、user 1h 在后是非法请求，不模拟。
         use super::super::types::{CacheControl, Message, MessagesRequest, SystemMessage};
         let cache = CacheMeter::new(None);
 
@@ -2185,8 +2326,8 @@ mod tests {
         };
 
         let usage = compute_cache_usage_sync(&cache, &req, 1);
-        assert!(usage.cache_covered_est > 0);
-        assert_eq!(cache.len(), 2);
+        assert_eq!(usage.cache_covered_est, 0);
+        assert_eq!(cache.len(), 0);
     }
 
     #[test]
@@ -2611,7 +2752,7 @@ mod tests {
         assert_eq!(explicit_empty.cache_covered_est, 0);
         assert_eq!(empty_text_cache.len(), 0);
 
-        // 5. 顶层自动与显式 TTL 在本地都映射为 1h，同位置视为 no-op
+        // 5. 顶层自动 1h 与显式 5m 落在同一位置：TTL 冲突，不模拟
         let conflict_cache = CacheMeter::new(None);
         let conflict = compute_cache_usage_sync(
             &conflict_cache,
@@ -2628,8 +2769,8 @@ mod tests {
             ),
             1,
         );
-        assert!(conflict.cache_covered_est > 0);
-        assert_eq!(conflict_cache.len(), 1);
+        assert_eq!(conflict.cache_covered_est, 0);
+        assert_eq!(conflict_cache.len(), 0);
 
         // 6. 顶层自动与显式同位置同 TTL (5m + 5m) 是 no-op，成功模拟
         let noop_cache = CacheMeter::new(None);
@@ -3251,7 +3392,7 @@ mod tests {
         assert_eq!(u2.cache_read, u1.cache_covered_est);
         assert_eq!(instance_2.len(), 2, "命中后断点应回填至实例 2 的本地缓存");
 
-        // 模拟 350 秒后：1 小时 TTL 下两段都仍有效
+        // 模拟 350 秒后：5m 段过期，1h 的 system 段仍有效
         {
             let mut remote_map = fake_redis.entries.lock();
             for (_, v) in remote_map.iter_mut() {
@@ -3264,9 +3405,10 @@ mod tests {
         }
 
         let u3 = compute_cache_usage(&instance_2, &req, 1).await;
+        assert!(u1.cache_covered_1h_est > 0);
         assert_eq!(
-            u3.cache_read, u1.cache_covered_est,
-            "350 秒后 1 小时 TTL 下整段前缀仍应命中"
+            u3.cache_read, u1.cache_covered_1h_est,
+            "350 秒后只剩 1h 的 system 前缀命中"
         );
     }
 
@@ -3432,6 +3574,7 @@ mod tests {
             cache_read: 100_000,
             cache_covered_est: 100_000,
             prompt_total_est: 101_000,
+            cache_covered_1h_est: 0,
         };
 
         let (input, creation, read) = usage.split_against_total(101_000);
@@ -3553,5 +3696,327 @@ mod tests {
         assert!(as_string[0].cacheable);
         assert!(!as_string[0].is_current_turn_input);
         assert!(!as_string[1].cacheable, "空白字符串不可作断点");
+    }
+
+    // ---- TTL 智能路由：默认 5m、显式透传、1h 规则、混合顺序 ----
+
+    /// 一段约 `tokens` 个 estimate token 的英文文本（4 字符 ≈ 1 token）。
+    fn text_of_tokens(tag: &str, tokens: usize) -> String {
+        format!("{tag} {}", "abcd".repeat(tokens))
+    }
+
+    /// system 一段 + 一条 user 消息，各自可选 cache_control；可选 session。
+    fn ttl_request(
+        system_tokens: usize,
+        system_cc: Option<serde_json::Value>,
+        user_tokens: usize,
+        user_cc: Option<serde_json::Value>,
+        session: Option<&str>,
+    ) -> MessagesRequest {
+        use super::super::types::{Message, Metadata, SystemMessage};
+        let mut user_block = serde_json::json!({
+            "type": "text",
+            "text": text_of_tokens("user", user_tokens),
+        });
+        if let Some(cc) = user_cc {
+            user_block["cache_control"] = cc;
+        }
+        MessagesRequest {
+            model: "claude-opus-5.5".to_string(),
+            max_tokens: 32,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!([user_block]),
+            }],
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: text_of_tokens("system", system_tokens),
+                cache_control: system_cc
+                    .map(|cc| serde_json::from_value::<CacheControl>(cc).unwrap()),
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: session.map(|sid| Metadata {
+                user_id: Some(format!("user_x_account__session_{sid}")),
+            }),
+            cache_control: None,
+        }
+    }
+
+    fn entry_ttls(cache: &CacheMeter) -> Vec<i64> {
+        let mut ttls: Vec<i64> = cache
+            .inner
+            .lock()
+            .entries
+            .values()
+            .map(|e| e.ttl_secs)
+            .collect();
+        ttls.sort();
+        ttls
+    }
+
+    #[test]
+    fn unspecified_ttl_defaults_to_5m() {
+        let cache = CacheMeter::new(None);
+        let req = ttl_request(
+            2_000,
+            Some(serde_json::json!({"type":"ephemeral"})),
+            2_000,
+            Some(serde_json::json!({"type":"ephemeral"})),
+            Some("s1"),
+        );
+        let usage = compute_cache_usage_sync(&cache, &req, 1);
+        assert!(usage.cache_covered_est > 0);
+        assert_eq!(usage.cache_covered_1h_est, 0);
+        assert_eq!(entry_ttls(&cache), vec![300, 300]);
+        let (input, creation, read) = usage.split_against_total(usage.prompt_total_est);
+        assert_eq!(
+            usage.split_creation_ttl(input, creation, read),
+            (creation, 0)
+        );
+    }
+
+    #[test]
+    fn injected_automatic_breakpoint_defaults_to_5m() {
+        let cache = CacheMeter::new(None);
+        let req = ttl_request(2_000, None, 2_000, None, Some("s1"));
+        let (usage, pending) = compute_cache_usage_sync_deferred(&cache, &req, 1, true);
+        pending.commit_local(&cache);
+        assert!(usage.cache_covered_est > 0);
+        assert_eq!(usage.cache_covered_1h_est, 0);
+        assert_eq!(entry_ttls(&cache), vec![300]);
+    }
+
+    #[test]
+    fn explicit_1h_ttl_is_honored() {
+        let cache = CacheMeter::new(None);
+        let req = ttl_request(
+            2_000,
+            Some(serde_json::json!({"type":"ephemeral","ttl":"1h"})),
+            2_000,
+            Some(serde_json::json!({"type":"ephemeral","ttl":"1h"})),
+            Some("s1"),
+        );
+        let usage = compute_cache_usage_sync(&cache, &req, 1);
+        assert_eq!(entry_ttls(&cache), vec![3600, 3600]);
+        assert_eq!(usage.cache_covered_1h_est, usage.cache_covered_est);
+        let (input, creation, read) = usage.split_against_total(usage.prompt_total_est);
+        assert!(creation > 0);
+        assert_eq!(
+            usage.split_creation_ttl(input, creation, read),
+            (0, creation)
+        );
+    }
+
+    #[test]
+    fn explicit_5m_is_never_upgraded_even_for_long_context() {
+        let cache = CacheMeter::new(None);
+        let req = ttl_request(
+            2_000,
+            Some(serde_json::json!({"type":"ephemeral","ttl":"5m"})),
+            LONG_CONTEXT_1H_MIN_TOKENS as usize,
+            Some(serde_json::json!({"type":"ephemeral","ttl":"5m"})),
+            Some("s1"),
+        );
+        let usage = compute_cache_usage_sync(&cache, &req, 1);
+        assert_eq!(entry_ttls(&cache), vec![300, 300]);
+        assert_eq!(usage.cache_covered_1h_est, 0);
+    }
+
+    #[test]
+    fn long_context_rule_upgrades_unspecified_chain_to_1h() {
+        let cache = CacheMeter::new(None);
+        let req = ttl_request(
+            2_000,
+            Some(serde_json::json!({"type":"ephemeral"})),
+            LONG_CONTEXT_1H_MIN_TOKENS as usize,
+            Some(serde_json::json!({"type":"ephemeral"})),
+            Some("s1"),
+        );
+        let usage = compute_cache_usage_sync(&cache, &req, 1);
+        // 最深断点命中 R1，之前未写 ttl 的 system 断点一起升 1h，保证 1h 在前。
+        assert_eq!(entry_ttls(&cache), vec![3600, 3600]);
+        assert_eq!(usage.cache_covered_1h_est, usage.cache_covered_est);
+    }
+
+    #[test]
+    fn long_context_rule_respects_threshold() {
+        let cache = CacheMeter::new(None);
+        let req = ttl_request(
+            2_000,
+            Some(serde_json::json!({"type":"ephemeral"})),
+            LONG_CONTEXT_1H_MIN_TOKENS as usize - 10_000,
+            Some(serde_json::json!({"type":"ephemeral"})),
+            Some("s1"),
+        );
+        compute_cache_usage_sync(&cache, &req, 1);
+        assert_eq!(entry_ttls(&cache), vec![300, 300]);
+    }
+
+    #[test]
+    fn long_context_rule_stops_at_explicit_5m() {
+        // system 显式 5m 在前：其后的断点不能升 1h（否则 1h 落在 5m 之后）。
+        let cache = CacheMeter::new(None);
+        let req = ttl_request(
+            2_000,
+            Some(serde_json::json!({"type":"ephemeral","ttl":"5m"})),
+            LONG_CONTEXT_1H_MIN_TOKENS as usize,
+            Some(serde_json::json!({"type":"ephemeral"})),
+            Some("s1"),
+        );
+        let usage = compute_cache_usage_sync(&cache, &req, 1);
+        assert!(usage.cache_covered_est > 0);
+        assert_eq!(entry_ttls(&cache), vec![300, 300]);
+    }
+
+    #[test]
+    fn long_context_rule_keeps_explicit_1h_prefix_and_upgrades_tail() {
+        let cache = CacheMeter::new(None);
+        let req = ttl_request(
+            2_000,
+            Some(serde_json::json!({"type":"ephemeral","ttl":"1h"})),
+            LONG_CONTEXT_1H_MIN_TOKENS as usize,
+            Some(serde_json::json!({"type":"ephemeral"})),
+            Some("s1"),
+        );
+        let usage = compute_cache_usage_sync(&cache, &req, 1);
+        assert_eq!(entry_ttls(&cache), vec![3600, 3600]);
+        assert_eq!(usage.cache_covered_1h_est, usage.cache_covered_est);
+    }
+
+    #[test]
+    fn shared_static_prefix_rule_upgrades_only_key_scoped_system() {
+        let system_cc = Some(serde_json::json!({"type":"ephemeral"}));
+        let user_cc = Some(serde_json::json!({"type":"ephemeral"}));
+
+        // 无 session：按 Key 共享，跨会话复用的大段 system → 1h；尾部消息仍 5m。
+        let shared = CacheMeter::new(None);
+        let req = ttl_request(
+            SHARED_PREFIX_1H_MIN_TOKENS as usize,
+            system_cc.clone(),
+            2_000,
+            user_cc.clone(),
+            None,
+        );
+        let usage = compute_cache_usage_sync(&shared, &req, 7);
+        assert_eq!(entry_ttls(&shared), vec![300, 3600]);
+        assert!(usage.cache_covered_1h_est > 0);
+        assert!(usage.cache_covered_1h_est < usage.cache_covered_est);
+
+        // system 太短：不升级。
+        let short = CacheMeter::new(None);
+        let req = ttl_request(2_000, system_cc.clone(), 2_000, user_cc.clone(), None);
+        compute_cache_usage_sync(&short, &req, 7);
+        assert_eq!(entry_ttls(&short), vec![300, 300]);
+
+        // 带 session：按会话隔离，不跨会话复用，不升级。
+        let per_session = CacheMeter::new(None);
+        let req = ttl_request(
+            SHARED_PREFIX_1H_MIN_TOKENS as usize,
+            system_cc,
+            2_000,
+            user_cc,
+            Some("s1"),
+        );
+        compute_cache_usage_sync(&per_session, &req, 7);
+        assert_eq!(entry_ttls(&per_session), vec![300, 300]);
+    }
+
+    #[test]
+    fn mixed_ttl_order_1h_before_5m_is_accepted_and_split() {
+        let cache = CacheMeter::new(None);
+        let req = ttl_request(
+            2_000,
+            Some(serde_json::json!({"type":"ephemeral","ttl":"1h"})),
+            2_000,
+            Some(serde_json::json!({"type":"ephemeral","ttl":"5m"})),
+            Some("s1"),
+        );
+        let usage = compute_cache_usage_sync(&cache, &req, 1);
+        assert_eq!(entry_ttls(&cache), vec![300, 3600]);
+        let (input, creation, read) = usage.split_against_total(usage.prompt_total_est);
+        let (c5m, c1h) = usage.split_creation_ttl(input, creation, read);
+        assert_eq!(c5m + c1h, creation);
+        assert!(
+            c1h > 0 && c5m > 0,
+            "system 段记 1h，user 段记 5m: {c5m}/{c1h}"
+        );
+    }
+
+    #[test]
+    fn mixed_ttl_order_1h_after_unspecified_is_rejected() {
+        // 未写 ttl 按 5m 判定：system 默认、user 显式 1h 属于 1h 在 5m 之后，官方拒绝。
+        let cache = CacheMeter::new(None);
+        let req = ttl_request(
+            2_000,
+            Some(serde_json::json!({"type":"ephemeral"})),
+            2_000,
+            Some(serde_json::json!({"type":"ephemeral","ttl":"1h"})),
+            Some("s1"),
+        );
+        let usage = compute_cache_usage_sync(&cache, &req, 1);
+        assert_eq!(usage.cache_covered_est, 0);
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn resolve_unspecified_ttls_never_breaks_order() {
+        let bp = |idx: usize, ttl: i64, explicit: bool| Breakpoint {
+            block_idx: idx,
+            ttl_secs: ttl,
+            explicit_ttl: explicit,
+        };
+        let cum = [10_000, 20_000, 600_000, 700_000];
+        let cases: Vec<Vec<Breakpoint>> = vec![
+            vec![
+                bp(0, 300, false),
+                bp(1, 300, false),
+                bp(2, 300, false),
+                bp(3, 300, false),
+            ],
+            vec![bp(0, 3600, true), bp(1, 300, false), bp(3, 300, true)],
+            vec![bp(0, 300, true), bp(2, 300, false), bp(3, 300, false)],
+            vec![bp(1, 300, false), bp(2, 300, true), bp(3, 300, false)],
+        ];
+        for mut case in cases {
+            let before: Vec<(bool, i64)> =
+                case.iter().map(|b| (b.explicit_ttl, b.ttl_secs)).collect();
+            resolve_unspecified_ttls(&mut case, &cum, 1, true);
+            assert!(ttl_order_is_valid(&case), "{case:?}");
+            for (b, (explicit, ttl)) in case.iter().zip(before) {
+                if explicit {
+                    assert_eq!(b.ttl_secs, ttl, "显式 TTL 不得改写");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn split_creation_ttl_maps_1h_boundary_to_real_scale() {
+        // estimate 口径：1h 覆盖 40 / 总 100。真实总量 200 → 边界 80。
+        let usage = CacheUsage {
+            cache_read: 0,
+            cache_covered_est: 80,
+            prompt_total_est: 100,
+            cache_covered_1h_est: 40,
+        };
+        // [read 20][creation 140][input 40]：1h 写入 = 80 - 20 = 60，5m = 80。
+        assert_eq!(usage.split_creation_ttl(40, 140, 20), (80, 60));
+        // 读取已越过 1h 边界：新写入全部是 5m 段。
+        assert_eq!(usage.split_creation_ttl(40, 60, 100), (60, 0));
+        // 没有 1h 断点。
+        let none = CacheUsage {
+            cache_covered_1h_est: 0,
+            ..usage
+        };
+        assert_eq!(none.split_creation_ttl(40, 140, 20), (140, 0));
+        // 1h 覆盖整个前缀：creation 全部 1h。
+        let all = CacheUsage {
+            cache_covered_1h_est: 80,
+            ..usage
+        };
+        assert_eq!(all.split_creation_ttl(40, 140, 20), (0, 140));
     }
 }
