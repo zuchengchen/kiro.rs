@@ -5,7 +5,7 @@ name = "kiro-rs"
 # version number"），所以这里用 semver 的 build metadata 表达第四段，Admin UI
 # 经 `display_version` 还原成 `0.9.0.11` 显示。合并上游时这一行会冲突：保留上游
 # 的三段基线，把 `+N` 接回去即可；基线变了则迭代号归 1。
-version = "0.9.0+11"
+version = "0.9.0+12"
 edition = "2024"
 
 [features]
