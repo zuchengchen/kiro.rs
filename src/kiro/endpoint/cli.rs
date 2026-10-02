@@ -3,7 +3,7 @@
 use reqwest::RequestBuilder;
 use uuid::Uuid;
 
-use super::ide::{RUNTIME_ENDPOINT_NAME, normalize_api_region};
+use super::ide::normalize_api_region;
 use super::{KiroEndpoint, RequestContext, transform_streaming_payload};
 use crate::kiro::kiro_version;
 
@@ -74,10 +74,6 @@ impl KiroEndpoint for CliEndpoint {
 
     fn display_name(&self) -> &'static str {
         "AmazonQCLI"
-    }
-
-    fn fallback_name(&self) -> Option<&'static str> {
-        Some(RUNTIME_ENDPOINT_NAME)
     }
 
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {

@@ -6,6 +6,9 @@
 //! [`KiroEndpoint`] 抽象了请求侧的差异点；`KiroProvider` 持有一个 endpoint 注册表，
 //! 按凭据的 `endpoint` 字段选择对应实现。
 
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
 use reqwest::RequestBuilder;
 
 use crate::kiro::model::credentials::KiroCredentials;
@@ -27,11 +30,6 @@ pub trait KiroEndpoint: Send + Sync {
     /// Human-readable upstream name used in rate-limit failover logs.
     fn display_name(&self) -> &'static str {
         self.name()
-    }
-
-    /// Independent rate-limit bucket to try once when this endpoint returns 429.
-    fn fallback_name(&self) -> Option<&'static str> {
-        None
     }
 
     /// Whether this endpoint requires the CodeWhisperer internal model ID.
@@ -127,10 +125,60 @@ pub struct RequestContext<'a> {
     pub config: &'a Config,
 }
 
+/// Same-account hop order after the request's primary bucket.
+///
+/// Aliases (`ide` / `cli`) are not listed; they resolve to the same
+/// `Arc` as `codewhisperer` / `amazonq-cli` and are skipped by host+path.
+const UNIQUE_BUCKET_FALLBACK_ORDER: &[&str] = &[
+    ide::RUNTIME_ENDPOINT_NAME,
+    ide::CODEWHISPERER_ENDPOINT_NAME,
+    ide::AMAZON_Q_ENDPOINT_NAME,
+    cli::AMAZON_Q_CLI_ENDPOINT_NAME,
+];
+
+/// Independent rate-limit bucket identity: `host+path` from [`KiroEndpoint::api_url`].
+///
+/// EU CodeWhisperer and Amazon Q share `q.eu-central-1.amazonaws.com/generateAssistantResponse`,
+/// so they collapse to one bucket. US CodeWhisperer uses a distinct host.
+pub(crate) fn api_bucket_key(endpoint: &dyn KiroEndpoint, ctx: &RequestContext<'_>) -> String {
+    let url = endpoint.api_url(ctx);
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(&url);
+    rest.split('?').next().unwrap_or(rest).to_string()
+}
+
+/// Unused unique buckets for this request, primary first, then the fixed remainder.
+///
+/// Dedup key is [`api_bucket_key`], not endpoint name. Registry aliases never
+/// enqueue a second hop to the same host+path.
+pub(crate) fn unique_api_buckets(
+    registry: &HashMap<String, Arc<dyn KiroEndpoint>>,
+    primary: Arc<dyn KiroEndpoint>,
+    ctx: &RequestContext<'_>,
+) -> Vec<Arc<dyn KiroEndpoint>> {
+    let mut seen = HashSet::new();
+    let mut queue = Vec::new();
+    let mut push = |endpoint: Arc<dyn KiroEndpoint>| {
+        let key = api_bucket_key(endpoint.as_ref(), ctx);
+        if seen.insert(key) {
+            queue.push(endpoint);
+        }
+    };
+    push(primary);
+    for name in UNIQUE_BUCKET_FALLBACK_ORDER {
+        if let Some(endpoint) = registry.get(*name).cloned() {
+            push(endpoint);
+        }
+    }
+    queue
+}
+
 /// Build an endpoint-specific streaming payload from the original request body.
 /// Each call reparses the original JSON so a fallback never inherits mutations
 /// made for the primary endpoint.
-pub(super) fn transform_streaming_payload(
+pub(crate) fn transform_streaming_payload(
     body: &str,
     profile_arn: Option<&str>,
     origin: &str,
@@ -240,8 +288,8 @@ pub(crate) fn apply_payload_model_id(body: &str, model_id: &str) -> String {
 /// - `MONTHLY_REQUEST_COUNT`: 月度请求额度用尽
 /// - `OVERAGE_REQUEST_LIMIT_EXCEEDED`: 超额（overage）额度也耗尽
 ///
-/// 两类语义都是「该凭据当前计费周期内不能再用」，处理方式一致：
-/// 立刻禁用凭据并故障转移到下一个可用凭据。
+/// 两类语义都是「该桶当前计费周期内不能再用」。同账号仍先走完其余独特桶；
+/// 全部独特桶都额度尽后才禁用凭据并换号。
 const QUOTA_EXHAUSTED_REASONS: &[&str] =
     &["MONTHLY_REQUEST_COUNT", "OVERAGE_REQUEST_LIMIT_EXCEEDED"];
 
@@ -575,6 +623,132 @@ mod tests {
         assert!(!default_is_account_throttled(
             r#"{"message":"trace mentions USER_REQUEST_RATE_EXCEEDED","reason":"OTHER"}"#
         ));
+    }
+
+    fn bucket_ctx<'a>(
+        credentials: &'a KiroCredentials,
+        config: &'a Config,
+    ) -> RequestContext<'a> {
+        RequestContext {
+            credentials,
+            token: "token",
+            machine_id: "machine",
+            config,
+        }
+    }
+
+    fn four_bucket_registry() -> HashMap<String, Arc<dyn KiroEndpoint>> {
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        let codewhisperer: Arc<dyn KiroEndpoint> = Arc::new(IdeEndpoint::codewhisperer());
+        endpoints.insert(codewhisperer.name().to_string(), Arc::clone(&codewhisperer));
+        endpoints.insert(ide::IDE_ENDPOINT_NAME.to_string(), Arc::clone(&codewhisperer));
+        let amazon_q: Arc<dyn KiroEndpoint> = Arc::new(IdeEndpoint::amazon_q());
+        endpoints.insert(amazon_q.name().to_string(), amazon_q);
+        let amazon_q_cli: Arc<dyn KiroEndpoint> = Arc::new(CliEndpoint::new());
+        endpoints.insert(amazon_q_cli.name().to_string(), Arc::clone(&amazon_q_cli));
+        endpoints.insert(cli::CLI_ENDPOINT_NAME.to_string(), amazon_q_cli);
+        let runtime: Arc<dyn KiroEndpoint> = Arc::new(IdeEndpoint::runtime());
+        endpoints.insert(runtime.name().to_string(), runtime);
+        endpoints
+    }
+
+    #[test]
+    fn us_codewhisperer_and_amazonq_are_distinct_buckets() {
+        let credentials = KiroCredentials::default();
+        let config = Config::default();
+        let ctx = bucket_ctx(&credentials, &config);
+        let cw = IdeEndpoint::codewhisperer();
+        let amazon_q = IdeEndpoint::amazon_q();
+        let runtime = IdeEndpoint::runtime();
+        let cli = CliEndpoint::new();
+        assert_eq!(
+            api_bucket_key(&cw, &ctx),
+            "codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse"
+        );
+        assert_eq!(
+            api_bucket_key(&amazon_q, &ctx),
+            "q.us-east-1.amazonaws.com/generateAssistantResponse"
+        );
+        assert_eq!(
+            api_bucket_key(&runtime, &ctx),
+            "runtime.us-east-1.kiro.dev/generateAssistantResponse"
+        );
+        assert_eq!(
+            api_bucket_key(&cli, &ctx),
+            "q.us-east-1.amazonaws.com/SendMessageStreaming"
+        );
+        assert_ne!(api_bucket_key(&cw, &ctx), api_bucket_key(&amazon_q, &ctx));
+    }
+
+    #[test]
+    fn eu_codewhisperer_and_amazonq_share_one_bucket() {
+        let mut credentials = KiroCredentials::default();
+        credentials.region = Some("eu-west-1".to_string());
+        let config = Config::default();
+        let ctx = bucket_ctx(&credentials, &config);
+        let cw = IdeEndpoint::codewhisperer();
+        let amazon_q = IdeEndpoint::amazon_q();
+        assert_eq!(
+            api_bucket_key(&cw, &ctx),
+            "q.eu-central-1.amazonaws.com/generateAssistantResponse"
+        );
+        assert_eq!(api_bucket_key(&cw, &ctx), api_bucket_key(&amazon_q, &ctx));
+    }
+
+    #[test]
+    fn unique_queue_starts_at_primary_then_runtime_unused_ide_cli() {
+        let credentials = KiroCredentials::default();
+        let config = Config::default();
+        let ctx = bucket_ctx(&credentials, &config);
+        let registry = four_bucket_registry();
+        let names = |primary: &str| {
+            unique_api_buckets(&registry, registry.get(primary).unwrap().clone(), &ctx)
+                .into_iter()
+                .map(|endpoint| endpoint.name())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names("codewhisperer"),
+            ["codewhisperer", "runtime", "amazonq", "amazonq-cli"]
+        );
+        assert_eq!(
+            names("ide"),
+            ["codewhisperer", "runtime", "amazonq", "amazonq-cli"]
+        );
+        assert_eq!(
+            names("amazonq"),
+            ["amazonq", "runtime", "codewhisperer", "amazonq-cli"]
+        );
+        assert_eq!(
+            names("runtime"),
+            ["runtime", "codewhisperer", "amazonq", "amazonq-cli"]
+        );
+        assert_eq!(
+            names("amazonq-cli"),
+            ["amazonq-cli", "runtime", "codewhisperer", "amazonq"]
+        );
+        assert_eq!(
+            names("cli"),
+            ["amazonq-cli", "runtime", "codewhisperer", "amazonq"]
+        );
+    }
+
+    #[test]
+    fn unique_queue_skips_eu_amazonq_after_codewhisperer() {
+        let mut credentials = KiroCredentials::default();
+        credentials.region = Some("eu-central-1".to_string());
+        let config = Config::default();
+        let ctx = bucket_ctx(&credentials, &config);
+        let registry = four_bucket_registry();
+        let names: Vec<_> = unique_api_buckets(
+            &registry,
+            registry.get("codewhisperer").unwrap().clone(),
+            &ctx,
+        )
+        .into_iter()
+        .map(|endpoint| endpoint.name())
+        .collect();
+        assert_eq!(names, ["codewhisperer", "runtime", "amazonq-cli"]);
     }
 
     #[test]

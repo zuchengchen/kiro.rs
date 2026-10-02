@@ -786,7 +786,8 @@ credential.proxyUrl -> config.proxyUrl -> direct
 故障处理：
 
 - 单凭据连续 API 失败会增加失败计数，达到阈值后跳过。
-- 402 / quota exhausted 会禁用该凭据并切换。
+- 同一凭据上的 429，以及 402 月度限额（`MONTHLY_REQUEST_COUNT` / `OVERAGE_REQUEST_LIMIT_EXCEEDED`），会按 host+path 跳到该凭据尚未用过的上游桶。US 最多 4 个（runtime、CodeWhisperer、Amazon Q、amazonq-cli）；EU 的 CodeWhisperer 与 Amazon Q 共用一个桶。成功即停，不改写凭据 `endpoint`；全部耗尽后才冷却 / 禁用并换号。MCP 不换桶。后继桶的 401 / 403 立即停跳并换号，不再重走同一凭据。
+- 其它 402 / quota exhausted 会禁用该凭据并切换。
 - 401 / 403 中识别到 bearer token 失效时，会对该凭据强制刷新一次 token 后重试。
 - 429 + suspicious activity 可触发账号级冷却并切换凭据。
 - 400 客户端请求错误不会切换凭据。
