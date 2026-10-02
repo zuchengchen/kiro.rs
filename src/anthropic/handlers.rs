@@ -1762,6 +1762,32 @@ pub(crate) async fn execute_non_stream_request(
     );
     content.extend(tool_uses);
 
+    // CodeWhisperer / 空 200：上游成功结束但没有任何可见输出。不能回
+    // 200 + content:[] + end_turn，否则下游（Kilo / sub2api）当成正常完成。
+    if !non_stream_content_has_visible_output(&content) {
+        let message = super::stream::EMPTY_COMPLETION_ERROR_MESSAGE;
+        tracing::warn!(
+            model = %model,
+            stop_reason = %stop_reason,
+            "非流式响应未产生任何可见输出，返回 502"
+        );
+        hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
+        tracer.finalize(
+            "error",
+            Some(outcome::TRANSIENT),
+            Some(message),
+            None,
+            TraceUsage::zero(),
+        );
+        return Err(NonStreamExecutionError::Response(
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse::new("api_error", message)),
+            )
+                .into_response(),
+        ));
+    }
+
     // provider 未下发 metadataEvent 时才使用本地输出估算。
     let fallback_output_tokens = token::estimate_output_tokens(&content);
     let (
@@ -1841,6 +1867,25 @@ pub(crate) async fn execute_non_stream_request(
         },
     );
     Ok(response_body)
+}
+
+fn non_stream_content_has_visible_output(content: &[serde_json::Value]) -> bool {
+    content.iter().any(|block| match block.get("type").and_then(|v| v.as_str()) {
+        Some("text") => block
+            .get("text")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty()),
+        Some("thinking") => block
+            .get("thinking")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty()),
+        Some("redacted_thinking") => block
+            .get("data")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty()),
+        Some("tool_use") => true,
+        _ => false,
+    })
 }
 
 fn build_non_stream_content(
@@ -3094,6 +3139,16 @@ mod tests {
         assert_eq!(models[0].owned_by, "configured-owner");
         assert_eq!(models[0].context_window, 500_000);
         assert_eq!(models[0].max_tokens, 12_345);
+    }
+
+    #[test]
+    fn non_stream_content_empty_is_not_visible() {
+        assert!(!non_stream_content_has_visible_output(&[]));
+        assert!(!non_stream_content_has_visible_output(&[json!({"type":"text","text":""})]));
+        assert!(!non_stream_content_has_visible_output(&[json!({"type":"text","text":"   "})]));
+        assert!(non_stream_content_has_visible_output(&[json!({"type":"text","text":"pong"})]));
+        assert!(non_stream_content_has_visible_output(&[json!({"type":"thinking","thinking":"plan"})]));
+        assert!(non_stream_content_has_visible_output(&[json!({"type":"tool_use","id":"t1","name":"lookup"})]));
     }
 
     #[test]
