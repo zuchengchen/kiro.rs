@@ -13,9 +13,12 @@
 //!      （首轮写入最后一条 User，次轮从上一轮最后一条 User 读取）。自动断点占用 1 个断点槽。
 //!    - **显式 block 级缓存 (`cache_control`)**：仅在标记了 cache_control 的 block
 //!      处写入缓存 entry。
-//!    - **无 cache_control**：单元测试与显式关闭路径不计缓存。生产计量入口
-//!      （`inject_automatic`）会补一个顶层 ephemeral 自动断点（不带 ttl，走下方
-//!      智能路由），等价于官方 automatic caching，让客户端漏标时仍按多轮前缀命中。
+//!    - **无 cache_control / 仅 tools·system 标记**：单元测试与显式关闭路径不计缓存。
+//!      生产计量入口（`inject_automatic`）在 **messages 未声明断点** 时仍补一个顶层
+//!      ephemeral 自动断点（不带 ttl，走下方智能路由），即使 tools/system 已有
+//!      `cache_control`。messages 已有断点或显式断点已达 4 个上限时不补，避免
+//!      触发「>4 禁用全部计量」。等价于官方 automatic caching，让只标工具前缀的
+//!      客户端仍按多轮历史命中。
 //! 2. **20-Block Lookback 回溯查找**：
 //!    - 读取匹配时，从每个断点向后（回溯）最多检查 20 个 block，寻找此前真正写入过的
 //!      最长前缀断点。只能命中此前实际写入过的断点，未声明断点的中间 block 不会写入或命中。
@@ -792,6 +795,13 @@ enum LookbackGroup {
     ToolResult,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptSection {
+    Tool,
+    System,
+    Message,
+}
+
 /// 协议层打平后的一个 Prompt Block
 #[derive(Debug, Clone)]
 struct PromptBlock {
@@ -801,6 +811,7 @@ struct PromptBlock {
     invalid_cache_control: bool,
     cacheable: bool,
     lookback_group: Option<LookbackGroup>,
+    section: PromptSection,
     /// 是否为当前轮次的最新用户提问（若是，在多轮对话中自动缓存不应打在其末尾，而应打在上一轮末尾）
     is_current_turn_input: bool,
 }
@@ -831,6 +842,7 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
                 invalid_cache_control: false,
                 cacheable: true,
                 lookback_group: None,
+                section: PromptSection::Tool,
                 is_current_turn_input: false,
             });
         }
@@ -848,6 +860,7 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
                 invalid_cache_control: false,
                 cacheable: !sys.text.trim().is_empty(),
                 lookback_group: None,
+                section: PromptSection::System,
                 is_current_turn_input: false,
             });
         }
@@ -897,6 +910,7 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
                 invalid_cache_control,
                 cacheable: block_is_cacheable(&content),
                 lookback_group,
+                section: PromptSection::Message,
                 is_current_turn_input,
             });
         }
@@ -1068,7 +1082,9 @@ fn automatic_ephemeral() -> CacheControl {
     }
 }
 
-/// 客户端完全未声明断点时，生产路径补顶层自动缓存；已有顶层或 block 级标记则不改。
+/// 生产路径为漏标 messages 补顶层自动缓存。
+/// tools/system 上的 `cache_control` 不再抑制自动注入；messages 已有断点、
+/// 非法 cache_control、或显式断点已达 4 个上限时不补。
 fn effective_top_cache_control<'a>(
     req: &'a MessagesRequest,
     blocks: &[PromptBlock],
@@ -1081,10 +1097,20 @@ fn effective_top_cache_control<'a>(
     if !inject_automatic {
         return None;
     }
+    if blocks.iter().any(|block| block.invalid_cache_control) {
+        return None;
+    }
     if blocks
         .iter()
-        .any(|block| block.cache_control.is_some() || block.invalid_cache_control)
+        .any(|block| block.section == PromptSection::Message && block.cache_control.is_some())
     {
+        return None;
+    }
+    let explicit = blocks
+        .iter()
+        .filter(|block| block.cache_control.is_some())
+        .count();
+    if explicit >= MAX_BREAKPOINTS {
         return None;
     }
     Some(injected)
@@ -1104,7 +1130,7 @@ pub async fn compute_cache_usage(
 
 /// 异步计算缓存覆盖，新断点放入 [`PendingCacheWrites`]，调用方在响应开始后提交。
 ///
-/// `inject_automatic`：客户端完全未声明 `cache_control` 时补顶层自动断点。
+/// `inject_automatic`：客户端 messages 未声明 `cache_control` 时补顶层自动断点。
 pub async fn compute_cache_usage_deferred(
     cache: &CacheMeter,
     req: &MessagesRequest,
@@ -1390,6 +1416,7 @@ fn is_session_scoped(req: &MessagesRequest) -> bool {
 }
 
 /// 从 Claude Code 的 user_id 中提取 session 标识。
+/// 支持 JSON `session_id`、`_session_<token>`、以及 32-hex / UUID 形态的不透明 id。
 fn extract_session_id(user_id: &str) -> Option<String> {
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(user_id)
         && let Some(sid) = json
@@ -1401,10 +1428,25 @@ fn extract_session_id(user_id: &str) -> Option<String> {
         return Some(sid.to_string());
     }
 
-    user_id
-        .split_once("_session_")
-        .map(|(_, sid)| sid.trim().to_string())
-        .filter(|s| !s.is_empty())
+    if let Some((_, sid)) = user_id.split_once("_session_") {
+        let sid = sid.trim();
+        if !sid.is_empty() {
+            return Some(sid.to_string());
+        }
+    }
+
+    let trimmed = user_id.trim();
+    if is_opaque_session_id(trimmed) {
+        return Some(trimmed.to_string());
+    }
+    None
+}
+
+fn is_opaque_session_id(s: &str) -> bool {
+    if s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return true;
+    }
+    s.len() == 36 && s.chars().filter(|c| *c == '-').count() == 4
 }
 
 fn validated_ttl(cache_control: &CacheControl) -> Option<i64> {
@@ -1823,6 +1865,177 @@ mod tests {
         pending.commit_local(&cache);
         let (warm, _) = compute_cache_usage_sync_deferred(&cache, &req, 1, true);
         assert_eq!(warm.cache_read, cold.cache_covered_est);
+    }
+
+    #[test]
+    fn inject_automatic_covers_history_when_only_tools_are_marked() {
+        use super::super::types::{CacheControl, Message, MessagesRequest, Tool};
+        let cache = CacheMeter::new(None);
+        let cache_off = CacheMeter::new(None);
+        let history = claude_cacheable("History turn 1 ".repeat(50));
+        let follow = claude_cacheable("Follow-up ".repeat(20));
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-5-20250929".to_string(),
+            max_tokens: 32,
+            messages: vec![
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::Value::String(history),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::Value::String(claude_cacheable("ack ".repeat(40))),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::Value::String(follow),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: Some(vec![Tool {
+                tool_type: None,
+                name: "bash".to_string(),
+                description: "run".to_string(),
+                input_schema: Default::default(),
+                max_uses: None,
+                cache_control: Some(CacheControl {
+                    cache_type: "ephemeral".to_string(),
+                    ttl: None,
+                }),
+            }]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            cache_control: None,
+        };
+        let (tools_only, _) = compute_cache_usage_sync_deferred(&cache_off, &req, 1, false);
+        let (cold, pending) = compute_cache_usage_sync_deferred(&cache, &req, 1, true);
+        assert!(
+            cold.cache_covered_est > tools_only.cache_covered_est,
+            "auto breakpoint must cover history, not just tools: auto={} tools_only={}",
+            cold.cache_covered_est,
+            tools_only.cache_covered_est
+        );
+        assert_eq!(cold.cache_read, 0);
+        pending.commit_local(&cache);
+        let (warm, _) = compute_cache_usage_sync_deferred(&cache, &req, 1, true);
+        assert_eq!(warm.cache_read, cold.cache_covered_est);
+    }
+
+    #[test]
+    fn inject_automatic_skips_when_a_message_already_has_cache_control() {
+        use super::super::types::{Message, MessagesRequest};
+        let cache_auto = CacheMeter::new(None);
+        let cache_off = CacheMeter::new(None);
+        let history = claude_cacheable("History with explicit bp ".repeat(40));
+        let follow = claude_cacheable("Current turn ".repeat(20));
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-5-20250929".to_string(),
+            max_tokens: 32,
+            messages: vec![
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!([{
+                        "type": "text",
+                        "text": history,
+                        "cache_control": {"type": "ephemeral"}
+                    }]),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::Value::String("ack".repeat(40)),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::Value::String(follow),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            cache_control: None,
+        };
+        let (with_auto, pending_auto) =
+            compute_cache_usage_sync_deferred(&cache_auto, &req, 1, true);
+        let (without_auto, pending_off) =
+            compute_cache_usage_sync_deferred(&cache_off, &req, 1, false);
+        assert_eq!(with_auto.cache_covered_est, without_auto.cache_covered_est);
+        assert!(with_auto.cache_covered_est > 0);
+        pending_auto.commit_local(&cache_auto);
+        pending_off.commit_local(&cache_off);
+        let (warm_auto, _) = compute_cache_usage_sync_deferred(&cache_auto, &req, 1, true);
+        let (warm_off, _) = compute_cache_usage_sync_deferred(&cache_off, &req, 1, false);
+        assert_eq!(warm_auto.cache_read, warm_off.cache_read);
+        assert_eq!(warm_auto.cache_read, with_auto.cache_covered_est);
+    }
+
+    #[test]
+    fn inject_automatic_skips_when_four_explicit_breakpoints_exist() {
+        use super::super::types::{CacheControl, Message, MessagesRequest, SystemMessage, Tool};
+        let cache = CacheMeter::new(None);
+        let cc = Some(CacheControl {
+            cache_type: "ephemeral".to_string(),
+            ttl: None,
+        });
+        let long = claude_cacheable("explicit prefix ".repeat(40));
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-5-20250929".to_string(),
+            max_tokens: 32,
+            messages: vec![
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!([{
+                        "type": "text",
+                        "text": long.clone(),
+                        "cache_control": {"type": "ephemeral"}
+                    }]),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([{
+                        "type": "text",
+                        "text": long.clone(),
+                        "cache_control": {"type": "ephemeral"}
+                    }]),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::Value::String(claude_cacheable("current ".repeat(10))),
+                },
+            ],
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: long.clone(),
+                cache_control: cc.clone(),
+            }]),
+            tools: Some(vec![Tool {
+                tool_type: None,
+                name: "bash".to_string(),
+                description: long,
+                input_schema: Default::default(),
+                max_uses: None,
+                cache_control: cc,
+            }]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            cache_control: None,
+        };
+        let (usage, pending) = compute_cache_usage_sync_deferred(&cache, &req, 1, true);
+        assert!(
+            usage.cache_covered_est > 0,
+            "four explicit breakpoints must still meter; auto must not disable them"
+        );
+        pending.commit_local(&cache);
+        let (warm, _) = compute_cache_usage_sync_deferred(&cache, &req, 1, true);
+        assert_eq!(warm.cache_read, usage.cache_covered_est);
     }
 
     #[test]
@@ -3311,6 +3524,35 @@ mod tests {
         assert_eq!(
             extract_session_id(r#"{"device_id":"abc","session_id":""}"#),
             None
+        );
+    }
+
+    #[test]
+    fn extract_session_id_accepts_opaque_hex_and_json() {
+        let hex = "5d700df1aaaaaaaaaaaaaaaaaaaaaaaa";
+        assert_eq!(extract_session_id(hex), Some(hex.to_string()));
+        let json = format!(r#"{{"session_id":"{hex}"}}"#);
+        assert_eq!(extract_session_id(&json), Some(hex.to_string()));
+        assert_eq!(
+            isolation_seed(
+                &super::super::types::MessagesRequest {
+                    model: "claude-sonnet-4-5-20250929".to_string(),
+                    max_tokens: 32,
+                    messages: vec![],
+                    stream: false,
+                    system: None,
+                    tools: None,
+                    tool_choice: None,
+                    thinking: None,
+                    output_config: None,
+                    metadata: Some(super::super::types::Metadata {
+                        user_id: Some(json),
+                    }),
+                    cache_control: None,
+                },
+                1
+            ),
+            Some(format!("key:1:sess:{hex}"))
         );
     }
 

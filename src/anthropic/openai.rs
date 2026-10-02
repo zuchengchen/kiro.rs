@@ -114,7 +114,7 @@ pub async fn post_chat_completions(
     };
 
     // 2. 复用 Anthropic 全链路（内部强制非流式）
-    let inner = post_messages(State(state), Extension(key_ctx), Json(anthropic_req)).await;
+    let inner = post_messages(State(state), Extension(key_ctx), headers, Json(anthropic_req)).await;
 
     let status = inner.status();
     let retry_after = inner.headers().get(header::RETRY_AFTER).cloned();

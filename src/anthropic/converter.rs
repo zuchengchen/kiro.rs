@@ -610,34 +610,89 @@ impl std::fmt::Display for ConversionError {
 
 impl std::error::Error for ConversionError {}
 
-/// 从 metadata.user_id 中提取 session UUID
+/// 从 metadata.user_id 中提取 session 标识并规范为 36 字符 UUID。
 ///
-/// 支持两种格式:
+/// 支持:
 /// 1. 字符串格式: user_xxx_account__session_0b4445e1-f5be-49e1-87ce-62bbc28ad705
-/// 2. JSON 格式: {"device_id":"...","account_uuid":"...","session_id":"UUID"}
-///
-/// 提取 session UUID 作为 conversationId
+/// 2. JSON 格式: {"device_id":"...","account_uuid":"...","session_id":"UUID 或 32-hex"}
+/// 3. `_session_<token>` / 裸 32-hex：非 UUID 时映射为确定性 UUID v5
 fn extract_session_id(user_id: &str) -> Option<String> {
-    // 先尝试 JSON 解析
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(user_id) {
-        if let Some(session_id) = json.get("session_id").and_then(|v| v.as_str()) {
-            if is_valid_uuid(session_id) {
-                return Some(session_id.to_string());
-            }
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(user_id)
+        && let Some(session_id) = json
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    {
+        return Some(normalize_session_token(session_id));
+    }
+
+    if let Some((_, sid)) = user_id.split_once("_session_") {
+        let sid = sid.trim();
+        if !sid.is_empty() {
+            return Some(normalize_session_token(sid));
         }
     }
 
-    // 回退到字符串格式: 查找 "session_" 后面的内容
-    if let Some(pos) = user_id.find("session_") {
-        let session_part = &user_id[pos + 8..]; // "session_" 长度为 8
-        if session_part.len() >= 36 {
-            let uuid_str = &session_part[..36];
-            if is_valid_uuid(uuid_str) {
-                return Some(uuid_str.to_string());
-            }
-        }
+    let trimmed = user_id.trim();
+    if is_opaque_session_token(trimmed) {
+        return Some(normalize_session_token(trimmed));
     }
     None
+}
+
+fn is_opaque_session_token(s: &str) -> bool {
+    (s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit())) || is_valid_uuid(s)
+}
+
+fn normalize_session_token(token: &str) -> String {
+    if is_valid_uuid(token) {
+        token.to_string()
+    } else {
+        Uuid::new_v5(&Uuid::NAMESPACE_OID, token.as_bytes()).to_string()
+    }
+}
+
+fn first_user_text(messages: &[super::types::Message]) -> String {
+    for msg in messages {
+        if msg.role != "user" {
+            continue;
+        }
+        match &msg.content {
+            serde_json::Value::String(s) => return s.clone(),
+            serde_json::Value::Array(arr) => {
+                let mut out = String::new();
+                for block in arr {
+                    if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                        out.push_str(text);
+                    }
+                }
+                if !out.is_empty() {
+                    return out;
+                }
+            }
+            _ => {}
+        }
+    }
+    String::new()
+}
+
+fn fallback_conversation_id(req: &MessagesRequest) -> String {
+    let mut seed = first_user_text(&req.messages);
+    seed.push('\0');
+    if let Some(tools) = req.tools.as_ref() {
+        let mut names: Vec<&str> = tools
+            .iter()
+            .map(|t| t.name.as_str())
+            .filter(|n| !n.is_empty())
+            .collect();
+        names.sort_unstable();
+        for name in names {
+            seed.push_str(name);
+            seed.push('\0');
+        }
+    }
+    Uuid::new_v5(&Uuid::NAMESPACE_OID, seed.as_bytes()).to_string()
 }
 
 /// 简单验证 UUID 格式（36 字符，包含 4 个连字符）
@@ -764,13 +819,13 @@ pub(crate) fn convert_request_with_purpose(
     };
 
     // 3. 生成会话 ID 和代理 ID
-    // 优先从 metadata.user_id 中提取 session UUID 作为 conversationId
+    // 优先从 metadata.user_id 提取 session；否则用首条 user 文本 + 工具名的确定性 UUID v5。
     let conversation_id = req
         .metadata
         .as_ref()
         .and_then(|m| m.user_id.as_ref())
         .and_then(|user_id| extract_session_id(user_id))
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+        .unwrap_or_else(|| fallback_conversation_id(req));
     // agentContinuationId 从 conversationId 确定性派生，让同一会话的请求体在会话 id 之外
     // 完全一致。实测上游 prompt cache 按内容前缀匹配、与会话 id 无关，所以这一步对缓存
     // 没有直接收益；保留确定性只是为了请求可复现、便于排查。
@@ -3179,10 +3234,14 @@ mod tests {
 
     #[test]
     fn test_extract_session_id_json_invalid_session() {
-        // 测试 JSON 格式但 session_id 不是有效 UUID
         let user_id = r#"{"device_id":"abc","session_id":"not-a-uuid"}"#;
-        let session_id = extract_session_id(user_id);
-        assert_eq!(session_id, None);
+        let session_id = extract_session_id(user_id).expect("opaque session maps to uuid v5");
+        assert!(is_valid_uuid(&session_id));
+        assert_eq!(session_id, normalize_session_token("not-a-uuid"));
+        assert_eq!(
+            extract_session_id(user_id),
+            extract_session_id(r#"{"session_id":"not-a-uuid"}"#)
+        );
     }
 
     #[test]
@@ -3195,10 +3254,21 @@ mod tests {
 
     #[test]
     fn test_extract_session_id_invalid_uuid() {
-        // 测试无效的 UUID 格式
         let user_id = "user_xxx_session_invalid-uuid";
-        let session_id = extract_session_id(user_id);
-        assert_eq!(session_id, None);
+        let session_id = extract_session_id(user_id).expect("opaque _session_ token maps to uuid v5");
+        assert!(is_valid_uuid(&session_id));
+        assert_eq!(session_id, normalize_session_token("invalid-uuid"));
+    }
+
+    #[test]
+    fn test_extract_session_id_opaque_hex() {
+        let hex = "5d700df1aaaaaaaaaaaaaaaaaaaaaaaa";
+        let from_raw = extract_session_id(hex).expect("32-hex is opaque session");
+        let from_json = extract_session_id(&format!(r#"{{"session_id":"{hex}"}}"#))
+            .expect("json 32-hex is opaque session");
+        assert!(is_valid_uuid(&from_raw));
+        assert_eq!(from_raw, from_json);
+        assert_eq!(from_raw, normalize_session_token(hex));
     }
 
     #[test]
@@ -3275,17 +3345,17 @@ mod tests {
         };
 
         let result = convert_request(&req).unwrap();
-        // 验证生成的是有效的 UUID 格式
-        assert_eq!(result.conversation_state.conversation_id.len(), 36);
+        let again = convert_request(&req).unwrap();
         assert_eq!(
-            result
-                .conversation_state
-                .conversation_id
-                .chars()
-                .filter(|c| *c == '-')
-                .count(),
-            4
+            result.conversation_state.conversation_id,
+            again.conversation_state.conversation_id
         );
+        assert!(is_valid_uuid(&result.conversation_state.conversation_id));
+
+        let mut other = req;
+        other.messages[0].content = serde_json::json!("Different first user text");
+        let other_id = convert_request(&other).unwrap().conversation_state.conversation_id;
+        assert_ne!(result.conversation_state.conversation_id, other_id);
     }
 
     #[test]

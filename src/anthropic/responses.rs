@@ -250,7 +250,7 @@ pub async fn post_responses(
     };
 
     // 2. 复用 Anthropic 全链路。流式请求会得到标准 Anthropic SSE。
-    let inner = post_messages(State(state), Extension(key_ctx), Json(anthropic_req)).await;
+    let inner = post_messages(State(state), Extension(key_ctx), headers, Json(anthropic_req)).await;
 
     let status = inner.status();
     // 非 2xx 与流式都必须在缓冲整个 body 之前分流：流式响应不能被 to_bytes 吃掉
