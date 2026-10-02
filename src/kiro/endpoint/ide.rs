@@ -136,15 +136,6 @@ impl KiroEndpoint for IdeEndpoint {
         }
     }
 
-    fn fallback_name(&self) -> Option<&'static str> {
-        match self.kind {
-            EditorEndpointKind::KiroRuntime => Some(CODEWHISPERER_ENDPOINT_NAME),
-            EditorEndpointKind::CodeWhisperer | EditorEndpointKind::AmazonQ => {
-                Some(RUNTIME_ENDPOINT_NAME)
-            }
-        }
-    }
-
     fn requires_codewhisperer_model_id(&self) -> bool {
         self.kind == EditorEndpointKind::CodeWhisperer
     }
@@ -211,15 +202,10 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_fallbacks_form_the_expected_ring() {
-        let codewhisperer = IdeEndpoint::codewhisperer();
-        let amazon_q = IdeEndpoint::amazon_q();
-        let runtime = IdeEndpoint::runtime();
-        assert_eq!(codewhisperer.fallback_name(), Some(RUNTIME_ENDPOINT_NAME));
-        assert_eq!(amazon_q.fallback_name(), Some(RUNTIME_ENDPOINT_NAME));
-        assert_eq!(runtime.fallback_name(), Some(CODEWHISPERER_ENDPOINT_NAME));
-        assert!(codewhisperer.requires_codewhisperer_model_id());
-        assert!(!runtime.requires_codewhisperer_model_id());
+    fn only_codewhisperer_requires_internal_model_id() {
+        assert!(IdeEndpoint::codewhisperer().requires_codewhisperer_model_id());
+        assert!(!IdeEndpoint::amazon_q().requires_codewhisperer_model_id());
+        assert!(!IdeEndpoint::runtime().requires_codewhisperer_model_id());
     }
 
     #[test]

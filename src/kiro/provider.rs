@@ -13,7 +13,9 @@ use tokio::time::sleep;
 
 use crate::admin::trace_db::{TraceAttempt, TraceRoute, TraceSink, outcome, truncate_snippet};
 use crate::http_client::{ProxyConfig, build_client};
-use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
+use crate::kiro::endpoint::{
+    KiroEndpoint, RequestContext, unique_api_buckets as unique_api_bucket_queue,
+};
 use crate::kiro::error::{
     is_model_temporarily_unavailable, UpstreamContextOverflowError, UpstreamRateLimitError,
 };
@@ -38,8 +40,15 @@ const MAX_TOTAL_RETRIES: usize = 4;
 /// 代理池条目较多时，避免每个不同代理都常驻一个 reqwest::Client 导致内存无界增长。
 const CLIENT_CACHE_CAP: usize = 64;
 
-/// The fallback must resolve before the outer stream's zero-byte guard fires.
+/// Later unique-bucket hops must resolve before the outer stream's zero-byte guard fires.
+///
+/// Tests use 200ms so a hung hop can trip this without waiting on real I/O: the
+/// mock server's `accept()` keeps the runtime busy, so `tokio::time::pause`
+/// cannot auto-advance a 10s timer.
+#[cfg(not(test))]
 const FALLBACK_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const FALLBACK_FIRST_BYTE_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Failed profile discovery is retried after a bounded negative-cache window.
 const PROFILE_RESOLUTION_NEGATIVE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -202,6 +211,15 @@ impl KiroProvider {
             .get(name)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
+    }
+
+    /// Unique data-plane buckets for this request: primary first, then unused host+path.
+    fn unique_api_buckets(
+        &self,
+        primary: Arc<dyn KiroEndpoint>,
+        ctx: &RequestContext<'_>,
+    ) -> Vec<Arc<dyn KiroEndpoint>> {
+        unique_api_bucket_queue(&self.endpoints, primary, ctx)
     }
 
     /// 在发起请求前，确保 Enterprise / IdC 账号的真实 profileArn 已解析并写入 `ctx`。
@@ -858,6 +876,7 @@ impl KiroProvider {
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        let mut hop_seq: usize = 0;
         let api_type = if is_stream { "流式" } else { "非流式" };
 
         // 尝试从请求体中提取模型与会话标识
@@ -888,8 +907,8 @@ impl KiroProvider {
                 }
                 Err(e) => {
                     if is_rate_limit_error(&e) {
-                        Self::emit_attempt(
-                            sink, attempt, 0, "", None, outcome::TRANSIENT,
+                        Self::emit_attempt_seq(
+                            sink, &mut hop_seq, 0, "", None, outcome::TRANSIENT,
                             Some(&e.to_string()), attempt_start,
                         );
                         return Err(e);
@@ -897,8 +916,8 @@ impl KiroProvider {
                     if let Some(rate_limit) = take_rate_limit_error(&mut last_error) {
                         return Err(rate_limit);
                     }
-                    Self::emit_attempt(
-                        sink, attempt, 0, "", None, outcome::UNKNOWN,
+                    Self::emit_attempt_seq(
+                        sink, &mut hop_seq, 0, "", None, outcome::UNKNOWN,
                         Some(&e.to_string()), attempt_start,
                     );
                     last_error = Some(e);
@@ -908,9 +927,9 @@ impl KiroProvider {
 
             // 确保 Enterprise / IdC 账号的真实 profileArn 已解析（流式端点强制要求）
             if let Err(e) = self.ensure_profile_arn(&mut ctx).await {
-                Self::emit_attempt(
+                Self::emit_attempt_seq(
                     sink,
-                    attempt,
+                        &mut hop_seq,
                     ctx.id,
                     "",
                     None,
@@ -927,9 +946,9 @@ impl KiroProvider {
             let mut endpoint = match self.endpoint_for(&ctx.credentials) {
                 Ok(e) => e,
                 Err(e) => {
-                    Self::emit_attempt(
+                    Self::emit_attempt_seq(
                         sink,
-                        attempt,
+                        &mut hop_seq,
                         ctx.id,
                         "",
                         None,
@@ -970,9 +989,9 @@ impl KiroProvider {
                         max_retries,
                         e
                     );
-                    Self::emit_attempt(
+                    Self::emit_attempt_seq(
                         sink,
-                        attempt,
+                        &mut hop_seq,
                         ctx.id,
                         endpoint_name,
                         None,
@@ -1010,9 +1029,9 @@ impl KiroProvider {
 
             // 成功响应
             if status.is_success() {
-                Self::emit_attempt(
+                Self::emit_attempt_seq(
                     sink,
-                    attempt,
+                    &mut hop_seq,
                     ctx.id,
                     endpoint_name,
                     Some(status.as_u16()),
@@ -1038,100 +1057,235 @@ impl KiroProvider {
             let mut primary_response = Some(response);
             let mut error_body: Option<String> = None;
             let mut fallback_exhausted = false;
+            let mut skip_failed_emit = false;
+            let mut hop_aborted = false;
+            let mut hop_saw_429 = status.as_u16() == 429;
+            let mut hop_saw_402_quota = false;
+            let mut later_hop_replaced_auth = false;
 
-            // runtime.kiro.dev and *.amazonaws.com use independent limit
-            // buckets. A 429 gets exactly one same-account retry on the paired
-            // bucket before account cooldown/credential failover sees it.
-            if status.as_u16() == 429
-                && let Some(fallback_name) = endpoint.fallback_name()
-                && let Some(fallback_endpoint) = self.endpoints.get(fallback_name).cloned()
-            {
-                // Dropping reqwest::Response cancels/releases its body. The
-                // fallback first-byte budget therefore starts immediately
-                // after the primary response headers arrive.
+            if status.as_u16() == 402 {
+                let body = match primary_response.take() {
+                    Some(response) => response.text().await.unwrap_or_default(),
+                    None => String::new(),
+                };
+                if endpoint.is_monthly_request_limit(&body) {
+                    hop_saw_402_quota = true;
+                }
+                error_body = Some(body);
+            }
+
+            let remaining_buckets: Vec<_> = self
+                .unique_api_buckets(Arc::clone(&endpoint), &rctx)
+                .into_iter()
+                .skip(1)
+                .collect();
+            let should_hop = (status.as_u16() == 429 || hop_saw_402_quota)
+                && !remaining_buckets.is_empty();
+
+            if should_hop {
+                // Dropping reqwest::Response cancels/releases its body. Later
+                // unique-bucket first-byte budgets therefore start immediately.
                 drop(primary_response.take());
-                error_body = Some(format!("Quota exhausted on {}", endpoint.display_name()));
+                if error_body.is_none() {
+                    error_body = Some(format!("Quota exhausted on {}", endpoint.display_name()));
+                }
+                let hop_outcome = if hop_saw_402_quota {
+                    outcome::QUOTA_EXHAUSTED
+                } else {
+                    outcome::TRANSIENT
+                };
+                Self::emit_attempt_seq(
+                    sink,
+                    &mut hop_seq,
+                    ctx.id,
+                    endpoint_name,
+                    Some(status.as_u16()),
+                    hop_outcome,
+                    error_body.as_deref(),
+                    attempt_start,
+                );
+                skip_failed_emit = true;
                 tracing::warn!(
-                    "[Kiro] Endpoint {} 429, retry on fallback {} (same account)",
+                    "[Kiro] Endpoint {} {} , walk remaining unique buckets (same account)",
                     endpoint.display_name(),
-                    fallback_endpoint.display_name()
+                    status.as_u16()
                 );
 
-                let fallback_result = tokio::time::timeout(
-                    FALLBACK_FIRST_BYTE_TIMEOUT,
-                    self.execute_endpoint_api_request(
-                        fallback_endpoint.as_ref(),
-                        ctx.id,
-                        &ctx.credentials,
-                        request_body,
-                        &rctx,
-                    ),
-                )
-                .await;
+                for hop_endpoint in remaining_buckets {
+                    let hop_start = Instant::now();
+                    let hop_result = tokio::time::timeout(
+                        FALLBACK_FIRST_BYTE_TIMEOUT,
+                        self.execute_endpoint_api_request(
+                            hop_endpoint.as_ref(),
+                            ctx.id,
+                            &ctx.credentials,
+                            request_body,
+                            &rctx,
+                        ),
+                    )
+                    .await;
 
-                match fallback_result {
-                    Ok(Ok(fallback_response)) => {
-                        let fallback_status = fallback_response.status();
-                        if fallback_status.is_success() {
-                            tracing::info!(
-                                "[Kiro] Fallback endpoint {} succeeded after {} 429",
-                                fallback_endpoint.display_name(),
-                                endpoint.display_name()
-                            );
-                            Self::emit_attempt(
-                                sink,
-                                attempt,
-                                ctx.id,
-                                fallback_endpoint.name(),
-                                Some(fallback_status.as_u16()),
-                                outcome::SUCCESS,
-                                None,
-                                attempt_start,
-                            );
-                            self.token_manager
-                                .report_success_for_request(ctx.id, model.as_deref());
-                            // 同账号换桶救回也算该凭据成功服务了会话，与主桶成功路径一致
-                            if let Some(session) = session_id.as_deref() {
-                                self.token_manager.bind_session(session, ctx.id);
+                    match hop_result {
+                        Ok(Ok(hop_response)) => {
+                            let hop_status = hop_response.status();
+                            if hop_status.is_success() {
+                                tracing::info!(
+                                    "[Kiro] Unique bucket {} succeeded after {} {}",
+                                    hop_endpoint.display_name(),
+                                    endpoint.display_name(),
+                                    status.as_u16()
+                                );
+                                Self::emit_attempt_seq(
+                                    sink,
+                                    &mut hop_seq,
+                                    ctx.id,
+                                    hop_endpoint.name(),
+                                    Some(hop_status.as_u16()),
+                                    outcome::SUCCESS,
+                                    None,
+                                    hop_start,
+                                );
+                                self.token_manager
+                                    .report_success_for_request(ctx.id, model.as_deref());
+                                if let Some(session) = session_id.as_deref() {
+                                    self.token_manager.bind_session(session, ctx.id);
+                                }
+                                return Ok(KiroCallResult {
+                                    response: hop_response,
+                                    credential_id: ctx.id,
+                                });
                             }
-                            return Ok(KiroCallResult {
-                                response: fallback_response,
-                                credential_id: ctx.id,
-                            });
-                        }
 
-                        let fallback_rate_limit = (fallback_status.as_u16() == 429).then(|| {
-                            UpstreamRateLimitError::from_headers(fallback_response.headers())
-                        });
-                        let fallback_body = fallback_response.text().await.unwrap_or_default();
+                            if hop_status.as_u16() == 429 {
+                                hop_saw_429 = true;
+                                rate_limit_error = Some(UpstreamRateLimitError::from_headers(
+                                    hop_response.headers(),
+                                ));
+                                drop(hop_response);
+                                Self::emit_attempt_seq(
+                                    sink,
+                                    &mut hop_seq,
+                                    ctx.id,
+                                    hop_endpoint.name(),
+                                    Some(429),
+                                    outcome::TRANSIENT,
+                                    Some(&format!(
+                                        "Quota exhausted on {}",
+                                        hop_endpoint.display_name()
+                                    )),
+                                    hop_start,
+                                );
+                                continue;
+                            }
 
-                        if matches!(fallback_status.as_u16(), 401 | 403) {
-                            // Auth/suspension evidence from the actual request
-                            // must not be hidden behind the primary 429.
-                            endpoint = fallback_endpoint;
-                            endpoint_name = endpoint.name();
-                            status = fallback_status;
-                            rate_limit_error = fallback_rate_limit;
-                            error_body = Some(fallback_body);
-                        } else {
-                            fallback_exhausted = true;
+                            let hop_body = hop_response.text().await.unwrap_or_default();
+                            if hop_status.as_u16() == 402
+                                && hop_endpoint.is_monthly_request_limit(&hop_body)
+                            {
+                                hop_saw_402_quota = true;
+                                Self::emit_attempt_seq(
+                                    sink,
+                                    &mut hop_seq,
+                                    ctx.id,
+                                    hop_endpoint.name(),
+                                    Some(402),
+                                    outcome::QUOTA_EXHAUSTED,
+                                    Some(&hop_body),
+                                    hop_start,
+                                );
+                                error_body = Some(hop_body);
+                                continue;
+                            }
+
+                            if hop_endpoint.is_client_validation_error(&hop_body)
+                                || matches!(hop_status.as_u16(), 401 | 403)
+                                || (hop_status.as_u16() == 400)
+                                || (hop_status.as_u16() == 403
+                                    && hop_endpoint.is_account_suspended(&hop_body))
+                            {
+                                // Auth/validation evidence from the actual hop
+                                // must not be hidden behind the triggering 429/402.
+                                endpoint = hop_endpoint;
+                                endpoint_name = endpoint.name();
+                                status = hop_status;
+                                rate_limit_error = (hop_status.as_u16() == 429).then(|| {
+                                    UpstreamRateLimitError::new(None)
+                                });
+                                error_body = Some(hop_body);
+                                skip_failed_emit = false;
+                                hop_aborted = false;
+                                later_hop_replaced_auth = matches!(hop_status.as_u16(), 401 | 403);
+                                break;
+                            }
+
+                            hop_aborted = true;
                             tracing::warn!(
-                                "[Kiro] Fallback endpoint {} also failed ({}), keep quota semantics",
-                                fallback_endpoint.display_name(),
-                                fallback_status.as_u16()
+                                "[Kiro] Unique bucket {} also failed ({}), keep trigger semantics",
+                                hop_endpoint.display_name(),
+                                hop_status.as_u16()
                             );
+                            Self::emit_attempt_seq(
+                                sink,
+                                &mut hop_seq,
+                                ctx.id,
+                                hop_endpoint.name(),
+                                Some(hop_status.as_u16()),
+                                outcome::TRANSIENT,
+                                Some(&hop_body),
+                                hop_start,
+                            );
+                            break;
+                        }
+                        Ok(Err(error)) => {
+                            hop_aborted = true;
+                            tracing::warn!(
+                                "[Kiro] Unique bucket {} request error: {}",
+                                hop_endpoint.display_name(),
+                                error
+                            );
+                            Self::emit_attempt_seq(
+                                sink,
+                                &mut hop_seq,
+                                ctx.id,
+                                hop_endpoint.name(),
+                                None,
+                                outcome::NETWORK_ERROR,
+                                Some(&error.to_string()),
+                                hop_start,
+                            );
+                            break;
+                        }
+                        Err(_) => {
+                            hop_aborted = true;
+                            tracing::warn!(
+                                "[Kiro] Unique bucket {} request error: first-byte timeout ({}ms)",
+                                hop_endpoint.display_name(),
+                                FALLBACK_FIRST_BYTE_TIMEOUT.as_millis()
+                            );
+                            Self::emit_attempt_seq(
+                                sink,
+                                &mut hop_seq,
+                                ctx.id,
+                                hop_endpoint.name(),
+                                None,
+                                outcome::NETWORK_ERROR,
+                                Some(&format!(
+                                    "first-byte timeout ({}ms)",
+                                    FALLBACK_FIRST_BYTE_TIMEOUT.as_millis()
+                                )),
+                                hop_start,
+                            );
+                            break;
                         }
                     }
-                    Ok(Err(error)) => {
-                        fallback_exhausted = true;
-                        tracing::warn!("[Kiro] Fallback endpoint request error: {}", error);
-                    }
-                    Err(_) => {
-                        fallback_exhausted = true;
-                        tracing::warn!(
-                            "[Kiro] Fallback endpoint request error: first-byte timeout ({}ms)",
-                            FALLBACK_FIRST_BYTE_TIMEOUT.as_millis()
-                        );
+                }
+                if skip_failed_emit {
+                    fallback_exhausted = true;
+                    if hop_saw_429 {
+                        status = reqwest::StatusCode::TOO_MANY_REQUESTS;
+                        if rate_limit_error.is_none() {
+                            rate_limit_error = Some(UpstreamRateLimitError::new(None));
+                        }
                     }
                 }
             }
@@ -1144,8 +1298,9 @@ impl KiroProvider {
                 },
             };
 
-            // 402 Payment Required 且额度用尽：禁用凭据并故障转移
-            if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
+            // 全部独特桶 402 额度尽：禁用凭据并换号。链被后跳 5xx/超时打断时
+            // 保留触发换桶的 402，不禁用（CLI 可能仍有额度）。
+            if status.as_u16() == 402 && hop_saw_402_quota && !hop_aborted {
                 tracing::warn!(
                     "API 请求失败（额度已用尽，禁用凭据并切换，尝试 {}/{}）: {} {}",
                     attempt + 1,
@@ -1153,16 +1308,18 @@ impl KiroProvider {
                     status,
                     body
                 );
-                Self::emit_attempt(
-                    sink,
-                    attempt,
-                    ctx.id,
-                    endpoint_name,
-                    Some(status.as_u16()),
-                    outcome::QUOTA_EXHAUSTED,
-                    Some(&body),
-                    attempt_start,
-                );
+                if !skip_failed_emit {
+                    Self::emit_attempt_seq(
+                        sink,
+                        &mut hop_seq,
+                        ctx.id,
+                        endpoint_name,
+                        Some(status.as_u16()),
+                        outcome::QUOTA_EXHAUSTED,
+                        Some(&body),
+                        attempt_start,
+                    );
+                }
 
                 let has_available = self.token_manager.report_quota_exhausted_for_request(
                     ctx.id,
@@ -1189,16 +1346,18 @@ impl KiroProvider {
 
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
-                Self::emit_attempt(
-                    sink,
-                    attempt,
-                    ctx.id,
-                    endpoint_name,
-                    Some(400),
-                    outcome::BAD_REQUEST,
-                    Some(&body),
-                    attempt_start,
-                );
+                if !skip_failed_emit {
+                    Self::emit_attempt_seq(
+                        sink,
+                        &mut hop_seq,
+                        ctx.id,
+                        endpoint_name,
+                        Some(400),
+                        outcome::BAD_REQUEST,
+                        Some(&body),
+                        attempt_start,
+                    );
+                }
                 if body.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
                     return Err(UpstreamContextOverflowError.into());
                 }
@@ -1220,16 +1379,18 @@ impl KiroProvider {
                         status,
                         body
                     );
-                    Self::emit_attempt(
-                        sink,
-                        attempt,
-                        ctx.id,
-                        endpoint_name,
-                        Some(403),
-                        outcome::ACCOUNT_SUSPENDED,
-                        Some(&body),
-                        attempt_start,
-                    );
+                    if !skip_failed_emit {
+                        Self::emit_attempt_seq(
+                            sink,
+                            &mut hop_seq,
+                            ctx.id,
+                            endpoint_name,
+                            Some(403),
+                            outcome::ACCOUNT_SUSPENDED,
+                            Some(&body),
+                            attempt_start,
+                        );
+                    }
 
                     let has_available = self.token_manager.report_suspended_for_request(
                         ctx.id,
@@ -1260,16 +1421,18 @@ impl KiroProvider {
                     status,
                     body
                 );
-                Self::emit_attempt(
-                    sink,
-                    attempt,
-                    ctx.id,
-                    endpoint_name,
-                    Some(status.as_u16()),
-                    outcome::AUTH_FAILED,
-                    Some(&body),
-                    attempt_start,
-                );
+                if !skip_failed_emit {
+                    Self::emit_attempt_seq(
+                        sink,
+                        &mut hop_seq,
+                        ctx.id,
+                        endpoint_name,
+                        Some(status.as_u16()),
+                        outcome::AUTH_FAILED,
+                        Some(&body),
+                        attempt_start,
+                    );
+                }
 
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
@@ -1302,6 +1465,26 @@ impl KiroProvider {
                     status,
                     body
                 ));
+                // A later unique-bucket hop already proved this account cannot
+                // continue. Re-walking the same unused-bucket queue on the next
+                // outer attempt only repeats the 429/401 pair. Switch accounts
+                // when possible; otherwise stop instead of burning the remaining
+                // per-credential retries on the same chain.
+                if later_hop_replaced_auth {
+                    if !self.token_manager.has_other_available_for_request(
+                        ctx.id,
+                        model.as_deref(),
+                        group,
+                    ) {
+                        return Err(last_error.take().unwrap());
+                    }
+                    self.token_manager.report_transient_throttle_for_request(
+                        ctx.id,
+                        Self::retry_delay(attempt),
+                        model.as_deref(),
+                        group,
+                    );
+                }
                 continue;
             }
 
@@ -1331,16 +1514,18 @@ impl KiroProvider {
                     model.as_deref(),
                     group,
                 );
-                Self::emit_attempt(
-                    sink,
-                    attempt,
-                    ctx.id,
-                    endpoint_name,
-                    Some(429),
-                    outcome::ACCOUNT_THROTTLED,
-                    Some(&body),
-                    attempt_start,
-                );
+                if !skip_failed_emit {
+                    Self::emit_attempt_seq(
+                        sink,
+                        &mut hop_seq,
+                        ctx.id,
+                        endpoint_name,
+                        Some(429),
+                        outcome::ACCOUNT_THROTTLED,
+                        Some(&body),
+                        attempt_start,
+                    );
+                }
                 // 账号级风控通常不返回 Retry-After；此时使用本地实际冷却时间，
                 // 让下游网关在同一时段内也停止调度该虚拟账号。
                 let (rate_limit_error, must_wait_for_upstream) =
@@ -1369,16 +1554,18 @@ impl KiroProvider {
                     status,
                     body
                 );
-                Self::emit_attempt(
-                    sink,
-                    attempt,
-                    ctx.id,
-                    endpoint_name,
-                    Some(status.as_u16()),
-                    outcome::BAD_REQUEST,
-                    Some(&body),
-                    attempt_start,
-                );
+                if !skip_failed_emit {
+                    Self::emit_attempt_seq(
+                        sink,
+                        &mut hop_seq,
+                        ctx.id,
+                        endpoint_name,
+                        Some(status.as_u16()),
+                        outcome::BAD_REQUEST,
+                        Some(&body),
+                        attempt_start,
+                    );
+                }
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
@@ -1387,16 +1574,18 @@ impl KiroProvider {
             // 重新建连。
             if status.as_u16() == 524 || endpoint.is_gateway_timeout(&body) {
                 tracing::warn!("API 请求失败（上游网关超时，不重试）: {} {}", status, body);
-                Self::emit_attempt(
-                    sink,
-                    attempt,
-                    ctx.id,
-                    endpoint_name,
-                    Some(status.as_u16()),
-                    outcome::TRANSIENT,
-                    Some(&body),
-                    attempt_start,
-                );
+                if !skip_failed_emit {
+                    Self::emit_attempt_seq(
+                        sink,
+                        &mut hop_seq,
+                        ctx.id,
+                        endpoint_name,
+                        Some(status.as_u16()),
+                        outcome::TRANSIENT,
+                        Some(&body),
+                        attempt_start,
+                    );
+                }
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
@@ -1410,16 +1599,18 @@ impl KiroProvider {
                     status,
                     body
                 );
-                Self::emit_attempt(
-                    sink,
-                    attempt,
-                    ctx.id,
-                    endpoint_name,
-                    Some(status.as_u16()),
-                    outcome::TRANSIENT,
-                    Some(&body),
-                    attempt_start,
-                );
+                if !skip_failed_emit {
+                    Self::emit_attempt_seq(
+                        sink,
+                        &mut hop_seq,
+                        ctx.id,
+                        endpoint_name,
+                        Some(status.as_u16()),
+                        outcome::TRANSIENT,
+                        Some(&body),
+                        attempt_start,
+                    );
+                }
                 last_error = if let Some(rate_limit) = rate_limit_error {
                     if !rate_limit.should_retry_locally() {
                         return Err(rate_limit.into());
@@ -1483,16 +1674,18 @@ impl KiroProvider {
 
             // 其他 4xx - 通常为请求/配置问题：直接返回，不计入凭据失败
             if status.is_client_error() {
-                Self::emit_attempt(
-                    sink,
-                    attempt,
-                    ctx.id,
-                    endpoint_name,
-                    Some(status.as_u16()),
-                    outcome::BAD_REQUEST,
-                    Some(&body),
-                    attempt_start,
-                );
+                if !skip_failed_emit {
+                    Self::emit_attempt_seq(
+                        sink,
+                        &mut hop_seq,
+                        ctx.id,
+                        endpoint_name,
+                        Some(status.as_u16()),
+                        outcome::BAD_REQUEST,
+                        Some(&body),
+                        attempt_start,
+                    );
+                }
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
@@ -1504,16 +1697,18 @@ impl KiroProvider {
                 status,
                 body
             );
-            Self::emit_attempt(
-                sink,
-                attempt,
-                ctx.id,
-                endpoint_name,
-                Some(status.as_u16()),
-                outcome::UNKNOWN,
-                Some(&body),
-                attempt_start,
-            );
+            if !skip_failed_emit {
+                Self::emit_attempt_seq(
+                    sink,
+                    &mut hop_seq,
+                    ctx.id,
+                    endpoint_name,
+                    Some(status.as_u16()),
+                    outcome::UNKNOWN,
+                    Some(&body),
+                    attempt_start,
+                );
+            }
             last_error = Some(anyhow::anyhow!(
                 "{} API 请求失败: {} {}",
                 api_type,
@@ -1533,6 +1728,29 @@ impl KiroProvider {
                 max_retries
             )
         }))
+    }
+
+    fn emit_attempt_seq(
+        sink: Option<&dyn TraceSink>,
+        hop_seq: &mut usize,
+        credential_id: u64,
+        endpoint: &str,
+        http_status: Option<u16>,
+        outcome: &str,
+        error_body: Option<&str>,
+        started: Instant,
+    ) {
+        Self::emit_attempt(
+            sink,
+            *hop_seq,
+            credential_id,
+            endpoint,
+            http_status,
+            outcome,
+            error_body,
+            started,
+        );
+        *hop_seq += 1;
     }
 
     /// 向 trace sink 上报一跳结果（sink 为 None 时无开销）
@@ -1655,13 +1873,16 @@ fn account_rate_limit_with_fallback(
 #[cfg(test)]
 mod rate_limit_tests {
     use super::*;
-    use axum::{Router, http::StatusCode, routing::post};
+    use crate::kiro::endpoint::{apply_payload_model_id, transform_streaming_payload};
+    use axum::{Router, extract::Request, http::StatusCode, routing::post};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct MockEndpoint {
         name: &'static str,
         url: String,
-        fallback: Option<&'static str>,
+        mcp_url: String,
     }
 
     impl KiroEndpoint for MockEndpoint {
@@ -1669,16 +1890,12 @@ mod rate_limit_tests {
             self.name
         }
 
-        fn fallback_name(&self) -> Option<&'static str> {
-            self.fallback
-        }
-
         fn api_url(&self, _ctx: &RequestContext<'_>) -> String {
             self.url.clone()
         }
 
         fn mcp_url(&self, _ctx: &RequestContext<'_>) -> String {
-            self.url.clone()
+            self.mcp_url.clone()
         }
 
         fn decorate_api(
@@ -1698,105 +1915,347 @@ mod rate_limit_tests {
         }
 
         fn transform_api_body(&self, body: &str, _ctx: &RequestContext<'_>) -> String {
-            body.to_string()
+            match self.name {
+                "codewhisperer" => apply_payload_model_id(body, "internal-cw-model"),
+                "amazonq-cli" => transform_streaming_payload(body, None, "CLI", true),
+                _ => transform_streaming_payload(body, None, "AI_EDITOR", false),
+            }
         }
     }
 
-    async fn mock_upstreams(
-        fallback_status: StatusCode,
-        fallback_body: &'static str,
-    ) -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
-        let primary_count = Arc::new(AtomicUsize::new(0));
-        let fallback_count = Arc::new(AtomicUsize::new(0));
-        let primary_counter = Arc::clone(&primary_count);
-        let fallback_counter = Arc::clone(&fallback_count);
-        let app = Router::new()
-            .route(
-                "/primary",
-                post(move || {
-                    let counter = Arc::clone(&primary_counter);
-                    async move {
-                        counter.fetch_add(1, Ordering::SeqCst);
-                        (
-                            StatusCode::TOO_MANY_REQUESTS,
-                            r#"{"reason":"USER_REQUEST_RATE_EXCEEDED"}"#,
-                        )
-                    }
-                }),
-            )
-            .route(
-                "/fallback",
-                post(move || {
-                    let counter = Arc::clone(&fallback_counter);
-                    async move {
-                        counter.fetch_add(1, Ordering::SeqCst);
-                        (fallback_status, fallback_body)
-                    }
-                }),
-            );
+    #[derive(Clone, Copy)]
+    struct BucketSpec {
+        status: StatusCode,
+        body: &'static str,
+        hang: bool,
+        ok_after: Option<usize>,
+    }
+
+    fn rate_429() -> BucketSpec {
+        BucketSpec {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            body: r#"{"reason":"USER_REQUEST_RATE_EXCEEDED"}"#,
+            hang: false,
+            ok_after: None,
+        }
+    }
+
+    fn rate_429_then_ok_on(hit: usize) -> BucketSpec {
+        BucketSpec {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            body: r#"{"reason":"USER_REQUEST_RATE_EXCEEDED"}"#,
+            hang: false,
+            ok_after: Some(hit),
+        }
+    }
+
+    fn monthly_402() -> BucketSpec {
+        BucketSpec {
+            status: StatusCode::PAYMENT_REQUIRED,
+            body: r#"{"reason":"MONTHLY_REQUEST_COUNT"}"#,
+            hang: false,
+            ok_after: None,
+        }
+    }
+
+    fn ok(body: &'static str) -> BucketSpec {
+        BucketSpec {
+            status: StatusCode::OK,
+            body,
+            hang: false,
+            ok_after: None,
+        }
+    }
+
+    fn unauthorized() -> BucketSpec {
+        BucketSpec {
+            status: StatusCode::UNAUTHORIZED,
+            body: "unauthorized",
+            hang: false,
+            ok_after: None,
+        }
+    }
+
+    fn hang() -> BucketSpec {
+        BucketSpec {
+            status: StatusCode::OK,
+            body: "",
+            hang: true,
+            ok_after: None,
+        }
+    }
+
+    struct BucketMap {
+        codewhisperer: BucketSpec,
+        amazonq: BucketSpec,
+        runtime: BucketSpec,
+        amazonq_cli: BucketSpec,
+        mcp: BucketSpec,
+    }
+
+    struct FourBucketHarness {
+        provider: KiroProvider,
+        codewhisperer: Arc<AtomicUsize>,
+        amazonq: Arc<AtomicUsize>,
+        runtime: Arc<AtomicUsize>,
+        amazonq_cli: Arc<AtomicUsize>,
+        mcp: Arc<AtomicUsize>,
+        bodies: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    impl FourBucketHarness {
+        fn count(&self, name: &str) -> usize {
+            match name {
+                "codewhisperer" => self.codewhisperer.load(Ordering::SeqCst),
+                "amazonq" => self.amazonq.load(Ordering::SeqCst),
+                "runtime" => self.runtime.load(Ordering::SeqCst),
+                "amazonq-cli" => self.amazonq_cli.load(Ordering::SeqCst),
+                "mcp" => self.mcp.load(Ordering::SeqCst),
+                _ => panic!("unknown bucket {name}"),
+            }
+        }
+
+        fn total_api(&self) -> usize {
+            self.count("codewhisperer")
+                + self.count("amazonq")
+                + self.count("runtime")
+                + self.count("amazonq-cli")
+        }
+    }
+
+    async fn mock_four_buckets(
+        map: BucketMap,
+        share_editor: bool,
+        credential_count: usize,
+    ) -> FourBucketHarness {
+        let codewhisperer = Arc::new(AtomicUsize::new(0));
+        let amazonq = Arc::new(AtomicUsize::new(0));
+        let runtime = Arc::new(AtomicUsize::new(0));
+        let amazonq_cli = Arc::new(AtomicUsize::new(0));
+        let mcp = Arc::new(AtomicUsize::new(0));
+        let bodies = Arc::new(Mutex::new(Vec::new()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let base = format!("http://{}", address);
+
+        fn route(
+            name: &'static str,
+            spec: BucketSpec,
+            counter: Arc<AtomicUsize>,
+            bodies: Arc<Mutex<Vec<(String, String)>>>,
+        ) -> axum::routing::MethodRouter {
+            post(move |req: Request| {
+                let counter = Arc::clone(&counter);
+                let bodies = Arc::clone(&bodies);
+                async move {
+                    let hit = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                    let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+                        .await
+                        .unwrap_or_default();
+                    bodies
+                        .lock()
+                        .unwrap()
+                        .push((name.to_string(), String::from_utf8_lossy(&bytes).into_owned()));
+                    if spec.hang {
+                        std::future::pending::<()>().await;
+                    }
+                    if spec.ok_after.is_some_and(|n| hit >= n) {
+                        (StatusCode::OK, "second-account-ok")
+                    } else {
+                        (spec.status, spec.body)
+                    }
+                }
+            })
+        }
+
+        let mut app = Router::new().route(
+            "/mcp",
+            route("mcp", map.mcp, Arc::clone(&mcp), Arc::clone(&bodies)),
+        );
+        if share_editor {
+            app = app.route(
+                "/editor",
+                route(
+                    "codewhisperer",
+                    map.codewhisperer,
+                    Arc::clone(&codewhisperer),
+                    Arc::clone(&bodies),
+                ),
+            );
+        } else {
+            app = app
+                .route(
+                    "/codewhisperer",
+                    route(
+                        "codewhisperer",
+                        map.codewhisperer,
+                        Arc::clone(&codewhisperer),
+                        Arc::clone(&bodies),
+                    ),
+                )
+                .route(
+                    "/amazonq",
+                    route(
+                        "amazonq",
+                        map.amazonq,
+                        Arc::clone(&amazonq),
+                        Arc::clone(&bodies),
+                    ),
+                );
+        }
+        app = app
+            .route(
+                "/runtime",
+                route(
+                    "runtime",
+                    map.runtime,
+                    Arc::clone(&runtime),
+                    Arc::clone(&bodies),
+                ),
+            )
+            .route(
+                "/amazonq-cli",
+                route(
+                    "amazonq-cli",
+                    map.amazonq_cli,
+                    Arc::clone(&amazonq_cli),
+                    Arc::clone(&bodies),
+                ),
+            );
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        (format!("http://{}", address), primary_count, fallback_count)
-    }
 
-    fn provider_for_mock_upstreams(base_url: &str) -> KiroProvider {
-        let credentials = KiroCredentials {
-            id: Some(1),
-            auth_method: Some("api_key".to_string()),
-            kiro_api_key: Some("ksk_test".to_string()),
-            profile_arn: Some(
-                "arn:aws:codewhisperer:us-east-1:123456789012:profile/test".to_string(),
-            ),
-            endpoint: Some("primary".to_string()),
-            ..KiroCredentials::default()
+        let editor_url = if share_editor {
+            format!("{}/editor", base)
+        } else {
+            format!("{}/codewhisperer", base)
         };
+        let amazonq_url = if share_editor {
+            editor_url.clone()
+        } else {
+            format!("{}/amazonq", base)
+        };
+        let mcp_url = format!("{}/mcp", base);
+        let credentials: Vec<_> = (1..=credential_count)
+            .map(|id| KiroCredentials {
+                id: Some(id as u64),
+                auth_method: Some("api_key".to_string()),
+                kiro_api_key: Some(format!("ksk_test_{id}")),
+                profile_arn: Some(
+                    "arn:aws:codewhisperer:us-east-1:123456789012:profile/test".to_string(),
+                ),
+                endpoint: Some("codewhisperer".to_string()),
+                ..KiroCredentials::default()
+            })
+            .collect();
         let mut config = crate::model::config::Config::default();
         config.account_throttle_cooldown_secs = 300;
         let token_manager =
-            Arc::new(MultiTokenManager::new(config, vec![credentials], None, None, false).unwrap());
+            Arc::new(MultiTokenManager::new(config, credentials, None, None, false).unwrap());
         let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
-        endpoints.insert(
-            "primary".to_string(),
-            Arc::new(MockEndpoint {
-                name: "primary",
-                url: format!("{}/primary", base_url),
-                fallback: Some("fallback"),
-            }),
+        let insert = |endpoints: &mut HashMap<String, Arc<dyn KiroEndpoint>>,
+                      name: &'static str,
+                      url: String| {
+            endpoints.insert(
+                name.to_string(),
+                Arc::new(MockEndpoint {
+                    name,
+                    url,
+                    mcp_url: mcp_url.clone(),
+                }),
+            );
+        };
+        insert(&mut endpoints, "codewhisperer", editor_url);
+        insert(&mut endpoints, "amazonq", amazonq_url);
+        insert(&mut endpoints, "runtime", format!("{}/runtime", base));
+        insert(
+            &mut endpoints,
+            "amazonq-cli",
+            format!("{}/amazonq-cli", base),
         );
-        endpoints.insert(
-            "fallback".to_string(),
-            Arc::new(MockEndpoint {
-                name: "fallback",
-                url: format!("{}/fallback", base_url),
-                fallback: None,
-            }),
-        );
-        KiroProvider::with_proxy(token_manager, None, endpoints, "primary".to_string())
+        FourBucketHarness {
+            provider: KiroProvider::with_proxy(
+                token_manager,
+                None,
+                endpoints,
+                "codewhisperer".to_string(),
+            ),
+            codewhisperer,
+            amazonq,
+            runtime,
+            amazonq_cli,
+            mcp,
+            bodies,
+        }
     }
 
     const TEST_REQUEST_BODY: &str = r#"{
         "conversationState": {
-            "currentMessage": {"userInputMessage": {"modelId": "claude-sonnet-4.6"}}
+            "conversationId": "sess-four-bucket",
+            "agentContinuationId": "continue",
+            "agentTaskType": "vibe",
+            "currentMessage": {"userInputMessage": {"modelId": "claude-sonnet-4.6", "origin": "AI_EDITOR"}}
         }
     }"#;
 
+    fn origin_for(bodies: &[(String, String)], name: &str) -> Option<String> {
+        bodies.iter().find(|(n, _)| n == name).map(|(_, body)| {
+            let value: serde_json::Value = serde_json::from_str(body).unwrap();
+            value["conversationState"]["currentMessage"]["userInputMessage"]["origin"]
+                .as_str()
+                .unwrap_or("")
+                .to_string()
+        })
+    }
+
+    fn us_map(
+        codewhisperer: BucketSpec,
+        amazonq: BucketSpec,
+        runtime: BucketSpec,
+        amazonq_cli: BucketSpec,
+    ) -> BucketMap {
+        BucketMap {
+            codewhisperer,
+            amazonq,
+            runtime,
+            amazonq_cli,
+            mcp: ok("mcp-ok"),
+        }
+    }
+
     #[tokio::test]
     async fn primary_429_uses_same_account_fallback_without_outer_retry() {
-        let (base_url, primary_count, fallback_count) =
-            mock_upstreams(StatusCode::OK, "fallback-ok").await;
-        let provider = provider_for_mock_upstreams(&base_url);
-
-        let result = provider
+        let harness = mock_four_buckets(
+            us_map(rate_429(), rate_429(), ok("fallback-ok"), rate_429()),
+            false,
+            1,
+        )
+        .await;
+        let result = harness
+            .provider
             .call_api_stream(TEST_REQUEST_BODY, None, None)
             .await
             .unwrap();
         assert_eq!(result.credential_id, 1);
         assert_eq!(result.response.text().await.unwrap(), "fallback-ok");
-        assert_eq!(primary_count.load(Ordering::SeqCst), 1);
-        assert_eq!(fallback_count.load(Ordering::SeqCst), 1);
+        assert_eq!(harness.count("codewhisperer"), 1);
+        assert_eq!(harness.count("runtime"), 1);
+        assert_eq!(harness.count("amazonq"), 0);
+        assert_eq!(harness.count("amazonq-cli"), 0);
+        assert_eq!(harness.total_api(), 2);
+        assert_eq!(
+            harness.provider.token_manager().snapshot().entries[0].endpoint.as_deref(),
+            Some("codewhisperer")
+        );
+        assert_eq!(
+            harness
+                .provider
+                .token_manager()
+                .session_affinity()
+                .lookup("sess-four-bucket"),
+            Some(1)
+        );
     }
 
     /// 不变量 #3：同一客户端请求的多次上游调用共用调用方的等待预算。第一次调用
@@ -1804,21 +2263,24 @@ mod rate_limit_tests {
     /// 新建预算那样再等一轮。
     #[tokio::test]
     async fn wait_budget_is_shared_across_calls_of_one_request() {
-        let (base_url, primary_count, fallback_count) =
-            mock_upstreams(StatusCode::OK, "fallback-ok").await;
-        let provider = provider_for_mock_upstreams(&base_url);
-        let tm = provider.token_manager();
+        let harness = mock_four_buckets(
+            us_map(rate_429(), rate_429(), ok("fallback-ok"), rate_429()),
+            false,
+            1,
+        )
+        .await;
+        let tm = harness.provider.token_manager();
         tm.set_account_throttle_config(None, None, Some(1_500))
             .unwrap();
         let mut budget = tm.new_acquire_wait_budget();
 
         tm.report_account_throttled_for_request(1, std::time::Duration::from_secs(1), None, None);
-        let result = provider
+        let result = harness
+            .provider
             .call_api_stream_with_budget(TEST_REQUEST_BODY, None, None, &mut budget)
             .await
             .unwrap();
         assert_eq!(result.response.text().await.unwrap(), "fallback-ok");
-        // 按剩余冷却精确扣除（略少于 1s）：剩余预算在 500ms 上方一点
         let remaining = budget.remaining();
         assert!(
             remaining >= std::time::Duration::from_millis(500)
@@ -1828,7 +2290,8 @@ mod rate_limit_tests {
 
         tm.report_account_throttled_for_request(1, std::time::Duration::from_secs(1), None, None);
         let started = std::time::Instant::now();
-        let error = match provider
+        let error = match harness
+            .provider
             .call_api_with_budget(TEST_REQUEST_BODY, None, None, &mut budget)
             .await
         {
@@ -1837,36 +2300,263 @@ mod rate_limit_tests {
         };
         assert!(error.downcast_ref::<UpstreamRateLimitError>().is_some());
         assert!(started.elapsed() < std::time::Duration::from_millis(500));
-        assert_eq!(
-            primary_count.load(Ordering::SeqCst),
-            1,
-            "second call never reaches upstream"
-        );
-        assert_eq!(fallback_count.load(Ordering::SeqCst), 1);
+        assert_eq!(harness.count("codewhisperer"), 1);
+        assert_eq!(harness.count("runtime"), 1);
+        assert_eq!(harness.total_api(), 2);
     }
 
     #[tokio::test]
-    async fn both_buckets_429_cool_down_after_one_fallback_request() {
-        let (base_url, primary_count, fallback_count) = mock_upstreams(
-            StatusCode::TOO_MANY_REQUESTS,
-            r#"{"reason":"SERVICE_REQUEST_RATE_EXCEEDED"}"#,
+    async fn all_four_buckets_429_cool_down_without_quota_disable() {
+        let harness = mock_four_buckets(
+            us_map(rate_429(), rate_429(), rate_429(), rate_429()),
+            false,
+            1,
         )
         .await;
-        let provider = provider_for_mock_upstreams(&base_url);
-
-        let error = match provider
+        let error = match harness
+            .provider
             .call_api_stream(TEST_REQUEST_BODY, None, None)
             .await
         {
-            Ok(_) => panic!("both rate-limit buckets should propagate a typed 429"),
+            Ok(_) => panic!("all unique buckets 429 should propagate a typed 429"),
             Err(error) => error,
         };
         let rate_limit = error
             .downcast_ref::<UpstreamRateLimitError>()
             .expect("the outer layer must retain rate-limit semantics");
         assert_eq!(rate_limit.retry_after(), Some("300"));
-        assert_eq!(primary_count.load(Ordering::SeqCst), 1);
-        assert_eq!(fallback_count.load(Ordering::SeqCst), 1);
+        assert_eq!(harness.count("codewhisperer"), 1);
+        assert_eq!(harness.count("runtime"), 1);
+        assert_eq!(harness.count("amazonq"), 1);
+        assert_eq!(harness.count("amazonq-cli"), 1);
+        assert_eq!(harness.total_api(), 4);
+        let entry = &harness.provider.token_manager().snapshot().entries[0];
+        assert!(!entry.disabled);
+        assert!(entry.throttled_remaining_secs.is_some());
+        assert_ne!(entry.disabled_reason.as_deref(), Some("QuotaExceeded"));
+    }
+
+    #[tokio::test]
+    async fn three_ide_402_and_cli_200_succeeds_without_quota_disable() {
+        let harness = mock_four_buckets(
+            us_map(monthly_402(), monthly_402(), monthly_402(), ok("cli-ok")),
+            false,
+            1,
+        )
+        .await;
+        let result = harness
+            .provider
+            .call_api_stream(TEST_REQUEST_BODY, None, None)
+            .await
+            .unwrap();
+        assert_eq!(result.credential_id, 1);
+        assert_eq!(result.response.text().await.unwrap(), "cli-ok");
+        assert_eq!(harness.count("codewhisperer"), 1);
+        assert_eq!(harness.count("runtime"), 1);
+        assert_eq!(harness.count("amazonq"), 1);
+        assert_eq!(harness.count("amazonq-cli"), 1);
+        let entry = &harness.provider.token_manager().snapshot().entries[0];
+        assert!(!entry.disabled);
+        assert_ne!(entry.disabled_reason.as_deref(), Some("QuotaExceeded"));
+    }
+
+    #[tokio::test]
+    async fn all_four_buckets_402_disables_credential() {
+        let harness = mock_four_buckets(
+            us_map(monthly_402(), monthly_402(), monthly_402(), monthly_402()),
+            false,
+            1,
+        )
+        .await;
+        let error = match harness
+            .provider
+            .call_api_stream(TEST_REQUEST_BODY, None, None)
+            .await
+        {
+            Ok(_) => panic!("all unique buckets 402 should disable the credential"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("402"));
+        assert_eq!(harness.total_api(), 4);
+        let entry = &harness.provider.token_manager().snapshot().entries[0];
+        assert!(entry.disabled);
+        assert_eq!(entry.disabled_reason.as_deref(), Some("QuotaExceeded"));
+    }
+
+    #[tokio::test]
+    async fn eu_shared_editor_bucket_skips_amazonq_and_still_hits_runtime_and_cli() {
+        let harness = mock_four_buckets(
+            us_map(rate_429(), rate_429(), rate_429(), ok("cli-ok")),
+            true,
+            1,
+        )
+        .await;
+        let result = harness
+            .provider
+            .call_api_stream(TEST_REQUEST_BODY, None, None)
+            .await
+            .unwrap();
+        assert_eq!(result.response.text().await.unwrap(), "cli-ok");
+        assert_eq!(harness.count("codewhisperer"), 1);
+        assert_eq!(harness.count("amazonq"), 0);
+        assert_eq!(harness.count("runtime"), 1);
+        assert_eq!(harness.count("amazonq-cli"), 1);
+        assert_eq!(harness.total_api(), 3);
+    }
+
+    #[tokio::test]
+    async fn later_hop_401_stops_the_chain() {
+        let harness = mock_four_buckets(
+            us_map(rate_429(), rate_429(), unauthorized(), ok("cli-ok")),
+            false,
+            1,
+        )
+        .await;
+        let error = match harness
+            .provider
+            .call_api_stream(TEST_REQUEST_BODY, None, None)
+            .await
+        {
+            Ok(_) => panic!("401 on a later hop must stop the chain"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("401"));
+        assert_eq!(harness.count("codewhisperer"), 1);
+        assert_eq!(harness.count("runtime"), 1);
+        assert_eq!(harness.count("amazonq"), 0);
+        assert_eq!(harness.count("amazonq-cli"), 0);
+    }
+
+    #[tokio::test]
+    async fn later_hop_401_switches_account_instead_of_rewalking_buckets() {
+        let harness = mock_four_buckets(
+            us_map(
+                rate_429_then_ok_on(2),
+                rate_429(),
+                unauthorized(),
+                ok("cli-ok"),
+            ),
+            false,
+            2,
+        )
+        .await;
+        let result = harness
+            .provider
+            .call_api_stream(TEST_REQUEST_BODY, None, None)
+            .await
+            .unwrap();
+        assert_eq!(result.credential_id, 2);
+        assert_eq!(result.response.text().await.unwrap(), "second-account-ok");
+        assert_eq!(harness.count("codewhisperer"), 2);
+        assert_eq!(harness.count("runtime"), 1);
+        assert_eq!(harness.count("amazonq"), 0);
+        assert_eq!(harness.count("amazonq-cli"), 0);
+    }
+
+    #[tokio::test]
+    async fn hops_rebuild_payload_for_codewhisperer_and_cli() {
+        let harness = mock_four_buckets(
+            us_map(rate_429(), rate_429(), rate_429(), ok("cli-ok")),
+            false,
+            1,
+        )
+        .await;
+        harness
+            .provider
+            .call_api_stream(TEST_REQUEST_BODY, None, None)
+            .await
+            .unwrap();
+        let bodies = harness.bodies.lock().unwrap().clone();
+        let cw_body = bodies
+            .iter()
+            .find(|(name, _)| name == "codewhisperer")
+            .map(|(_, body)| body.as_str())
+            .unwrap();
+        let cw: serde_json::Value = serde_json::from_str(cw_body).unwrap();
+        assert_eq!(
+            cw["conversationState"]["currentMessage"]["userInputMessage"]["modelId"],
+            "internal-cw-model"
+        );
+        let cli_body = bodies
+            .iter()
+            .find(|(name, _)| name == "amazonq-cli")
+            .map(|(_, body)| body.as_str())
+            .unwrap();
+        let cli: serde_json::Value = serde_json::from_str(cli_body).unwrap();
+        let state = &cli["conversationState"];
+        assert!(state.get("agentContinuationId").is_none());
+        assert!(state.get("agentTaskType").is_none());
+        assert_eq!(state["currentMessage"]["userInputMessage"]["origin"], "CLI");
+        assert_eq!(origin_for(&bodies, "runtime").as_deref(), Some("AI_EDITOR"));
+    }
+
+    #[tokio::test]
+    async fn outer_credential_budget_is_not_multiplied_by_four_buckets() {
+        let harness = mock_four_buckets(
+            us_map(rate_429(), rate_429(), rate_429(), rate_429()),
+            false,
+            2,
+        )
+        .await;
+        let error = match harness
+            .provider
+            .call_api_stream(TEST_REQUEST_BODY, None, None)
+            .await
+        {
+            Ok(_) => panic!("exhausted unique buckets should remain a typed 429"),
+            Err(error) => error,
+        };
+        assert!(error.downcast_ref::<UpstreamRateLimitError>().is_some());
+        assert_eq!(harness.count("codewhisperer"), 2);
+        assert_eq!(harness.count("runtime"), 2);
+        assert_eq!(harness.count("amazonq"), 2);
+        assert_eq!(harness.count("amazonq-cli"), 2);
+        assert_eq!(harness.total_api(), 8);
+    }
+
+    #[tokio::test]
+    async fn later_hop_timeout_stops_remaining_buckets_and_keeps_trigger_429() {
+        let harness = mock_four_buckets(
+            us_map(rate_429(), rate_429(), hang(), ok("cli-ok")),
+            false,
+            1,
+        )
+        .await;
+        let error = match harness
+            .provider
+            .call_api_stream(TEST_REQUEST_BODY, None, None)
+            .await
+        {
+            Ok(_) => panic!("timeout on a later hop must keep the triggering 429"),
+            Err(error) => error,
+        };
+        let rate_limit = error
+            .downcast_ref::<UpstreamRateLimitError>()
+            .expect("keep the triggering 429");
+        assert_eq!(rate_limit.retry_after(), Some("300"));
+        assert_eq!(harness.count("codewhisperer"), 1);
+        assert_eq!(harness.count("runtime"), 1);
+        assert_eq!(harness.count("amazonq"), 0);
+        assert_eq!(harness.count("amazonq-cli"), 0);
+    }
+
+    #[tokio::test]
+    async fn mcp_request_does_not_hop_buckets() {
+        let harness = mock_four_buckets(
+            us_map(rate_429(), rate_429(), rate_429(), rate_429()),
+            false,
+            1,
+        )
+        .await;
+        let mut budget = harness.provider.token_manager().new_acquire_wait_budget();
+        let response = harness
+            .provider
+            .call_mcp(TEST_REQUEST_BODY, None, &mut budget)
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(harness.count("mcp"), 1);
+        assert_eq!(harness.total_api(), 0);
     }
 
     #[test]
