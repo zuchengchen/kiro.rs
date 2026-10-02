@@ -980,6 +980,7 @@ const UPSTREAM_API_ERROR_TYPE: &str = "api_error";
 const UPSTREAM_OVERLOADED_ERROR_TYPE: &str = "overloaded_error";
 // 以下文案都必须带 "unavailable"：Kilo / opencode 的重试判定按消息关键词识别瞬态错误。
 const THINKING_ONLY_ERROR_MESSAGE: &str = "Upstream model became unavailable: the stream ended after reasoning without any answer text or tool call. Please retry.";
+pub(crate) const EMPTY_COMPLETION_ERROR_MESSAGE: &str = "Upstream model became unavailable: the stream ended without any answer text, reasoning, or tool call. Please retry.";
 const UPSTREAM_OVERLOADED_ERROR_MESSAGE: &str =
     "Upstream model temporarily unavailable (overloaded) mid-stream. Please retry.";
 const UPSTREAM_MID_STREAM_ERROR_MESSAGE: &str =
@@ -1517,6 +1518,10 @@ pub struct StreamContext {
     upstream_stop_reason: Option<String>,
     /// 流内上游失败；置位后收尾走 error 事件，不发 message_delta / message_stop。
     upstream_terminal_error: Option<UpstreamTerminalError>,
+    /// 是否真正吐出过可见输出（非空 text / thinking / tool_use）。
+    /// thinking 关闭时 `generate_initial_events` 会先开一个空 text 块，
+    /// 不能据此把空流当成正常完成。
+    emitted_visible_output: bool,
     /// 流结束后按上游 credits 修正 CacheMeter 拆分（默认读环境变量，测试可直接赋值）。
     pub credit_reconcile: bool,
 }
@@ -1665,6 +1670,7 @@ impl StreamContext {
             tool_use_xml_filter: ToolUseXmlLeakFilter::default(),
             upstream_stop_reason: None,
             upstream_terminal_error: None,
+            emitted_visible_output: false,
             credit_reconcile: super::credit_cache_reconcile::enabled_from_env(),
         }
     }
@@ -2281,6 +2287,7 @@ impl StreamContext {
                 }
             }),
         ) {
+            self.emitted_visible_output = true;
             events.push(delta_event);
         }
 
@@ -2387,6 +2394,7 @@ impl StreamContext {
             self.output_tokens += estimate_tokens(text);
             events.extend(self.ensure_thinking_block());
             if let Some(idx) = self.thinking_block_index {
+                self.emitted_visible_output = true;
                 events.push(self.create_thinking_delta_event(idx, text));
             }
         }
@@ -2395,6 +2403,7 @@ impl StreamContext {
             && !redacted.is_empty()
         {
             self.output_tokens += 8;
+            self.emitted_visible_output = true;
             events.extend(self.create_redacted_thinking_events(redacted));
         }
 
@@ -2425,7 +2434,10 @@ impl StreamContext {
     }
 
     /// 创建 thinking_delta 事件
-    fn create_thinking_delta_event(&self, index: i32, thinking: &str) -> SseEvent {
+    fn create_thinking_delta_event(&mut self, index: i32, thinking: &str) -> SseEvent {
+        if !thinking.is_empty() {
+            self.emitted_visible_output = true;
+        }
         SseEvent::new(
             "content_block_delta",
             json!({
@@ -2497,6 +2509,7 @@ impl StreamContext {
                 }
             }),
         ));
+        self.emitted_visible_output = true;
 
         // 一次性发出完整参数 JSON（来源已保证是合法 JSON）。
         self.output_tokens += estimate_tokens(&completed.input.to_string());
@@ -2669,8 +2682,9 @@ impl StreamContext {
                 } else {
                     // 如果还在 thinking 块内，发送剩余内容作为 thinking_delta
                     if let Some(thinking_index) = self.thinking_block_index {
+                        let remaining_thinking = self.thinking_buffer.clone();
                         events.push(
-                            self.create_thinking_delta_event(thinking_index, &self.thinking_buffer),
+                            self.create_thinking_delta_event(thinking_index, &remaining_thinking),
                         );
                     }
                     // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
@@ -2777,6 +2791,31 @@ impl StreamContext {
                 self.upstream_terminal_error = Some(err);
                 return events;
             }
+        }
+
+        // CodeWhisperer / 空 200 回退：上游成功结束但没有任何可见输出。
+        // thinking 关闭时会先开空 text 块；thinking-only 路径要求开过 thinking 块。
+        // 这两种都不能当成正常 end_turn，否则 Kilo 界面无字。
+        if !self.emitted_visible_output {
+            let stop_reason = self.state_manager.get_stop_reason();
+            tracing::warn!(
+                model = %self.model,
+                resolved_stop_reason = %stop_reason,
+                upstream_stop_reason = self.upstream_stop_reason.as_deref().unwrap_or("-"),
+                output_tokens = self.resolved_output_tokens(),
+                "流中未产生任何内容块，以可重试 error 结束"
+            );
+            let err = UpstreamTerminalError {
+                error_type: UPSTREAM_API_ERROR_TYPE,
+                client_message: EMPTY_COMPLETION_ERROR_MESSAGE,
+                detail: format!(
+                    "{EMPTY_COMPLETION_ERROR_MESSAGE} (resolved_stop_reason={stop_reason}, upstream_stop_reason={})",
+                    self.upstream_stop_reason.as_deref().unwrap_or("-")
+                ),
+            };
+            events.extend(self.generate_upstream_terminal_error_events(&err));
+            self.upstream_terminal_error = Some(err);
+            return events;
         }
 
         // 精确 metadata 真值优先；缺失时才使用 contextUsage/估算回退。
@@ -4860,6 +4899,30 @@ mod tests {
     }
 
     #[test]
+    fn test_empty_stream_ends_with_retryable_error() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-5.5",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let all = ctx.generate_final_events();
+        let message = assert_ends_with_error(&all, "api_error");
+        assert!(message.to_lowercase().contains("unavailable"), "{message}");
+        assert!(ctx.upstream_terminal_error_message().is_some());
+    }
+
+    #[test]
+    fn test_empty_thinking_enabled_stream_ends_with_retryable_error() {
+        let mut ctx = thinking_ctx();
+        let all = ctx.generate_final_events();
+        let message = assert_ends_with_error(&all, "api_error");
+        assert!(message.to_lowercase().contains("unavailable"), "{message}");
+    }
+
+    #[test]
     fn test_thinking_only_without_limit_signal_ends_with_retryable_error() {
         let mut ctx = thinking_ctx();
         let mut all = ctx.process_assistant_response("<thinking>\nabc</thinking>");
@@ -5904,6 +5967,7 @@ mod tests {
             unit_plural: "credits".into(),
             usage: 0.42,
         }));
+        let _ = ctx.process_assistant_response("ok");
 
         let final_events = ctx.generate_final_events();
         let delta = final_events
@@ -5928,6 +5992,7 @@ mod tests {
             test_known_tools(),
         );
         let _ = ctx.generate_initial_events();
+        let _ = ctx.process_assistant_response("ok");
         let final_events = ctx.generate_final_events();
         let delta = final_events
             .iter()
@@ -5973,6 +6038,7 @@ mod tests {
         let _ = ctx.process_kiro_event(&Event::Metering(parse_metering(
             r#"{"unit":"credit","unitPlural":"credits","usage":2.913}"#,
         )));
+        let _ = ctx.process_assistant_response("ok");
         let events = ctx.generate_final_events();
         let usage = &events
             .iter()
@@ -6143,6 +6209,9 @@ mod tests {
             token_usage: Some(usage),
             stop_reason: None,
         }));
+        let mut visible = crate::kiro::model::events::AssistantResponseEvent::default();
+        visible.content = "ok".to_string();
+        ctx.process_and_buffer(&Event::AssistantResponse(visible));
         let events = ctx.finish_and_get_all_events();
 
         assert_eq!(ctx.final_usage(), (3, 11, 4, 7, 0.0));
@@ -6291,6 +6360,7 @@ mod tests {
         );
 
         let _ = ctx.generate_initial_events();
+        let _ = ctx.process_assistant_response("ok");
         let events = ctx.generate_final_events();
         let delta = events
             .iter()
