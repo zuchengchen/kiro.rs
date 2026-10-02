@@ -22,7 +22,7 @@ use axum::{
     Json as JsonExtractor,
     body::Body,
     extract::{Extension, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
 use bytes::Bytes;
@@ -37,8 +37,8 @@ use super::converter::{ConversionError, convert_request_with_mode, get_context_w
 use super::middleware::{AppState, KeyContext};
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{
-    CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
-    OutputConfig, Thinking,
+    CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Metadata, Model,
+    ModelsResponse, OutputConfig, Thinking,
 };
 use super::websearch;
 
@@ -815,12 +815,48 @@ pub async fn get_models(
     .into_response()
 }
 
+fn session_id_from_headers(headers: &HeaderMap) -> Option<String> {
+    for name in ["session_id", "x-session-id", "x-claude-code-session-id"] {
+        if let Some(value) = headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn payload_has_user_id(payload: &MessagesRequest) -> bool {
+    payload
+        .metadata
+        .as_ref()
+        .and_then(|m| m.user_id.as_deref())
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty())
+}
+
+fn ensure_session_metadata_from_headers(payload: &mut MessagesRequest, headers: &HeaderMap) {
+    if payload_has_user_id(payload) {
+        return;
+    }
+    let Some(session_id) = session_id_from_headers(headers) else {
+        return;
+    };
+    payload.metadata = Some(Metadata {
+        user_id: Some(json!({"session_id": session_id}).to_string()),
+    });
+}
+
 /// POST /v1/messages
 ///
 /// 创建消息（对话）
 pub async fn post_messages(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
+    headers: HeaderMap,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     // Count the image budget on inbound to provide precise diagnostics for later context-window-full errors
@@ -835,6 +871,7 @@ pub async fn post_messages(
         image_largest_b64_kb = %(img_stats.largest_b64_bytes / 1024),
         "Received POST /v1/messages request"
     );
+    ensure_session_metadata_from_headers(&mut payload, &headers);
     if let Err(error) = validate_max_tokens(payload.max_tokens) {
         return (StatusCode::BAD_REQUEST, Json(error)).into_response();
     }
@@ -2021,6 +2058,7 @@ pub async fn count_tokens(
 pub async fn post_messages_cc(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
+    headers: HeaderMap,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     tracing::info!(
@@ -2030,6 +2068,7 @@ pub async fn post_messages_cc(
         message_count = %payload.messages.len(),
         "Received POST /cc/v1/messages request"
     );
+    ensure_session_metadata_from_headers(&mut payload, &headers);
     if let Err(error) = validate_max_tokens(payload.max_tokens) {
         return (StatusCode::BAD_REQUEST, Json(error)).into_response();
     }
@@ -3273,5 +3312,49 @@ mod tests {
         assert!(validate_max_tokens(1).is_ok());
         assert!(validate_max_tokens(0).is_err());
         assert!(validate_max_tokens(-1).is_err());
+    }
+
+    fn sample_payload() -> MessagesRequest {
+        MessagesRequest {
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 32,
+            messages: vec![],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            cache_control: None,
+        }
+    }
+
+    #[test]
+    fn session_headers_fill_metadata_when_user_id_missing() {
+        let mut headers = HeaderMap::new();
+        headers.insert("session_id", "5d700df1aaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap());
+        let mut payload = sample_payload();
+        ensure_session_metadata_from_headers(&mut payload, &headers);
+        let user_id = payload.metadata.as_ref().unwrap().user_id.as_deref().unwrap();
+        assert_eq!(
+            user_id,
+            r#"{"session_id":"5d700df1aaaaaaaaaaaaaaaaaaaaaaaa"}"#
+        );
+    }
+
+    #[test]
+    fn session_headers_preserve_client_user_id() {
+        let mut headers = HeaderMap::new();
+        headers.insert("session_id", "header-sid".parse().unwrap());
+        let mut payload = sample_payload();
+        payload.metadata = Some(Metadata {
+            user_id: Some("client-provided".to_string()),
+        });
+        ensure_session_metadata_from_headers(&mut payload, &headers);
+        assert_eq!(
+            payload.metadata.as_ref().unwrap().user_id.as_deref(),
+            Some("client-provided")
+        );
     }
 }
