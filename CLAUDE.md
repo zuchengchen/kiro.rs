@@ -5,7 +5,7 @@
 ```
 hank9999/kiro.rs        原始项目。版本号是日期式（v2026.3.1）。
         ↓               落后我们约 36k 行，永远不要直接 merge 它。
-ZyphrZero/kiro.rs       我们真正的上游。0.x 语义版本（v0.9.0）。
+ZyphrZero/kiro.rs       我们真正的上游。0.x 语义版本（当前基线 v0.9.2）。
         ↓               = git remote `upstream`
 zuchengchen/kiro.rs     本仓库。= git remote `origin`
 ```
@@ -20,7 +20,7 @@ zuchengchen/kiro.rs     本仓库。= git remote `origin`
 | `master` | **上游纯镜像**，不放任何定制 | `upstream/master` |
 | `main-czc` | **定制主分支**，生产部署来源 | `origin/main-czc` |
 
-`git diff master main-czc -- src/` 就是我们全部的定制（相对 v0.9.0 约 +4,200 / −400 行，27 个文件）。
+`git diff master main-czc -- src/` 就是我们全部的定制（相对 v0.9.2 约 +10,100 / −1,100 行，42 个文件）。
 
 ## 同步上游
 
@@ -72,34 +72,34 @@ git push origin main-czc
    经 `call_api*_with_budget` / `call_mcp` 往下传。目前有 web_search 多轮循环
    （含 MCP 搜索）和 Codex 压缩的溢出重试；以后新增这类路径也照此处理。
 
-## 版本号：`0.9.0.1` = 上游基线 + 定制迭代号
+## 版本号：`0.9.2.1` = 上游基线 + 定制迭代号
 
 第四段是本仓库的定制迭代号，前三段永远是我们所基于的上游基线。这样上游发到
-`0.9.1` 也不会和我们的编号撞车。
+`0.9.3` 也不会和我们的编号撞车。
 
-**Cargo 不接受四段版本号**（`0.9.0.1` 直接报 `unexpected character '.' after
+**Cargo 不接受四段版本号**（`0.9.2.1` 直接报 `unexpected character '.' after
 patch version number`），所以三个版本文件里写的是 semver build metadata 形式：
 
 | 文件 | 值 |
 |---|---|
-| `Cargo.toml` | `0.9.0+11` |
-| `Cargo.lock`（kiro-rs 自身条目） | `0.9.0+11` |
-| `admin-ui/package.json` | `0.9.0+11` |
+| `Cargo.toml` | `0.9.2+1` |
+| `Cargo.lock`（kiro-rs 自身条目） | `0.9.2+1` |
+| `admin-ui/package.json` | `0.9.2+1` |
 
 `display_version()`（`src/admin/service.rs`）在对外暴露时把 `+1` 还原成 `.1`，
-Admin UI 显示 `v0.9.0.1`。`parse_semver_core()` 返回 `[u32; 4]`，两种形式都解析
-成同一个 `[0,9,0,1]` —— 显示形式会回流进 `compare_semver`（`current_version`
+Admin UI 显示 `v0.9.2.1`。`parse_semver_core()` 返回 `[u32; 4]`，两种形式都解析
+成同一个 `[0,9,2,1]` —— 显示形式会回流进 `compare_semver`（`current_version`
 已是显示形式），两者必须一致，否则第四段被 `splitn` 吞掉。
 
-更新提示的语义因此是对的：我们 `[0,9,0,1]` > 上游 `0.9.0` = `[0,9,0,0]`，不提示；
-上游发 `0.9.1`/`0.9.8`/`0.10.0` 时前三段更大，正常提示。上游历史 tag 全是纯三段
-（`v0.7.0` … `v0.9.0`），从未带 `+`，所以第四段解析为 0 不会误判。
+更新提示的语义因此是对的：我们 `[0,9,2,1]` > 上游 `0.9.2` = `[0,9,2,0]`，不提示；
+上游发 `0.9.3`/`0.9.8`/`0.10.0` 时前三段更大，正常提示。上游历史 tag 全是纯三段
+（`v0.7.0` … `v0.9.2`），从未带 `+`，所以第四段解析为 0 不会误判。
 
 **升级定制迭代号时三个文件一起改**，只改 `Cargo.toml` 会让 `Cargo.lock` 和
 `package.json` 落后。合并上游时这三行都会冲突：保留上游的三段基线，把 `+N` 接
-回去；基线变了（如上游到 0.9.0）则迭代号归 1。
+回去；基线变了（如上游到 0.9.2）则迭代号归 1。
 
-image tag 和 `deployment-*.json` 沿用同一个编号（`kiro-rs:0.9.0.1`）。历史上
+image tag 和 `deployment-*.json` 沿用同一个编号（`kiro-rs:0.9.2.1`）。历史上
 `0.8.1`–`0.8.8` 那批部署记录是旧的两段式本地编号，留着不动，它们是历史追溯点。
 
 ## Tag 约定
@@ -108,7 +108,7 @@ image tag 和 `deployment-*.json` 沿用同一个编号（`kiro-rs:0.9.0.1`）�
 - **不要 `git push --tags`。** 上游 tag 会污染 `origin`。已设
   `remote.upstream.tagOpt=--no-tags` 阻止拉取，推送时显式指定 tag 名。
 
-## 定制清单（相对上游 v0.9.0）
+## 定制清单（相对上游 v0.9.2）
 
 | 提交 | 内容 |
 |---|---|
@@ -129,6 +129,7 @@ image tag 和 `deployment-*.json` 沿用同一个编号（`kiro-rs:0.9.0.1`）�
 | `9065d67` | API Key / PKCE 用系统熵源生成（`src/common/secure_random.rs`），不再用 `fastrand` |
 | `7e8fb15` | 按上游 `meteringEvent.credits` 把并发同前缀请求误计的 cache_creation 改记为 read（`src/anthropic/credit_cache_reconcile.rs`，trace `usage_source = reconciled`）；`message_delta.usage` 带 `usage_final: true`。开关 `KIRO_RS_CREDIT_CACHE_RECONCILE` 默认关，依赖 Sub2API 支持 `usage_final`。合并上游时保住 `stream.rs::resolved_usage_raw` 与 `handlers.rs::resolve_non_stream_usage` 的调用点 |
 | fix/empty-opus-55-end-turn | 空完成（无 text / thinking / tool_use）不再伪装成 200 + `end_turn`。流式以可重试 `api_error` 结束，非流式回 502。Kilo 把空 `finish_reason=stop` 当成正常完成，界面无字。须配套 sub2api 空 Anthropic 完成故障转移 |
+| v0.9.2 合并（`30ecb40`） | 采纳上游流式增量输出 / 三档上游超时 / `apiDomain` / 代理热重载 / 账号级 429 分类 / quota reset recovery；保留四桶换号、TTL 路由、credits 修正与积分上限。`upstreamTimeoutSecs` 作为 `upstreamTotalTimeoutSecs` 的 serde alias，默认仍 1800s（0=关闭总期限）；`apiDomain=kiro` 时统一 runtime host 并跳过 CodeWhisperer 内部模型 ID；内容过滤 `refusal` 优先于空完成重试判定；API Key 凭据不再白跑 `ListAvailableProfiles` |
 
 2026-09-28 全项目审查的其余修复（`8085197..HEAD`）都是对已有代码的缺陷修正，
 没有新功能，逐条见各自的提交说明。其中会影响合并判断的两处上游代码改动：
