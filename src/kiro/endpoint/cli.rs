@@ -1,4 +1,13 @@
 //! Amazon Q Developer CLI-compatible streaming endpoint.
+//!
+//! 对应 Kiro CLI / Amazon Q for CLI 使用的 AWS JSON 协议端点：
+//! - URL: `https://q.{api_region}.amazonaws.com/SendMessageStreaming`（独立限流桶）
+//! - 切到 `apiDomain=kiro` 时改走 `https://runtime.{api_region}.kiro.dev/`
+//! - Content-Type: `application/x-amz-json-1.0`
+//! - User-Agent: aws-sdk-js 格式
+//! - 请求体 origin: `KIRO_CLI`
+//!
+//! 适用于使用 `ksk_` 前缀 API Key 的凭据。
 
 use reqwest::RequestBuilder;
 use uuid::Uuid;
@@ -23,7 +32,11 @@ impl CliEndpoint {
     }
 
     fn host(&self, ctx: &RequestContext<'_>) -> String {
-        format!("q.{}.amazonaws.com", self.api_region(ctx))
+        if ctx.api_domain == crate::model::config::ApiDomain::Kiro {
+            ctx.runtime_host()
+        } else {
+            format!("q.{}.amazonaws.com", self.api_region(ctx))
+        }
     }
 
     fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
@@ -77,7 +90,11 @@ impl KiroEndpoint for CliEndpoint {
     }
 
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!("https://{}/SendMessageStreaming", self.host(ctx))
+        if ctx.api_domain == crate::model::config::ApiDomain::Kiro {
+            format!("https://{}/", self.host(ctx))
+        } else {
+            format!("https://{}/SendMessageStreaming", self.host(ctx))
+        }
     }
 
     fn mcp_url(&self, ctx: &RequestContext<'_>) -> String {
@@ -93,7 +110,9 @@ impl KiroEndpoint for CliEndpoint {
 
     fn decorate_mcp(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
         let mut req = self.common_headers(req, ctx);
-        if let Some(arn) = ctx.credentials.effective_profile_arn() {
+        // 上游 MCP 同样强制要求 profileArn（缺失 → 400 profileArn is required），
+        // 与对话请求一致：BuilderID 占位符账号也要带上占位符
+        if let Some(arn) = ctx.credentials.streaming_profile_arn() {
             req = req.header("x-amzn-kiro-profile-arn", arn);
         }
         req
@@ -130,9 +149,10 @@ mod tests {
         assert!(state.get("agentTaskType").is_none());
         assert_eq!(state["currentMessage"]["userInputMessage"]["origin"], "CLI");
         assert_eq!(state["history"][0]["userInputMessage"]["origin"], "CLI");
-        assert_eq!(
-            state["history"][0]["userInputMessage"]["modelId"],
-            "friendly"
+        assert!(
+            state["history"][0]["userInputMessage"]
+                .get("modelId")
+                .is_none()
         );
         assert_eq!(value["profileArn"], "arn:test");
     }

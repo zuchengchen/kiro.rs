@@ -18,7 +18,7 @@ import type { RailTone } from './rail'
  */
 export type CredentialState =
   | 'current' // 当前优先，正在服务
-  | 'throttled' // 账号级风控冷却中，会自行恢复
+  | 'throttled' // 账号级限流冷却中，会自行恢复
   | 'creditCapped' // 达到管理员设的周期积分上限，下个周期自动恢复
   | 'quotaDisabled' // 因超额被禁用
   | 'quotaExceeded' // 已超额但仍启用
@@ -139,12 +139,12 @@ export function getDisposition(
     }
   }
 
-  // 未禁用但在风控冷却中：会自己恢复，所以是 cool 而非 warn
+  // 未禁用但在限流冷却中：会自己恢复，所以是 cool 而非 warn
   if (throttleRemaining > 0) {
     return {
       state: 'throttled',
       tone: 'cool',
-      stateLabel: '风控冷却中',
+      stateLabel: '限流冷却中',
       actionLabel: '解除冷却',
       action: 'clearThrottle',
     }

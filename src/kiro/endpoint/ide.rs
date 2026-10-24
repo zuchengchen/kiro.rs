@@ -2,6 +2,11 @@
 //!
 //! CodeWhisperer, Amazon Q, and Kiro Runtime use the same editor payload shape,
 //! but their hosts are backed by independent rate-limit buckets.
+//!
+//! `apiDomain=amazonaws`（默认）时四个独特桶各自使用固定 host；切到 `kiro` 时
+//! 对话 / MCP 统一走 `runtime.{api_region}.kiro.dev`，桶差异只剩路径。
+//!
+//! 请求头使用 aws-sdk-js User-Agent 标识。请求体会在根对象上注入 `profileArn`。
 
 use reqwest::RequestBuilder;
 use uuid::Uuid;
@@ -55,6 +60,9 @@ impl IdeEndpoint {
     }
 
     fn api_host(&self, ctx: &RequestContext<'_>) -> String {
+        if ctx.api_domain == crate::model::config::ApiDomain::Kiro {
+            return ctx.runtime_host();
+        }
         let region = self.api_region(ctx);
         match self.kind {
             EditorEndpointKind::CodeWhisperer if region == "us-east-1" => {
@@ -70,7 +78,8 @@ impl IdeEndpoint {
     }
 
     fn mcp_host(&self, ctx: &RequestContext<'_>) -> String {
-        format!("q.{}.amazonaws.com", self.api_region(ctx))
+        // MCP 跟随 apiDomain：默认 q.{region}，切到 kiro 后 runtime.{region}。
+        ctx.runtime_host()
     }
 
     fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
@@ -153,7 +162,9 @@ impl KiroEndpoint for IdeEndpoint {
             "x-amz-target",
             "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
         );
-        if self.kind == EditorEndpointKind::KiroRuntime {
+        if self.kind == EditorEndpointKind::KiroRuntime
+            || ctx.api_domain == crate::model::config::ApiDomain::Kiro
+        {
             req = req.header("x-amzn-codewhisperer-optout", "true");
         }
         req
@@ -161,7 +172,9 @@ impl KiroEndpoint for IdeEndpoint {
 
     fn decorate_mcp(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
         let mut req = self.common_headers(req, ctx, self.mcp_host(ctx));
-        if let Some(arn) = ctx.credentials.effective_profile_arn() {
+        // 上游 MCP 同样强制要求 profileArn（缺失 → 400 profileArn is required），
+        // 与对话请求一致：BuilderID 占位符账号也要带上占位符
+        if let Some(arn) = ctx.credentials.streaming_profile_arn() {
             req = req.header("x-amzn-kiro-profile-arn", arn);
         }
         req
@@ -217,6 +230,7 @@ mod tests {
             token: "token",
             machine_id: "machine",
             config: &config,
+            api_domain: config.api_domain,
         };
         assert_eq!(
             IdeEndpoint::codewhisperer().api_url(&ctx),
@@ -238,6 +252,7 @@ mod tests {
             token: "token",
             machine_id: "machine",
             config: &config,
+            api_domain: config.api_domain,
         };
         assert_eq!(
             IdeEndpoint::codewhisperer().api_url(&eu_ctx),
@@ -258,6 +273,7 @@ mod tests {
             token: "secret-token",
             machine_id: "machine",
             config: &config,
+            api_domain: config.api_domain,
         };
         let client = reqwest::Client::new();
 

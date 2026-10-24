@@ -17,10 +17,16 @@ import {
   updateRefreshToken,
   getLoadBalancingMode,
   setLoadBalancingMode,
+  getApiDomain,
+  setApiDomain,
   getAccountThrottleConfig,
   setAccountThrottleConfig,
+  getModelApiRetryConfig,
+  setModelApiRetryConfig,
   getAccountRpmLimitConfig,
   setAccountRpmLimitConfig,
+  getQuotaResetRecoveryConfig,
+  setQuotaResetRecoveryConfig,
   getSelfHealConfig,
   setSelfHealConfig,
   getLogGovernanceConfig,
@@ -180,7 +186,7 @@ export function useForceRefreshToken() {
   })
 }
 
-// 解除账号级风控冷却
+// 解除账号级限流冷却
 export function useClearThrottle() {
   const queryClient = useQueryClient()
   return useMutation({
@@ -280,7 +286,26 @@ export function useSetLoadBalancingMode() {
   })
 }
 
-// 获取账号级风控故障转移配置
+// 获取上游域名
+export function useApiDomain() {
+  return useQuery({
+    queryKey: ['apiDomain'],
+    queryFn: getApiDomain,
+  })
+}
+
+// 设置上游域名
+export function useSetApiDomain() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setApiDomain,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['apiDomain'] })
+    },
+  })
+}
+
+// 获取账号级 429 限流故障转移配置
 export function useAccountThrottleConfig() {
   return useQuery({
     queryKey: ['accountThrottleConfig'],
@@ -288,13 +313,32 @@ export function useAccountThrottleConfig() {
   })
 }
 
-// 更新账号级风控故障转移配置
+// 更新账号级 429 限流故障转移配置
 export function useSetAccountThrottleConfig() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: setAccountThrottleConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['accountThrottleConfig'] })
+    },
+  })
+}
+
+// 获取普通模型 API 429 自动重试配置
+export function useModelApiRetryConfig() {
+  return useQuery({
+    queryKey: ['modelApiRetryConfig'],
+    queryFn: getModelApiRetryConfig,
+  })
+}
+
+// 更新普通模型 API 429 自动重试配置
+export function useSetModelApiRetryConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setModelApiRetryConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['modelApiRetryConfig'] })
     },
   })
 }
@@ -314,6 +358,23 @@ export function useSetAccountRpmLimitConfig() {
     mutationFn: setAccountRpmLimitConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['accountRpmLimitConfig'] })
+    },
+  })
+}
+
+export function useQuotaResetRecoveryConfig() {
+  return useQuery({
+    queryKey: ['quotaResetRecoveryConfig'],
+    queryFn: getQuotaResetRecoveryConfig,
+  })
+}
+
+export function useSetQuotaResetRecoveryConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setQuotaResetRecoveryConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['quotaResetRecoveryConfig'] })
     },
   })
 }

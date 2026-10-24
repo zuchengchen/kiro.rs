@@ -47,6 +47,7 @@ pub(crate) fn usage_json(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn attach_cache_creation_object(usage: &mut Value, creation_1h: i32) {
     let creation = usage
         .get("cache_creation_input_tokens")

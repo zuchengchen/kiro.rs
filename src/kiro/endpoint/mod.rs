@@ -12,7 +12,7 @@ use std::sync::Arc;
 use reqwest::RequestBuilder;
 
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::model::config::Config;
+use crate::model::config::{ApiDomain, Config};
 
 pub mod cli;
 pub mod ide;
@@ -50,7 +50,7 @@ pub trait KiroEndpoint: Send + Sync {
 
     /// 装饰 API 请求的端点特有 header
     ///
-    /// Provider 已经设置好 URL、content-type、Connection 和 body；
+    /// Provider 已经设置好 URL、content-type 和 body；
     /// 实现负责追加 Authorization、host、user-agent 等端点相关头。
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder;
 
@@ -75,12 +75,12 @@ pub trait KiroEndpoint: Send + Sync {
         default_is_bearer_token_invalid(body)
     }
 
-    /// 判断响应体是否表示"账号级临时风控"（429 + suspicious activity）
+    /// 判断响应体是否表示账号级 429 限流。
     ///
-    /// 与普通 429（high traffic）区分：账号级风控只针对当前凭据生效，
-    /// 故障转移到其它凭据后可立即恢复；普通 429 是上游全局过载，切换无意义。
-    fn is_account_throttled(&self, body: &str) -> bool {
-        default_is_account_throttled(body)
+    /// 账号级限流可通过冷却当前凭据并故障转移恢复；模型容量不足等普通 429
+    /// 与凭据无关，应留在当前凭据上退避重试。
+    fn is_account_rate_limited(&self, body: &str) -> bool {
+        default_is_account_rate_limited(body)
     }
 
     /// 判断响应体是否表示"客户端请求格式错误"（messages 数组本身违反协议）
@@ -123,6 +123,16 @@ pub struct RequestContext<'a> {
     pub machine_id: &'a str,
     /// 全局配置
     pub config: &'a Config,
+    /// 对话 / MCP 上游域名（运行时值，Admin 可热修改，不读 `config.api_domain`）
+    pub api_domain: ApiDomain,
+}
+
+impl RequestContext<'_> {
+    /// 对话 / MCP 请求的上游 host
+    pub fn runtime_host(&self) -> String {
+        self.api_domain
+            .runtime_host(self.credentials.effective_api_region(self.config))
+    }
 }
 
 /// Same-account hop order after the request's primary bucket.
@@ -207,6 +217,20 @@ pub(crate) fn transform_streaming_payload(
     if strip_cli_state {
         state.remove("agentContinuationId");
         state.remove("agentTaskType");
+        // CLI 协议不接受历史消息里的 modelId（与上游 set_origin_kiro_cli 一致）。
+        if let Some(history) = state
+            .get_mut("history")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for entry in history {
+                if let Some(message) = entry
+                    .get_mut("userInputMessage")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    message.remove("modelId");
+                }
+            }
+        }
     }
 
     if let Some(message) = state
@@ -320,32 +344,40 @@ pub fn default_is_bearer_token_invalid(body: &str) -> bool {
     body.contains("The bearer token included in the request is invalid")
 }
 
-/// 默认的账号级风控判断逻辑
+/// 默认的账号级 429 限流判断逻辑。
 ///
-/// 上游 Kiro/Q-Developer 风控会返回 429 + 类似：
-/// `Due to suspicious activity, we are imposing temporary limits on how
-/// frequently your account (d-...) can send a request to Kiro while we investigate.`
-///
-/// 与普通 429（high traffic / rate limit exceeded）的关键差异是
-/// 提到 "suspicious activity" 与具体账号 ID。
-pub fn default_is_account_throttled(body: &str) -> bool {
-    if body.contains("suspicious activity") && body.contains("temporary limits") {
+/// 优先按上游 JSON 的 `reason` 分类；老版本无 reason 的响应再按高特异文案兼容。
+/// `INSUFFICIENT_MODEL_CAPACITY` 等容量类错误不会命中。
+pub fn default_is_account_rate_limited(body: &str) -> bool {
+    let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+    let reason = parsed
+        .as_ref()
+        .and_then(|value| value.get("reason"))
+        .and_then(|value| value.as_str());
+    if reason.is_some_and(|reason| {
+        matches!(
+            reason,
+            "USER_REQUEST_RATE_EXCEEDED"
+                | "CREDIT_CONSUMPTION_RATE_EXCEEDED"
+                | "SERVICE_REQUEST_RATE_EXCEEDED"
+        )
+    }) {
         return true;
     }
 
-    const ACCOUNT_RATE_LIMIT_REASONS: &[&str] = &[
-        "USER_REQUEST_RATE_EXCEEDED",
-        "SERVICE_REQUEST_RATE_EXCEEDED",
-    ];
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
-        return false;
-    };
-    let top = value.get("reason").and_then(|v| v.as_str());
-    let nested = value.pointer("/error/reason").and_then(|v| v.as_str());
-    [top, nested]
-        .into_iter()
-        .flatten()
-        .any(|reason| ACCOUNT_RATE_LIMIT_REASONS.contains(&reason))
+    let message = parsed
+        .as_ref()
+        .and_then(|value| value.get("message"))
+        .and_then(|value| value.as_str())
+        .unwrap_or(body)
+        .trim();
+    let message_lower = message.to_ascii_lowercase();
+
+    (message_lower.contains("suspicious activity")
+        && message_lower.contains("temporary limits"))
+        || message_lower.contains("5-minute credit limit exceeded")
+        || message_lower.trim_end_matches('.')
+            == "too many requests, please wait before trying again"
 }
 
 /// 默认的"账号被封禁/停用"判断逻辑
@@ -488,6 +520,7 @@ mod tests {
                 token: "test-token",
                 machine_id: "test-machine",
                 config: &config,
+                api_domain: config.api_domain,
             };
             let host = format!("q.{expected_region}.amazonaws.com");
 
@@ -523,6 +556,204 @@ mod tests {
                     .unwrap();
                 assert_eq!(mcp.url().as_str(), format!("https://{host}/mcp"));
                 assert_eq!(mcp.headers()["host"].to_str().unwrap(), host);
+            }
+        }
+    }
+
+    #[test]
+    fn api_domain_account_matrix_preserves_protocol_and_profile_arn() {
+        use crate::kiro::model::credentials::{BUILDER_ID_PROFILE_ARN, SOCIAL_PROFILE_ARN};
+        let endpoints: [&dyn KiroEndpoint; 2] = [&IdeEndpoint::new(), &CliEndpoint::new()];
+        let client = reqwest::Client::new();
+        let real_arn = "arn:aws:codewhisperer:eu-central-1:123456789012:profile/test";
+        let cases = [
+            (
+                serde_json::json!({"authMethod":"idc"}),
+                Some(BUILDER_ID_PROFILE_ARN),
+                "us-east-1",
+            ),
+            (
+                serde_json::json!({"authMethod":"social"}),
+                Some(SOCIAL_PROFILE_ARN),
+                "us-east-1",
+            ),
+            (
+                serde_json::json!({"authMethod":"idc","profileArn":real_arn}),
+                Some(real_arn),
+                "eu-central-1",
+            ),
+            (
+                serde_json::json!({"kiroApiKey":"ksk_test"}),
+                None,
+                "us-east-1",
+            ),
+        ];
+        for domain in [ApiDomain::Amazonaws, ApiDomain::Kiro] {
+            for (value, expected_arn, region) in &cases {
+                let credentials: KiroCredentials = serde_json::from_value(value.clone()).unwrap();
+                let config = Config::default();
+                let ctx = RequestContext {
+                    credentials: &credentials,
+                    token: "test-token",
+                    machine_id: "test-machine",
+                    config: &config,
+                    api_domain: domain,
+                };
+                for endpoint in endpoints {
+                    let body = r#"{"conversationState":{"currentMessage":{"userInputMessage":{"origin":"AI_EDITOR","content":"hello"}},"agentContinuationId":"test","history":[{"userInputMessage":{"modelId":"test","origin":"AI_EDITOR"}}]}}"#;
+                    let transformed: serde_json::Value =
+                        serde_json::from_str(&endpoint.transform_api_body(body, &ctx)).unwrap();
+                    assert_eq!(
+                        transformed["profileArn"].as_str(),
+                        *expected_arn,
+                        "{} {value}",
+                        endpoint.name()
+                    );
+                    let state = &transformed["conversationState"];
+                    // 本仓库的 Amazon Q CLI 桶使用独立协议（/SendMessageStreaming），
+                    // origin 与上游 Kiro CLI 文档不同，固定为 "CLI"。
+                    let expected_origin = if endpoint.name() == "amazonq-cli" {
+                        "CLI"
+                    } else {
+                        "AI_EDITOR"
+                    };
+                    assert_eq!(
+                        state["currentMessage"]["userInputMessage"]["origin"],
+                        expected_origin
+                    );
+                    if endpoint.name() == "amazonq-cli" {
+                        assert!(state.get("agentContinuationId").is_none());
+                        assert!(
+                            state["history"][0]["userInputMessage"]
+                                .get("modelId")
+                                .is_none()
+                        );
+                    }
+                    let host = domain.runtime_host(region);
+                    let mcp = endpoint
+                        .decorate_mcp(client.post(endpoint.mcp_url(&ctx)), &ctx)
+                        .build()
+                        .unwrap();
+                    assert_eq!(mcp.url().host_str(), Some(host.as_str()));
+                    assert_eq!(
+                        mcp.headers()
+                            .get("x-amzn-kiro-profile-arn")
+                            .map(|v| v.to_str().unwrap()),
+                        *expected_arn
+                    );
+                    let api = endpoint
+                        .decorate_api(client.post(endpoint.api_url(&ctx)), &ctx)
+                        .build()
+                        .unwrap();
+                    // 本仓库的四个独特桶：Amazonaws 下 ide 从 CodeWhisperer host 起步，
+                    // CLI 走独立的 /SendMessageStreaming 桶；Kiro 域统一 runtime host。
+                    let expected_api_host = match (endpoint.name(), domain) {
+                        (_, ApiDomain::Kiro) => domain.runtime_host(region),
+                        ("codewhisperer", _) if *region == "eu-central-1" => {
+                            format!("q.{region}.amazonaws.com")
+                        }
+                        ("codewhisperer", _) => {
+                            "codewhisperer.us-east-1.amazonaws.com".to_string()
+                        }
+                        ("amazonq-cli", _) => format!("q.{region}.amazonaws.com"),
+                        other => panic!("unexpected endpoint: {other:?}"),
+                    };
+                    assert_eq!(api.url().host_str(), Some(expected_api_host.as_str()));
+                    assert_eq!(api.headers()["authorization"], "Bearer test-token");
+                    assert_eq!(api.headers()["host"], expected_api_host);
+                    if endpoint.name() == "amazonq-cli" {
+                        let expected_path = if domain == ApiDomain::Kiro {
+                            "/"
+                        } else {
+                            "/SendMessageStreaming"
+                        };
+                        assert_eq!(api.url().path(), expected_path);
+                        assert_eq!(
+                            api.headers()["x-amz-target"],
+                            "AmazonQDeveloperStreamingService.SendMessage"
+                        );
+                    } else {
+                        assert_eq!(api.url().path(), "/generateAssistantResponse");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_api_domain_kiro_switches_api_and_mcp_host() {
+        let client = reqwest::Client::new();
+        let endpoints: [&dyn KiroEndpoint; 2] = [&IdeEndpoint::new(), &CliEndpoint::new()];
+        let credentials: KiroCredentials = serde_json::from_str(r#"{"region":"eu-central-1"}"#).unwrap();
+        let config: Config = serde_json::from_str(r#"{"apiDomain":"kiro"}"#).unwrap();
+        assert_eq!(config.api_domain, crate::model::config::ApiDomain::Kiro);
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "test-token",
+            machine_id: "test-machine",
+            config: &config,
+            api_domain: config.api_domain,
+        };
+        let host = "runtime.eu-central-1.kiro.dev";
+
+        for endpoint in endpoints {
+            let api = endpoint
+                .decorate_api(client.post(endpoint.api_url(&ctx)), &ctx)
+                .build()
+                .unwrap();
+            assert!(api.url().as_str().starts_with(&format!("https://{host}/")));
+            assert_eq!(api.headers()["host"].to_str().unwrap(), host);
+
+            let mcp = endpoint
+                .decorate_mcp(client.post(endpoint.mcp_url(&ctx)), &ctx)
+                .build()
+                .unwrap();
+            assert_eq!(mcp.url().as_str(), format!("https://{host}/mcp"));
+            assert_eq!(mcp.headers()["host"].to_str().unwrap(), host);
+        }
+    }
+
+    #[test]
+    fn test_api_domain_defaults_to_amazonaws() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.api_domain, crate::model::config::ApiDomain::Amazonaws);
+        assert_eq!(
+            serde_json::to_value(&config).unwrap()["apiDomain"],
+            serde_json::json!("amazonaws")
+        );
+    }
+
+    #[test]
+    fn test_mcp_sends_placeholder_profile_arn_header() {
+        let client = reqwest::Client::new();
+        let endpoints: [&dyn KiroEndpoint; 2] = [&IdeEndpoint::new(), &CliEndpoint::new()];
+        let placeholder = crate::kiro::model::credentials::BUILDER_ID_PROFILE_ARN;
+        let config = Config::default();
+        let cases = [
+            (format!(r#"{{"authMethod":"idc","profileArn":"{placeholder}"}}"#), Some(placeholder)),
+            (r#"{"authMethod":"idc"}"#.to_string(), Some(placeholder)),
+            (r#"{"kiroApiKey":"k"}"#.to_string(), None),
+        ];
+
+        for (json, expected) in &cases {
+            let credentials: KiroCredentials = serde_json::from_str(json).unwrap();
+            let ctx = RequestContext {
+                credentials: &credentials,
+                token: "test-token",
+                machine_id: "test-machine",
+                config: &config,
+                api_domain: config.api_domain,
+            };
+            for endpoint in endpoints {
+                let mcp = endpoint
+                    .decorate_mcp(client.post(endpoint.mcp_url(&ctx)), &ctx)
+                    .build()
+                    .unwrap();
+                let header = mcp
+                    .headers()
+                    .get("x-amzn-kiro-profile-arn")
+                    .map(|v| v.to_str().unwrap());
+                assert_eq!(header, *expected, "{} {json}", endpoint.name());
             }
         }
     }
@@ -602,25 +833,40 @@ mod tests {
     }
 
     #[test]
-    fn test_default_is_account_throttled() {
+    fn test_default_is_account_rate_limited() {
         let body = r#"{"message":"Due to suspicious activity, we are imposing temporary limits on how frequently your account (d-9067c98495.84f894a8) can send a request to Kiro while we investigate.","reason":null}"#;
-        assert!(default_is_account_throttled(body));
-        // 普通 429 不应被识别为账号风控
-        assert!(!default_is_account_throttled(
+        assert!(default_is_account_rate_limited(body));
+        assert!(default_is_account_rate_limited(
+            r#"{"message":"Too many requests, please wait before trying again.","reason":"USER_REQUEST_RATE_EXCEEDED"}"#
+        ));
+        assert!(default_is_account_rate_limited(
+            r#"{"message":"Too many requests, please wait before trying again.","reason":"CREDIT_CONSUMPTION_RATE_EXCEEDED"}"#
+        ));
+        assert!(default_is_account_rate_limited(
+            r#"{"message":"Too many requests","reason":"SERVICE_REQUEST_RATE_EXCEEDED"}"#
+        ));
+        assert!(default_is_account_rate_limited(
+            r#"{"message":"5-minute credit limit exceeded","reason":null}"#
+        ));
+        assert!(default_is_account_rate_limited(
+            r#"{"message":"Too many requests, please wait before trying again.","reason":null}"#
+        ));
+
+        // 模型容量类 429 不应触发换号。
+        assert!(!default_is_account_rate_limited(
+            r#"{"message":"I am experiencing high traffic, please try again shortly.","reason":"INSUFFICIENT_MODEL_CAPACITY"}"#
+        ));
+        assert!(!default_is_account_rate_limited(
+            r#"{"message":"Encountered unexpectedly high load when processing the request, please try again.","reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#
+        ));
+        assert!(!default_is_account_rate_limited(
             "{\"message\":\"Too many requests\"}"
         ));
         // 仅有一半关键词时也不命中
-        assert!(!default_is_account_throttled(
+        assert!(!default_is_account_rate_limited(
             "suspicious activity detected"
         ));
-
-        assert!(default_is_account_throttled(
-            r#"{"reason":"USER_REQUEST_RATE_EXCEEDED"}"#
-        ));
-        assert!(default_is_account_throttled(
-            r#"{"error":{"reason":"SERVICE_REQUEST_RATE_EXCEEDED"}}"#
-        ));
-        assert!(!default_is_account_throttled(
+        assert!(!default_is_account_rate_limited(
             r#"{"message":"trace mentions USER_REQUEST_RATE_EXCEEDED","reason":"OTHER"}"#
         ));
     }
@@ -634,6 +880,7 @@ mod tests {
             token: "token",
             machine_id: "machine",
             config,
+            api_domain: config.api_domain,
         }
     }
 

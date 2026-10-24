@@ -17,6 +17,28 @@ impl Default for TlsBackend {
     }
 }
 
+/// 对话 / MCP 请求使用的上游域名。
+///
+/// - `Amazonaws`（默认）：`q.{region}.amazonaws.com`
+/// - `Kiro`：`runtime.{region}.kiro.dev`，新版 Kiro IDE / Kiro CLI 使用的域名，
+///   官方客户端仅内置 us-east-1、eu-central-1 等少数区域
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApiDomain {
+    #[default]
+    Amazonaws,
+    Kiro,
+}
+
+impl ApiDomain {
+    pub fn runtime_host(self, region: &str) -> String {
+        match self {
+            Self::Amazonaws => format!("q.{}.amazonaws.com", region),
+            Self::Kiro => format!("runtime.{}.kiro.dev", region),
+        }
+    }
+}
+
 /// 工具兼容模式。
 ///
 /// - `ClaudeCode`（默认）：把 Claude Code 内置工具（Write/Edit/Bash/Read/Glob/Grep/LS/WebSearch）
@@ -108,6 +130,28 @@ pub struct Config {
     #[serde(default = "default_tls_backend")]
     pub tls_backend: TlsBackend,
 
+    /// Deadline for establishing an upstream API connection.
+    #[serde(default = "default_upstream_connect_timeout_secs")]
+    pub upstream_connect_timeout_secs: u64,
+
+    /// Maximum silence while waiting for headers or the next upstream body read.
+    #[serde(default = "default_upstream_read_timeout_secs")]
+    pub upstream_read_timeout_secs: u64,
+
+    /// Deadline for a whole upstream API request, body included. An active
+    /// stream cannot reset it, so it also caps how long an answer may be.
+    /// Defaults to this fork's long-standing 1800s (thinking answers can run
+    /// past upstream's 720s hardcoded value); set 0 to disable it and leave
+    /// stalled upstreams to `upstream_read_timeout_secs`.
+    ///
+    /// `upstreamTimeoutSecs` is the pre-0.9.2 name of this setting and is
+    /// accepted as a deserialization alias.
+    #[serde(
+        default = "default_upstream_total_timeout_secs",
+        alias = "upstreamTimeoutSecs"
+    )]
+    pub upstream_total_timeout_secs: u64,
+
     /// 外部 count_tokens API 地址（可选）
     #[serde(default)]
     pub count_tokens_api_url: Option<String>,
@@ -181,15 +225,15 @@ pub struct Config {
     #[serde(default = "default_session_affinity_ttl_secs")]
     pub session_affinity_ttl_secs: u64,
 
-    /// 账号级 429 风控触发时是否对当前凭据进入冷却并故障转移（默认 true）。
+    /// 账号级 429 限流触发时是否冷却当前凭据并故障转移（默认 true）。
     ///
-    /// 关闭后：429 + suspicious activity 仍按普通瞬态错误重试，不切换凭据。
-    /// 开启后：识别到 suspicious activity 字符串时，把当前凭据冷却 `account_throttle_cooldown_secs` 秒，
-    /// 立即切换到下一个可用凭据。
+    /// 适用于 USER_REQUEST_RATE_EXCEEDED、CREDIT_CONSUMPTION_RATE_EXCEEDED
+    /// 和 suspicious activity 等明确绑定账号的 429。关闭后直接返回客户端，不会由
+    /// `model_api_429_retry_enabled` 在原账号上继续重试。
     #[serde(default = "default_account_throttle_failover")]
     pub account_throttle_failover: bool,
 
-    /// 账号级风控冷却时长（秒，默认 1800 = 30 分钟）。
+    /// 账号级 429 限流冷却时长（秒，默认 1800 = 30 分钟）。
     #[serde(default = "default_account_throttle_cooldown_secs")]
     pub account_throttle_cooldown_secs: u64,
 
@@ -198,17 +242,6 @@ pub struct Config {
     /// 官方 IDE 取值为 `vibe`（对话）或 `spec`（规格驱动）。
     #[serde(default = "default_agent_mode")]
     pub agent_mode: String,
-
-    /// 上游 API 请求的总超时（秒，默认 1800 = 30 分钟）。
-    ///
-    /// 这是 reqwest 客户端的整体超时，覆盖「建连 → 读完整个流式响应」。thinking
-    /// 模型的长回答可以跑十几分钟：实测成功请求最长 706 秒，而此前硬编码的 720 秒
-    /// 上限恰好卡在这条边界上，把已经传输了 600-780KB、接近写完的回答切断。
-    ///
-    /// 超时只是兜底（防止连接永久挂住），请求正常结束即正常返回，因此放宽不会带来
-    /// 额外开销；客户端自身的超时才决定它愿意等多久。
-    #[serde(default = "default_upstream_timeout_secs")]
-    pub upstream_timeout_secs: u64,
 
     /// 全池冷却时的内部等待预算（毫秒，默认 3000）。
     ///
@@ -221,6 +254,13 @@ pub struct Config {
     /// 设为 0 可完全恢复旧行为。
     #[serde(default = "default_acquire_wait_budget_ms")]
     pub acquire_wait_budget_ms: u64,
+
+    /// 普通模型 API 429 是否由中转侧自动重试（默认 true）。
+    ///
+    /// 仅控制不需要切换凭据的容量类 429（如 `INSUFFICIENT_MODEL_CAPACITY`）。
+    /// 关闭后首个 429 立即返回客户端；账号级故障转移不受影响。
+    #[serde(default = "default_model_api_429_retry_enabled")]
+    pub model_api_429_retry_enabled: bool,
 
     /// 是否启用单账号每分钟请求次数（RPM）主动限流（默认 false）。
     ///
@@ -268,6 +308,14 @@ pub struct Config {
     #[serde(default = "default_self_heal_max_consecutive_rounds")]
     pub self_heal_max_consecutive_rounds: u32,
 
+    /// 是否在上游月度额度重置后自动恢复 `QuotaExceeded` 凭据（默认 false）。
+    ///
+    /// 开启后，后台余额任务仅在该凭据的 `nextResetAt` 到期时复查它自己；确认
+    /// `remaining > 0` 后才恢复调度。关闭时，`QuotaExceeded` 凭据保持禁用，
+    /// 需管理员手动恢复。
+    #[serde(default)]
+    pub quota_reset_recovery_enabled: bool,
+
     /// 按凭据缓存上游可用模型列表的 TTL（秒，默认 3600）。
     #[serde(default = "default_model_cache_ttl_secs")]
     pub model_cache_ttl_secs: u64,
@@ -288,6 +336,11 @@ pub struct Config {
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
 
+    /// 对话 / MCP 请求的上游域名：`amazonaws`（默认）或 `kiro`。
+    /// 仅影响 ide / cli 端点的 generateAssistantResponse 与 mcp，不影响 token 刷新和用量查询
+    #[serde(default)]
+    pub api_domain: ApiDomain,
+
     /// 是否启用中转层 prompt cache 本地计量模拟。未设置时回落到
     /// `KIRO_RS_CACHE_METERING` 环境变量，再回落到默认开启。
     ///
@@ -296,6 +349,35 @@ pub struct Config {
     /// 上游若下发真实 `metadataEvent.tokenUsage`，仍按真值上报，不受此开关影响。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_metering_enabled: Option<bool>,
+
+    /// prompt cache 计量模拟的条目上限。未设置时回落到 `KIRO_RS_CACHE_CAPACITY`
+    /// 环境变量，再回落到内置默认 262144。
+    ///
+    /// 选型公式：`C >= peak_req_per_sec * entries_per_req * TTL_secs`。
+    /// 生效值钳到 `[1024, 8388608]`。启动时固定，运行时不可改。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_metering_capacity: Option<usize>,
+
+    /// 是否把 prompt cache 计量快照落到 `cache_metering.json`。未设置时回落到
+    /// `KIRO_RS_CACHE_PERSIST` 环境变量，再回落到默认**关闭**。
+    ///
+    /// 关闭后启动不读该文件、运行与退出都不写该文件，也不会删除已有文件。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_metering_persist_enabled: Option<bool>,
+
+    /// prompt cache 计量快照的落盘间隔（秒）。未设置时回落到
+    /// `KIRO_RS_CACHE_FLUSH_INTERVAL_SECS` 环境变量，再回落到默认 300。
+    /// 生效值钳到 `[10, 3600]`。仅在落盘开启时有意义。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_metering_flush_interval_secs: Option<u64>,
+
+    /// 是否开启 miss 归因（墓碑表，用于区分 `miss_evicted` / `miss_expired`）。
+    /// 未设置时回落到 `KIRO_RS_CACHE_MISS_DIAGNOSTICS` 环境变量，再回落到默认开启。
+    ///
+    /// 关闭后不建墓碑表（内存归零），`miss_evicted` 退化为 `miss_no_entry`，
+    /// 其余计数器与 `entries_len` 仍然输出。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_metering_miss_diagnostics: Option<bool>,
 
     /// 是否启用请求链路追踪（写 traces.db）。默认 true。
     ///
@@ -376,6 +458,18 @@ fn default_tls_backend() -> TlsBackend {
     TlsBackend::Rustls
 }
 
+fn default_upstream_connect_timeout_secs() -> u64 {
+    15
+}
+fn default_upstream_read_timeout_secs() -> u64 {
+    120
+}
+fn default_upstream_total_timeout_secs() -> u64 {
+    // 本仓库历史默认 1800 秒：thinking 长回答实测接近 706 秒，上游写死的
+    // 720 秒会把接近写完的回答切断。0 表示关闭总期限，只保留读超时兜底。
+    30 * 60
+}
+
 fn default_load_balancing_mode() -> String {
     "priority".to_string()
 }
@@ -404,10 +498,6 @@ fn default_acquire_wait_budget_ms() -> u64 {
 /// Admin API 与配置文件加载共用这一上限。
 pub const MAX_ACQUIRE_WAIT_BUDGET_MS: u64 = 30_000;
 
-fn default_upstream_timeout_secs() -> u64 {
-    30 * 60
-}
-
 fn default_agent_mode() -> String {
     "vibe".to_string()
 }
@@ -422,6 +512,10 @@ fn is_valid_agent_mode(mode: &str) -> bool {
         && mode
             .bytes()
             .all(|b| b.is_ascii_graphic() || b == b'-' || b == b'_')
+}
+
+fn default_model_api_429_retry_enabled() -> bool {
+    true
 }
 
 fn default_account_rpm_limit_enabled() -> bool {
@@ -494,6 +588,9 @@ impl Default for Config {
             system_version: default_system_version(),
             node_version: default_node_version(),
             tls_backend: default_tls_backend(),
+            upstream_connect_timeout_secs: default_upstream_connect_timeout_secs(),
+            upstream_read_timeout_secs: default_upstream_read_timeout_secs(),
+            upstream_total_timeout_secs: default_upstream_total_timeout_secs(),
             count_tokens_api_url: None,
             count_tokens_api_key: None,
             count_tokens_auth_type: default_count_tokens_auth_type(),
@@ -512,19 +609,25 @@ impl Default for Config {
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
             acquire_wait_budget_ms: default_acquire_wait_budget_ms(),
-            upstream_timeout_secs: default_upstream_timeout_secs(),
             agent_mode: default_agent_mode(),
+            model_api_429_retry_enabled: default_model_api_429_retry_enabled(),
             account_rpm_limit_enabled: default_account_rpm_limit_enabled(),
             account_rpm_limit: default_account_rpm_limit(),
             suspended_detection_enabled: default_suspended_detection_enabled(),
             self_heal_enabled: default_self_heal_enabled(),
             self_heal_min_interval_secs: default_self_heal_min_interval_secs(),
             self_heal_max_consecutive_rounds: default_self_heal_max_consecutive_rounds(),
+            quota_reset_recovery_enabled: false,
             model_cache_ttl_secs: default_model_cache_ttl_secs(),
             extract_thinking: default_extract_thinking(),
             tool_compatibility_mode: default_tool_compatibility_mode(),
             default_endpoint: default_endpoint(),
+            api_domain: ApiDomain::default(),
             cache_metering_enabled: None,
+            cache_metering_capacity: None,
+            cache_metering_persist_enabled: None,
+            cache_metering_flush_interval_secs: None,
+            cache_metering_miss_diagnostics: None,
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
@@ -585,15 +688,9 @@ impl Config {
             );
             config.agent_mode = default_agent_mode();
         }
-        // 0 常被理解成「不限时」，但 reqwest 的 timeout(0) 会让每个上游请求立即超时，
-        // 整个服务等于不可用。超时本来就是防挂死的兜底，没有「关掉」的合理用法。
-        if config.upstream_timeout_secs == 0 {
-            tracing::warn!(
-                "upstreamTimeoutSecs 为 0 会让所有上游请求立即超时，回退为默认值 {}",
-                default_upstream_timeout_secs()
-            );
-            config.upstream_timeout_secs = default_upstream_timeout_secs();
-        }
+        // upstreamTotalTimeoutSecs 的 0 是正式取值（关闭总期限，只保留读超时），
+        // 因此这里不再把 0 回退成默认值。旧名 upstreamTimeoutSecs 通过 serde
+        // alias 映射到同一字段，历史配置里的 0 同样按「关闭」处理。
         // 与 Admin API 同一上限；手写的超大值收到上限而不是拒绝启动
         if config.acquire_wait_budget_ms > MAX_ACQUIRE_WAIT_BUDGET_MS {
             tracing::warn!(
@@ -763,18 +860,18 @@ mod tests {
     }
 
     #[test]
-    fn upstream_timeout_defaults_to_30_minutes() {
+    fn upstream_total_timeout_defaults_to_30_minutes() {
         // 此前硬编码 720s，实测成功请求最长 706s —— 上限贴着真实需求，
-        // 会把接近写完的 thinking 长回答切断。默认放宽到 1800s。
+        // 会把接近写完的 thinking 长回答切断。本仓库默认放宽到 1800s。
         let config: Config = serde_json::from_str("{}").unwrap();
-        assert_eq!(config.upstream_timeout_secs, 1_800);
-        assert_eq!(Config::default().upstream_timeout_secs, 1_800);
+        assert_eq!(config.upstream_total_timeout_secs, 1_800);
+        assert_eq!(Config::default().upstream_total_timeout_secs, 1_800);
     }
 
     #[test]
-    fn upstream_timeout_accepts_explicit_value() {
+    fn upstream_timeout_legacy_key_maps_to_total_timeout() {
         let config: Config = serde_json::from_str(r#"{"upstreamTimeoutSecs":600}"#).unwrap();
-        assert_eq!(config.upstream_timeout_secs, 600);
+        assert_eq!(config.upstream_total_timeout_secs, 600);
     }
 
     #[test]
@@ -792,7 +889,7 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_zero_upstream_timeout_and_clamps_wait_budget() {
+    fn load_keeps_zero_upstream_timeout_and_clamps_wait_budget() {
         let dir = tmp_dir("load_validation");
         let path = dir.join("config.json");
         std::fs::write(
@@ -802,8 +899,8 @@ mod tests {
         .unwrap();
         let config = Config::load(&path).unwrap();
         assert_eq!(
-            config.upstream_timeout_secs, 1_800,
-            "0 会让每个上游请求立即超时，必须回退默认值"
+            config.upstream_total_timeout_secs, 0,
+            "0 现在是正式取值：关闭总期限，只保留读超时"
         );
         assert_eq!(
             config.acquire_wait_budget_ms,
@@ -817,7 +914,7 @@ mod tests {
         )
         .unwrap();
         let config = Config::load(&path).unwrap();
-        assert_eq!(config.upstream_timeout_secs, 3);
+        assert_eq!(config.upstream_total_timeout_secs, 3);
         assert_eq!(config.acquire_wait_budget_ms, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -844,6 +941,48 @@ mod tests {
         assert!(!is_valid_agent_mode("vibe mode"));
         assert!(!is_valid_agent_mode("模式"));
         assert!(!is_valid_agent_mode(&"v".repeat(65)));
+    }
+
+    #[test]
+    fn upstream_deadlines_default_for_existing_configs() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.upstream_connect_timeout_secs, 15);
+        assert_eq!(config.upstream_read_timeout_secs, 120);
+        assert_eq!(Config::default().upstream_connect_timeout_secs, 15);
+        assert_eq!(Config::default().upstream_read_timeout_secs, 120);
+    }
+
+    /// 本仓库保留自己的 1800s 默认值，而不是上游的 720s：thinking 长回答
+    /// 实测可跑到 706s，720s 会把接近写完的响应切断。
+    #[test]
+    fn upstream_total_timeout_keeps_fork_default() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.upstream_total_timeout_secs, 1_800);
+        assert_eq!(Config::default().upstream_total_timeout_secs, 1_800);
+    }
+
+    #[test]
+    fn upstream_deadlines_accept_explicit_values() {
+        let config: Config = serde_json::from_str(
+            r#"{"upstreamConnectTimeoutSecs":7,"upstreamReadTimeoutSecs":45}"#,
+        )
+        .unwrap();
+        assert_eq!(config.upstream_connect_timeout_secs, 7);
+        assert_eq!(config.upstream_read_timeout_secs, 45);
+    }
+
+    #[test]
+    fn upstream_total_timeout_accepts_explicit_value() {
+        let config: Config = serde_json::from_str(r#"{"upstreamTotalTimeoutSecs":1800}"#).unwrap();
+        assert_eq!(config.upstream_total_timeout_secs, 1800);
+    }
+
+    /// 0 is a meaningful setting, not a missing one: it turns the overall
+    /// deadline off for deployments that would rather let long answers finish.
+    #[test]
+    fn upstream_total_timeout_accepts_zero_to_disable() {
+        let config: Config = serde_json::from_str(r#"{"upstreamTotalTimeoutSecs":0}"#).unwrap();
+        assert_eq!(config.upstream_total_timeout_secs, 0);
     }
 
     #[test]
@@ -892,6 +1031,14 @@ mod tests {
     }
 
     #[test]
+    fn quota_reset_recovery_defaults_to_disabled() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(!config.quota_reset_recovery_enabled);
+        let config: Config = serde_json::from_str(r#"{"quotaResetRecoveryEnabled":true}"#).unwrap();
+        assert!(config.quota_reset_recovery_enabled);
+    }
+
+    #[test]
     fn account_rpm_limit_defaults_for_existing_configs() {
         let config: Config = serde_json::from_str("{}").unwrap();
         assert!(!config.account_rpm_limit_enabled);
@@ -900,6 +1047,19 @@ mod tests {
         let default = Config::default();
         assert!(!default.account_rpm_limit_enabled);
         assert_eq!(default.account_rpm_limit, 60);
+    }
+
+    #[test]
+    fn model_api_429_retry_defaults_to_enabled_for_existing_configs() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(config.model_api_429_retry_enabled);
+        assert!(Config::default().model_api_429_retry_enabled);
+    }
+
+    #[test]
+    fn model_api_429_retry_accepts_explicitly_disabled() {
+        let config: Config = serde_json::from_str(r#"{"modelApi429RetryEnabled":false}"#).unwrap();
+        assert!(!config.model_api_429_retry_enabled);
     }
 
     #[test]
