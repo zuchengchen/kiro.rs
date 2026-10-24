@@ -1227,7 +1227,7 @@ pub struct MultiTokenManager {
     proxy: Mutex<Option<ProxyConfig>>,
     /// 凭据条目列表
     entries: Mutex<Vec<CredentialEntry>>,
-    /// Admin 服务最近一次成功刷新到的剩余额度快照（不持久化到凭据文件）。
+    /// Admin 服务最近一次成功刷新到的剩余额度 / 超额开关快照（不持久化到凭据文件）。
     balance_snapshots: Mutex<HashMap<u64, BalanceSnapshot>>,
     /// 各账号本计费周期内本机已消耗的积分快照（由 Admin 侧的累计计数器推送）。
     ///
@@ -1415,26 +1415,26 @@ fn normalize_self_heal_model(model: Option<&str>) -> Option<String> {
         .map(|value| value.to_ascii_lowercase())
 }
 
-/// 最近一次成功查询到的账号剩余额度。
+/// 最近一次成功查询到的账号剩余额度和超额开关。
 ///
 /// 余额由 Admin 服务后台刷新，Token 管理器只读取这个轻量快照，避免在每个
-/// 请求上实时调用上游额度接口。快照过期后自动回退到原有 priority 规则。
+/// 请求上实时调用上游额度接口。快照过期后不当成「额度用尽」，避免刷新失败把账号锁死。
 #[derive(Debug, Clone, Copy)]
 struct BalanceSnapshot {
     remaining: f64,
     cached_at: f64,
+    /// 用户当前是否开启了超额。未开且 remaining ≤ 0 时调用上游会 402。
+    overage_enabled: bool,
 }
 
 /// 后台余额刷新的间隔，main 用它启动 `start_balance_refresher`
 pub(crate) const BALANCE_REFRESH_INTERVAL_SECS: u64 = 300;
 
-/// 额度快照参与调度的有效期：两个刷新周期。过期数据不能影响账号选择。
+/// 额度快照参与调度的有效期：两个刷新周期。过期数据不能把账号排除出调度。
 ///
 /// 不能等于刷新间隔。刷新器是「逐个查完一轮再睡 300s」，一轮本身要几秒（生产 8 个账号
 /// 5.7s，账号越多越长），每个快照到下一次被刷新时实际已存在 300s + 一轮耗时。TTL 取 300s
-/// 时，每个账号每个周期都有几秒被当成「无额度数据」排到所有账号之后，而生产上所有账号
-/// 同 priority，这个排序就是实际的选号依据。两个周期也能容忍一次刷新失败，不会因为
-/// 一次查询出错就把账号降级一整个周期。
+/// 时，每个账号每个周期都有几秒被当成「无额度数据」。两个周期也能容忍一次刷新失败。
 const BALANCE_SNAPSHOT_TTL_SECS: f64 = 2.0 * BALANCE_REFRESH_INTERVAL_SECS as f64;
 
 /// 账号是否已用满本周期积分上限
@@ -1452,37 +1452,21 @@ fn credits_exhausted(entry: &CredentialEntry, usage: &HashMap<u64, f64>) -> bool
     usage.get(&entry.id).copied().unwrap_or(0.0) >= limit
 }
 
-fn fresh_balance_remaining(
-    snapshots: &HashMap<u64, BalanceSnapshot>,
-    id: u64,
-    now_ts: f64,
-) -> Option<f64> {
-    snapshots
-        .get(&id)
-        .filter(|snapshot| {
-            snapshot.remaining.is_finite()
-                && snapshot.cached_at.is_finite()
-                && now_ts - snapshot.cached_at < BALANCE_SNAPSHOT_TTL_SECS
-        })
-        .map(|snapshot| snapshot.remaining)
-}
-
-/// 比较两个账号的剩余额度，返回适用于 `sort_by` 的顺序：额度较多者在前。
-fn compare_balance_desc(
-    snapshots: &HashMap<u64, BalanceSnapshot>,
-    now_ts: f64,
-    left_id: u64,
-    right_id: u64,
-) -> std::cmp::Ordering {
-    match (
-        fresh_balance_remaining(snapshots, left_id, now_ts),
-        fresh_balance_remaining(snapshots, right_id, now_ts),
-    ) {
-        (Some(left), Some(right)) => right.total_cmp(&left),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => std::cmp::Ordering::Equal,
+/// 订阅额度已用尽且未开启超额。
+///
+/// 无新鲜快照时返回 false：刷新失败不该把账号锁死一个周期。只有明确 remaining ≤ 0
+/// 且 `overage_enabled` 为 false 才排除，避免继续打出 402 `MONTHLY_REQUEST_COUNT`。
+fn included_quota_exhausted(snapshot: Option<&BalanceSnapshot>, now_ts: f64) -> bool {
+    let Some(snapshot) = snapshot else {
+        return false;
+    };
+    if !snapshot.remaining.is_finite()
+        || !snapshot.cached_at.is_finite()
+        || now_ts - snapshot.cached_at >= BALANCE_SNAPSHOT_TTL_SECS
+    {
+        return false;
     }
+    snapshot.remaining <= 0.0 && !snapshot.overage_enabled
 }
 
 impl MultiTokenManager {
@@ -1735,11 +1719,17 @@ impl MultiTokenManager {
         &self.config
     }
 
-    /// 写入一个账号最近成功查询到的剩余额度，供 priority 调度使用。
+    /// 写入一个账号最近成功查询到的剩余额度和超额开关，供调度排除「用尽且未开超额」的号。
     ///
     /// 余额查询属于 Admin 服务职责，因此快照只在内存中共享，不写回凭据文件。
     /// 非有限数值视为无效并清除旧快照，避免异常响应影响账号选择。
-    pub fn set_balance_snapshot(&self, id: u64, remaining: f64, cached_at: f64) {
+    pub fn set_balance_snapshot(
+        &self,
+        id: u64,
+        remaining: f64,
+        cached_at: f64,
+        overage_enabled: bool,
+    ) {
         let mut snapshots = self.balance_snapshots.lock();
         if remaining.is_finite() && cached_at.is_finite() {
             snapshots.insert(
@@ -1747,10 +1737,18 @@ impl MultiTokenManager {
                 BalanceSnapshot {
                     remaining,
                     cached_at,
+                    overage_enabled,
                 },
             );
         } else {
             snapshots.remove(&id);
+        }
+    }
+
+    /// 只更新超额开关，保留剩余额度。Admin 打开/关闭超额后立刻反映到调度，不必等下一轮余额刷新。
+    pub fn set_snapshot_overage_enabled(&self, id: u64, enabled: bool) {
+        if let Some(snapshot) = self.balance_snapshots.lock().get_mut(&id) {
+            snapshot.overage_enabled = enabled;
         }
     }
 
@@ -1802,6 +1800,12 @@ impl MultiTokenManager {
         }
         let usage = self.cycle_credit_usage.lock();
         credits_exhausted(entry, &usage)
+    }
+
+    /// 订阅额度用尽且未开超额。无新鲜快照时不排除。
+    fn included_quota_exhausted_for(&self, id: u64) -> bool {
+        let snapshots = self.balance_snapshots.lock();
+        included_quota_exhausted(snapshots.get(&id), Utc::now().timestamp() as f64)
     }
 
     /// 设置或清除某个账号的周期积分上限。`None` 表示取消限制。
@@ -2178,8 +2182,10 @@ impl MultiTokenManager {
     /// 获取可用凭据数量
     pub fn available_count(&self) -> usize {
         let now = Instant::now();
-        // 先取用量快照再拿 entries 锁：与 entry_available_for_request 的加锁顺序保持一致
+        // 先取用量/额度快照再拿 entries 锁：与 entry_available_for_request 的加锁顺序保持一致
         let usage = self.cycle_credit_usage.lock().clone();
+        let snapshots = self.balance_snapshots.lock().clone();
+        let now_ts = Utc::now().timestamp() as f64;
         self.entries
             .lock()
             .iter()
@@ -2187,6 +2193,7 @@ impl MultiTokenManager {
                 !e.disabled
                     && !e.throttled_until.map(|t| t > now).unwrap_or(false)
                     && !credits_exhausted(e, &usage)
+                    && !included_quota_exhausted(snapshots.get(&e.id), now_ts)
             })
             .count()
     }
@@ -2205,6 +2212,7 @@ impl MultiTokenManager {
                 .unwrap_or(false)
             && !self.rpm_exceeded(entry, now)
             && !self.cycle_credits_exhausted(entry)
+            && !self.included_quota_exhausted_for(entry.id)
             && credential_matches_request(&entry.credentials, model, group)
             && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
     }
@@ -2249,8 +2257,9 @@ impl MultiTokenManager {
         let window = StdDuration::from_secs(RPM_WINDOW_SECS);
         let mut earliest_retry_after = None;
 
-        // 已达积分上限的账号即便 RPM 有余量也不可选，必须排除：否则它会让这里返回 None，
-        // 请求落到积分上限分支，拿到长达一小时的 Retry-After，而另一个账号一分钟内就能用
+        // 已达积分上限、或订阅额度用尽且未开超额的账号即便 RPM 有余量也不可选，必须排除：
+        // 否则它会让这里返回 None，请求落到上限分支，拿到长达一小时的 Retry-After，
+        // 而另一个账号一分钟内就能用
         for entry in entries.iter().filter(|entry| {
             !entry.disabled
                 && !entry
@@ -2258,6 +2267,7 @@ impl MultiTokenManager {
                     .map(|until| until > now)
                     .unwrap_or(false)
                 && !self.cycle_credits_exhausted(entry)
+                && !self.included_quota_exhausted_for(entry.id)
                 && credential_matches_request(&entry.credentials, model, group)
                 && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
         }) {
@@ -2343,9 +2353,10 @@ impl MultiTokenManager {
         entries
             .iter()
             .filter(|entry| {
-                // 冷却结束后仍被积分上限挡住的账号，等它的冷却没有意义
+                // 冷却结束后仍被积分上限或未开超额的用尽额度挡住的账号，等它的冷却没有意义
                 !entry.disabled
                     && !self.cycle_credits_exhausted(entry)
+                    && !self.included_quota_exhausted_for(entry.id)
                     && credential_matches_request(&entry.credentials, model, group)
                     && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
             })
@@ -2373,9 +2384,9 @@ impl MultiTokenManager {
 
     /// 根据负载均衡模式选择下一个凭据
     ///
-    /// - priority 模式：优先选择剩余额度较多的可用凭据；额度相同时按
-    ///   `priority`（数字越小越优先）选择。没有新鲜额度快照时回退到 priority。
-    /// - balanced 模式：均衡选择可用凭据
+    /// - priority 模式：`priority` 数字越小越优先；同一 priority 内按成功次数最少摊流量。
+    ///   订阅额度用尽且未开超额的号不参与；已开超额的号与还有剩余的号同等可选。
+    /// - balanced 模式：在可用凭据之间按成功次数最少均衡分配。
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
@@ -2384,8 +2395,6 @@ impl MultiTokenManager {
         model: Option<&str>,
         group: Option<&str>,
     ) -> Option<(u64, KiroCredentials)> {
-        let balance_snapshots = self.balance_snapshots.lock().clone();
-        let now_ts = Utc::now().timestamp() as f64;
         let entries = self.entries.lock();
         let now = Instant::now();
 
@@ -2430,16 +2439,13 @@ impl MultiTokenManager {
                 // 明确要求 priority 压过 discovery_rank，未确认的凭据会在实际调用时
                 // 由模型过滤兜住。
                 //
-                // 仅在同一 priority 内部按剩余额度降序做 tie-break：额度快照新鲜时把
-                // 负载导向还有额度的账号，避免同级里先撞满一个再换下一个；额度未知或
-                // 相等时回退 ID 升序，保持顺序稳定可预测。
+                // 同一 priority 内按成功次数升序摊流量，让额度用尽但已开超额的号
+                // 和还有剩余的号一起被调用，而不是永远排在 remaining > 0 后面。
                 available.sort_by(|(left, _), (right, _)| {
                     left.credentials
                         .priority
                         .cmp(&right.credentials.priority)
-                        .then_with(|| {
-                            compare_balance_desc(&balance_snapshots, now_ts, left.id, right.id)
-                        })
+                        .then_with(|| left.success_count.cmp(&right.success_count))
                         .then_with(|| left.id.cmp(&right.id))
                 });
 
@@ -2692,6 +2698,37 @@ impl MultiTokenManager {
                                 "所有可用凭据均已达到本周期积分上限，下个计费周期自动恢复"
                                     .to_string(),
                                 self.earliest_cycle_reset_in_secs(&exhausted_ids),
+                            ),
+                        ));
+                    }
+                    // 此处已持 entries：balance_snapshots 是叶子锁，加锁顺序不构成环路。
+                    let snapshots = self.balance_snapshots.lock().clone();
+                    let now_ts = Utc::now().timestamp() as f64;
+                    let quota_ids: Vec<u64> = entries
+                        .iter()
+                        .filter(|e| {
+                            !e.disabled
+                                && included_quota_exhausted(snapshots.get(&e.id), now_ts)
+                                && credential_matches_request(&e.credentials, model, group)
+                                && self.cached_model_support(e.id, model)
+                                    != CachedModelSupport::Unsupported
+                        })
+                        .map(|e| e.id)
+                        .collect();
+                    if !quota_ids.is_empty() {
+                        tracing::warn!(
+                            "本请求的可用凭据均已用尽订阅额度且未开启超额（{} 个受限 / 启用 {}，共 {}，分组 {:?}，模型 {:?}）",
+                            quota_ids.len(),
+                            available,
+                            total,
+                            group,
+                            model
+                        );
+                        return Err(anyhow::Error::new(
+                            crate::kiro::error::CreditLimitReachedError::new(
+                                "所有可用凭据均已用尽订阅额度且未开启超额，下个计费周期自动恢复"
+                                    .to_string(),
+                                self.earliest_cycle_reset_in_secs(&quota_ids),
                             ),
                         ));
                     }
@@ -3717,8 +3754,10 @@ impl MultiTokenManager {
 
     /// 获取管理器状态快照（用于 Admin API）
     pub fn snapshot(&self) -> ManagerSnapshot {
-        // 与 available_count 一致的加锁顺序：先 cycle_credit_usage 再 entries
+        // 与 available_count 一致的加锁顺序：先 cycle_credit_usage / snapshots 再 entries
         let usage = self.cycle_credit_usage.lock().clone();
+        let snapshots = self.balance_snapshots.lock().clone();
+        let now_ts = Utc::now().timestamp() as f64;
         let entries = self.entries.lock();
         let current_id = *self.current_id.lock();
         let now = Instant::now();
@@ -3728,6 +3767,7 @@ impl MultiTokenManager {
                 !e.disabled
                     && !e.throttled_until.map(|t| t > now).unwrap_or(false)
                     && !credits_exhausted(e, &usage)
+                    && !included_quota_exhausted(snapshots.get(&e.id), now_ts)
             })
             .count();
 
@@ -8312,6 +8352,20 @@ mod tests {
         c
     }
 
+    fn set_balance(
+        manager: &MultiTokenManager,
+        id: u64,
+        remaining: f64,
+        overage_enabled: bool,
+    ) {
+        manager.set_balance_snapshot(
+            id,
+            remaining,
+            Utc::now().timestamp() as f64,
+            overage_enabled,
+        );
+    }
+
     fn model_response(ids: &[&str]) -> ListAvailableModelsResponse {
         ListAvailableModelsResponse {
             models: ids
@@ -8665,9 +8719,8 @@ mod tests {
     }
 
     #[test]
-    fn priority_dominates_balance_across_different_priorities() {
-        // priority 是主序：即使账号 2 额度多得多，priority 更高的账号 1 仍先被选中。
-        // 这样后端调度顺序与 Admin UI 的优先级预览保持一致（上游 b0d3926）。
+    fn priority_dominates_success_count_across_different_priorities() {
+        // priority 是主序：即使账号 2 成功次数更少，priority 更高的账号 1 仍先被选中。
         let mut first = grouped_cred("first", &[]);
         first.priority = 0;
         let mut second = grouped_cred("second", &[]);
@@ -8676,20 +8729,20 @@ mod tests {
             MultiTokenManager::new(Config::default(), vec![first, second], None, None, false)
                 .unwrap();
 
-        let cached_at = Utc::now().timestamp() as f64;
-        manager.set_balance_snapshot(1, 10.0, cached_at);
-        manager.set_balance_snapshot(2, 100.0, cached_at);
+        manager.report_success(1);
+        manager.report_success(1);
+        set_balance(&manager, 1, 0.0, true);
+        set_balance(&manager, 2, 100.0, false);
 
         assert_eq!(
             manager.select_next_credential(None, None).map(|(id, _)| id),
             Some(1),
-            "priority 应压过剩余额度"
+            "priority 应压过成功次数和剩余额度"
         );
     }
 
     #[test]
-    fn balance_breaks_ties_within_same_priority() {
-        // 同一 priority 内部才按剩余额度降序：把负载导向还有额度的账号。
+    fn success_count_breaks_ties_within_same_priority() {
         let mut first = grouped_cred("first", &[]);
         first.priority = 5;
         let mut second = grouped_cred("second", &[]);
@@ -8698,64 +8751,184 @@ mod tests {
             MultiTokenManager::new(Config::default(), vec![first, second], None, None, false)
                 .unwrap();
 
-        let cached_at = Utc::now().timestamp() as f64;
-        manager.set_balance_snapshot(1, 10.0, cached_at);
-        manager.set_balance_snapshot(2, 100.0, cached_at);
+        manager.report_success(1);
+        manager.report_success(1);
         assert_eq!(
             manager.select_next_credential(None, None).map(|(id, _)| id),
             Some(2),
-            "同优先级应选剩余额度更多的账号"
+            "同优先级应选成功次数更少的账号"
         );
 
-        // 额度相等时回退到 ID 升序，保持顺序稳定可预测。
-        manager.set_balance_snapshot(2, 10.0, cached_at);
+        manager.report_success(2);
+        manager.report_success(2);
+        assert_eq!(
+            manager.select_next_credential(None, None).map(|(id, _)| id),
+            Some(1),
+            "成功次数追平后回退 ID 升序"
+        );
+    }
+
+    #[test]
+    fn remaining_zero_without_overage_is_excluded() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("first", &[]), grouped_cred("second", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        set_balance(&manager, 1, 0.0, false);
+        set_balance(&manager, 2, 10.0, false);
+        assert_eq!(manager.available_count(), 1);
+        assert_eq!(
+            manager.select_next_credential(None, None).map(|(id, _)| id),
+            Some(2)
+        );
+
+        set_balance(&manager, 2, 0.0, true);
+        assert_eq!(manager.available_count(), 1);
+        assert_eq!(
+            manager.select_next_credential(None, None).map(|(id, _)| id),
+            Some(2),
+            "已开超额的用尽账号仍可选"
+        );
+    }
+
+    #[test]
+    fn remaining_negative_with_overage_stays_available() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("overage", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        set_balance(&manager, 1, -50.0, true);
+        assert_eq!(manager.available_count(), 1);
         assert_eq!(
             manager.select_next_credential(None, None).map(|(id, _)| id),
             Some(1)
         );
     }
 
-    /// 刷新器是「查完一轮再睡一个间隔」：快照在下一次被刷新前已存在「间隔 + 一轮耗时」，
-    /// 这段时间内它仍必须参与排序，否则每个周期都有几秒被排到所有账号之后
     #[test]
-    fn balance_snapshot_stays_fresh_until_the_next_refresh_pass() {
-        let mut first = grouped_cred("first", &[]);
-        first.priority = 5;
-        let mut second = grouped_cred("second", &[]);
-        second.priority = 5;
-        let manager =
-            MultiTokenManager::new(Config::default(), vec![first, second], None, None, false)
-                .unwrap();
-
-        let now = Utc::now().timestamp() as f64;
-        // #2 额度多，但快照是上一轮刷新留下的：间隔 300s + 一轮 60s 前
-        manager.set_balance_snapshot(1, 10.0, now);
-        manager.set_balance_snapshot(2, 100.0, now - BALANCE_REFRESH_INTERVAL_SECS as f64 - 60.0);
+    fn exhausted_overage_account_competes_by_success_count() {
+        // 额度用尽但已开超额的号不应排在还有剩余的号后面；按成功次数摊。
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("remaining", &[]), grouped_cred("overage", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        set_balance(&manager, 1, 100.0, false);
+        set_balance(&manager, 2, 0.0, true);
+        manager.report_success(1);
+        manager.report_success(1);
         assert_eq!(
             manager.select_next_credential(None, None).map(|(id, _)| id),
             Some(2),
-            "等待下一轮刷新期间，旧快照仍应按额度参与排序"
+            "已开超额的用尽号成功次数更少时应被选中"
         );
     }
 
     #[test]
-    fn stale_balance_snapshot_falls_back_to_priority() {
-        let mut first = grouped_cred("first", &[]);
-        first.priority = 0;
-        let mut second = grouped_cred("second", &[]);
-        second.priority = 1;
-        let manager =
-            MultiTokenManager::new(Config::default(), vec![first, second], None, None, false)
-                .unwrap();
+    fn flipping_overage_flag_updates_availability_immediately() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("only", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        set_balance(&manager, 1, 0.0, false);
+        assert_eq!(manager.available_count(), 0);
+        assert!(manager.select_next_credential(None, None).is_none());
 
-        let stale_at = Utc::now().timestamp() as f64 - BALANCE_SNAPSHOT_TTL_SECS - 1.0;
-        manager.set_balance_snapshot(1, 1.0, stale_at);
-        manager.set_balance_snapshot(2, 1000.0, stale_at);
+        manager.set_snapshot_overage_enabled(1, true);
+        assert_eq!(manager.available_count(), 1);
+        assert_eq!(
+            manager.select_next_credential(None, None).map(|(id, _)| id),
+            Some(1)
+        );
 
+        manager.set_snapshot_overage_enabled(1, false);
+        assert_eq!(manager.available_count(), 0);
+    }
+
+    #[test]
+    fn has_other_available_ignores_remaining_zero_without_overage() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("a", &[]), grouped_cred("b", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(manager.has_other_available_for_request(1, None, None));
+        set_balance(&manager, 2, 0.0, false);
+        assert!(
+            !manager.has_other_available_for_request(1, None, None),
+            "#2 用尽且未开超额，选号不会用它"
+        );
+        set_balance(&manager, 2, 0.0, true);
+        assert!(manager.has_other_available_for_request(1, None, None));
+    }
+
+    /// 刷新器是「查完一轮再睡一个间隔」：remaining=0 且未开超额的快照在下一轮刷新前
+    /// 仍必须把账号排除，否则每个周期都会短暂把用尽号放回池子去打 402。
+    #[test]
+    fn included_quota_exclusion_stays_fresh_until_the_next_refresh_pass() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("first", &[]), grouped_cred("second", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let now = Utc::now().timestamp() as f64;
+        manager.set_balance_snapshot(1, 10.0, now, false);
+        manager.set_balance_snapshot(
+            2,
+            0.0,
+            now - BALANCE_REFRESH_INTERVAL_SECS as f64 - 60.0,
+            false,
+        );
         assert_eq!(
             manager.select_next_credential(None, None).map(|(id, _)| id),
             Some(1),
-            "过期额度不得覆盖原有 priority 顺序"
+            "等待下一轮刷新期间，未开超额的用尽快照仍应排除该账号"
+        );
+    }
+
+    #[test]
+    fn stale_zero_remaining_snapshot_does_not_exclude() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("first", &[]), grouped_cred("second", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let stale_at = Utc::now().timestamp() as f64 - BALANCE_SNAPSHOT_TTL_SECS - 1.0;
+        manager.set_balance_snapshot(1, 0.0, stale_at, false);
+        manager.set_balance_snapshot(2, 0.0, stale_at, false);
+
+        assert_eq!(manager.available_count(), 2);
+        assert_eq!(
+            manager.select_next_credential(None, None).map(|(id, _)| id),
+            Some(1),
+            "过期快照不得把账号排除出调度"
         );
     }
 
@@ -9011,8 +9184,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acquire_rechecks_balance_within_same_priority() {
-        // 取号不复用 current_id：同优先级下额度快照变化应在下一次请求立即生效。
+    async fn acquire_skips_remaining_zero_without_overage() {
         let first = KiroCredentials {
             access_token: Some("first-token".to_string()),
             expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
@@ -9028,16 +9200,113 @@ mod tests {
         let manager =
             MultiTokenManager::new(Config::default(), vec![first, second], None, None, false)
                 .unwrap();
-        let cached_at = Utc::now().timestamp() as f64;
 
-        manager.set_balance_snapshot(1, 10.0, cached_at);
-        manager.set_balance_snapshot(2, 100.0, cached_at);
+        set_balance(&manager, 1, 0.0, false);
+        set_balance(&manager, 2, 10.0, false);
         assert_eq!(manager.acquire_context(None, None).await.unwrap().id, 2);
 
-        // 额度反转后下一次请求应切回账号 1，而不是黏在 current_id 上。
-        manager.set_balance_snapshot(1, 200.0, cached_at);
-        manager.set_balance_snapshot(2, 1.0, cached_at);
-        assert_eq!(manager.acquire_context(None, None).await.unwrap().id, 1);
+        set_balance(&manager, 2, 0.0, false);
+        set_balance(&manager, 1, 0.0, true);
+        assert_eq!(
+            manager.acquire_context(None, None).await.unwrap().id,
+            1,
+            "未开超额的用尽号应立刻让位给已开超额的号，不黏在 current_id 上"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_returns_credit_limit_when_all_remaining_zero_without_overage() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("a", &[]), grouped_cred("b", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        set_balance(&manager, 1, 0.0, false);
+        set_balance(&manager, 2, 0.0, false);
+        let now = Utc::now().timestamp() as f64;
+        manager.set_cycle_reset_times(HashMap::from([(1, now + 1_800.0), (2, now + 600.0)]));
+
+        let Err(err) = manager.acquire_context(None, None).await else {
+            panic!("全部用尽且未开超额时取号应失败");
+        };
+        let limit = err
+            .downcast_ref::<crate::kiro::error::CreditLimitReachedError>()
+            .expect("应报订阅额度用尽");
+        assert!(
+            limit.to_string().contains("未开启超额"),
+            "错误信息应说明是未开超额：{limit}"
+        );
+        assert!(
+            !limit.to_string().contains("受限"),
+            "对客户端的错误信息不应暴露池子构成：{limit}"
+        );
+        assert!(
+            (590..=600).contains(&limit.retry_after_secs()),
+            "应按最早重置时刻：{}",
+            limit.retry_after_secs()
+        );
+    }
+
+    #[tokio::test]
+    async fn remaining_zero_without_overage_does_not_hide_rpm_retry_after() {
+        let mut config = Config::default();
+        config.account_rpm_limit_enabled = true;
+        config.account_rpm_limit = 1;
+        config.acquire_wait_budget_ms = 0;
+        let manager = MultiTokenManager::new(
+            config,
+            vec![grouped_cred("zero", &[]), grouped_cred("rpm", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        set_balance(&manager, 1, 0.0, false);
+        assert!(manager.record_request(2));
+
+        let Err(err) = manager.acquire_context(None, None).await else {
+            panic!("两个账号都不可用时取号应失败");
+        };
+        assert!(
+            err.downcast_ref::<crate::kiro::error::CreditLimitReachedError>()
+                .is_none(),
+            "#2 一分钟内就能用，不能报额度用尽：{err}"
+        );
+        let rate_limit = err
+            .downcast_ref::<UpstreamRateLimitError>()
+            .expect("应返回带 Retry-After 的限流错误");
+        let secs: u64 = rate_limit.retry_after().unwrap().parse().unwrap();
+        assert!(
+            (1..=60).contains(&secs),
+            "Retry-After 应来自 RPM 窗口: {secs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sticky_misses_remaining_zero_without_overage() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("first", &[]), grouped_cred("second", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let mut budget = manager.new_acquire_wait_budget();
+        manager.bind_session("sess-A", 1);
+        set_balance(&manager, 1, 0.0, false);
+        set_balance(&manager, 2, 0.0, true);
+
+        let (ctx, route) = manager
+            .acquire_context_routed(None, None, Some("sess-A"), &mut budget)
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 2);
+        assert_eq!(route.sticky_outcome, StickyOutcome::MissUnavailable);
+        assert_eq!(route.previous_credential_id, Some(1));
     }
 
     #[test]

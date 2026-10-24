@@ -687,7 +687,12 @@ impl AdminService {
         // 将启动时仍然新鲜的额度缓存同步给调度器；余额过期后由调度器自动回退
         // 到原有 priority 规则，避免因持久化缓存短暂缺失而阻塞请求。
         for (&id, cached) in &balance_cache {
-            token_manager.set_balance_snapshot(id, cached.data.remaining, cached.cached_at);
+            token_manager.set_balance_snapshot(
+                id,
+                cached.data.remaining,
+                cached.cached_at,
+                cached.data.overage_enabled == Some(true),
+            );
         }
         let update_config = RuntimeUpdateConfig::from_config(token_manager.config());
         let credential_metadata_schema = match token_manager
@@ -1098,8 +1103,12 @@ impl AdminService {
                 },
             );
         }
-        self.token_manager
-            .set_balance_snapshot(id, balance.remaining, cached_at);
+        self.token_manager.set_balance_snapshot(
+            id,
+            balance.remaining,
+            cached_at,
+            balance.overage_enabled == Some(true),
+        );
         self.save_balance_cache();
 
         Ok(balance)
@@ -1302,6 +1311,7 @@ impl AdminService {
                     }
                     let cached_at = Utc::now().timestamp() as f64;
                     let remaining = balance.remaining;
+                    let overage_enabled = balance.overage_enabled == Some(true);
                     {
                         let mut cache = self.balance_cache.lock();
                         cache.insert(
@@ -1312,8 +1322,12 @@ impl AdminService {
                             },
                         );
                     }
-                    self.token_manager
-                        .set_balance_snapshot(entry.id, remaining, cached_at);
+                    self.token_manager.set_balance_snapshot(
+                        entry.id,
+                        remaining,
+                        cached_at,
+                        overage_enabled,
+                    );
                     success += 1;
                 }
                 Err(e) => {
@@ -2800,10 +2814,10 @@ impl AdminService {
             {
                 Ok(()) => {
                     enabled_ids.push(id);
-                    // 失效本地缓存
+                    // 失效 UI 缓存，但调度快照只翻超额开关：额度用尽的号立刻可被选中
                     let mut cache = self.balance_cache.lock();
                     cache.remove(&id);
-                    self.token_manager.clear_balance_snapshot(id);
+                    self.token_manager.set_snapshot_overage_enabled(id, true);
                 }
                 Err(e) => {
                     tracing::warn!("一键开启超额：凭据 #{} 失败: {}", id, e);
@@ -2844,8 +2858,10 @@ impl AdminService {
             .await
             .map_err(|e| self.classify_balance_error(e, id))?;
 
-        // 让本地缓存的 overage 状态失效（下次刷新时重新拉）
-        self.invalidate_balance_cache(id);
+        // 调度立刻按新开关选号；磁盘余额缓存仍失效，下次刷新拉完整 remaining / overage
+        self.token_manager.set_snapshot_overage_enabled(id, enabled);
+        self.balance_cache.lock().remove(&id);
+        self.save_balance_cache();
 
         // 异步触发一次新的余额查询（不阻塞响应）
         let svc_handle = self.token_manager.clone();

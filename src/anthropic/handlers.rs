@@ -482,12 +482,12 @@ pub(super) fn map_provider_error(err: Error) -> Response {
         return response;
     }
 
-    // 所有账号都用满了管理员设置的周期积分上限：本地策略拒绝。
+    // 所有账号都被本地调度排除（周期积分上限，或订阅额度用尽且未开超额）。
     // 必须带 Retry-After —— 丢了客户端会立即重试，把一次上限拒绝放大成持续风暴。
     if let Some(credit_limit) =
         err.downcast_ref::<crate::kiro::error::CreditLimitReachedError>()
     {
-        tracing::warn!(error = %err, "账号积分上限已用满（映射为 429）");
+        tracing::warn!(error = %err, "账号已达调度上限（映射为 429）");
         let mut response = (
             StatusCode::TOO_MANY_REQUESTS,
             Json(ErrorResponse::new(
