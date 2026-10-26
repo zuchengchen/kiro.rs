@@ -17,8 +17,8 @@ use crate::kiro::endpoint::{
     KiroEndpoint, RequestContext, unique_api_buckets as unique_api_bucket_queue,
 };
 use crate::kiro::error::{
-    UpstreamContextOverflowError, UpstreamModelUnavailableError, UpstreamRateLimitError,
-    UpstreamTimeoutError, is_model_temporarily_unavailable,
+    CreditLimitReachedError, UpstreamContextOverflowError, UpstreamModelUnavailableError,
+    UpstreamRateLimitError, UpstreamTimeoutError, is_model_temporarily_unavailable,
 };
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
@@ -502,7 +502,9 @@ impl KiroProvider {
             {
                 Ok(c) => c,
                 Err(e) => {
-                    if is_rate_limit_error(&e) {
+                    if is_rate_limit_error(&e)
+                        || e.downcast_ref::<CreditLimitReachedError>().is_some()
+                    {
                         Self::emit_attempt(
                             sink,
                             attempt,
@@ -980,7 +982,9 @@ impl KiroProvider {
                     c
                 }
                 Err(e) => {
-                    if is_rate_limit_error(&e) {
+                    if is_rate_limit_error(&e)
+                        || e.downcast_ref::<CreditLimitReachedError>().is_some()
+                    {
                         Self::emit_attempt_seq(
                             sink, &mut hop_seq, 0, "", None, outcome::TRANSIENT,
                             Some(&e.to_string()), attempt_start,
@@ -1166,6 +1170,10 @@ impl KiroProvider {
                 .unique_api_buckets(Arc::clone(&endpoint), &rctx)
                 .into_iter()
                 .skip(1)
+                .filter(|hop| {
+                    hop.name() != crate::kiro::endpoint::cli::AMAZON_Q_CLI_ENDPOINT_NAME
+                        || !cli_rejects_model(model.as_deref())
+                })
                 .collect();
             let should_hop = (status.as_u16() == 429 || hop_saw_402_quota)
                 && !remaining_buckets.is_empty();
@@ -1283,6 +1291,31 @@ impl KiroProvider {
                                 );
                                 error_body = Some(hop_body);
                                 continue;
+                            }
+
+                            if hop_saw_402_quota
+                                && hop_status.as_u16() == 400
+                                && !hop_body.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD")
+                            {
+                                // IDE 桶额度尽后再 hop 到 CLI，5.5 模型会 400。
+                                // 不能当成客户端坏请求结束：要标尽并换号。
+                                Self::emit_attempt_seq(
+                                    sink,
+                                    &mut hop_seq,
+                                    ctx.id,
+                                    hop_endpoint.name(),
+                                    Some(400),
+                                    outcome::QUOTA_EXHAUSTED,
+                                    Some(&hop_body),
+                                    hop_start,
+                                );
+                                endpoint = hop_endpoint;
+                                endpoint_name = endpoint.name();
+                                status = hop_status;
+                                error_body = Some(hop_body);
+                                skip_failed_emit = true;
+                                hop_aborted = false;
+                                break;
                             }
 
                             if hop_endpoint.is_client_validation_error(&hop_body)
@@ -1421,11 +1454,17 @@ impl KiroProvider {
                 return Err(UpstreamModelUnavailableError { retry_after: delay }.into());
             }
 
-            // 全部独特桶 402 额度尽：禁用凭据并换号。链被后跳 5xx/超时打断时
-            // 保留触发换桶的 402，不禁用（CLI 可能仍有额度）。
-            if status.as_u16() == 402 && hop_saw_402_quota && !hop_aborted {
+            // IDE 桶额度尽（含 hop 到 CLI 后的 400）：周期内排除该号并换号。
+            // 不永久禁用：CLI 400 会打断「四桶全 402」，禁用会把号锁死到手动恢复。
+            let quota_failover = hop_saw_402_quota
+                && !hop_aborted
+                && (status.as_u16() == 402
+                    || (status.as_u16() == 400
+                        && !body.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD")));
+            if quota_failover {
                 tracing::warn!(
-                    "API 请求失败（额度已用尽，禁用凭据并切换，尝试 {}/{}）: {} {}",
+                    "API 请求失败（额度已用尽，本周期排除凭据 #{} 并换号，尝试 {}/{}）: {} {}",
+                    ctx.id,
                     attempt + 1,
                     max_retries,
                     status,
@@ -1443,20 +1482,7 @@ impl KiroProvider {
                         attempt_start,
                     );
                 }
-
-                let has_available = self.token_manager.report_quota_exhausted_for_request(
-                    ctx.id,
-                    model.as_deref(),
-                    group,
-                );
-                if !has_available {
-                    anyhow::bail!(
-                        "{} API 请求失败（所有凭据已用尽）: {} {}",
-                        api_type,
-                        status,
-                        body
-                    );
-                }
+                self.token_manager.mark_overage_exhausted(ctx.id);
 
                 last_error = Some(anyhow::anyhow!(
                     "{} API 请求失败: {} {}",
@@ -2002,6 +2028,18 @@ fn is_rate_limit_error(error: &anyhow::Error) -> bool {
     error.downcast_ref::<UpstreamRateLimitError>().is_some()
 }
 
+/// amazonq-cli 不接受这些实验模型 ID，hop 过去只会 400 Improperly formed request。
+fn cli_rejects_model(model: Option<&str>) -> bool {
+    let Some(model) = model else {
+        return false;
+    };
+    let normalized = model.to_ascii_lowercase().replace('_', "-");
+    normalized.contains("haiku-5.5")
+        || normalized.contains("haiku-5-5")
+        || normalized.contains("opus-5.5")
+        || normalized.contains("opus-5-5")
+}
+
 fn take_rate_limit_error(last_error: &mut Option<anyhow::Error>) -> Option<anyhow::Error> {
     if last_error
         .as_ref()
@@ -2125,6 +2163,24 @@ mod rate_limit_tests {
         BucketSpec {
             status: StatusCode::PAYMENT_REQUIRED,
             body: r#"{"reason":"MONTHLY_REQUEST_COUNT"}"#,
+            hang: false,
+            ok_after: None,
+        }
+    }
+
+    fn monthly_402_then_ok_on(hit: usize) -> BucketSpec {
+        BucketSpec {
+            status: StatusCode::PAYMENT_REQUIRED,
+            body: r#"{"reason":"OVERAGE_REQUEST_LIMIT_EXCEEDED"}"#,
+            hang: false,
+            ok_after: Some(hit),
+        }
+    }
+
+    fn improperly_formed_400() -> BucketSpec {
+        BucketSpec {
+            status: StatusCode::BAD_REQUEST,
+            body: r#"{"message":"Improperly formed request.","reason":null}"#,
             hang: false,
             ok_after: None,
         }
@@ -2528,7 +2584,7 @@ mod rate_limit_tests {
     }
 
     #[tokio::test]
-    async fn all_four_buckets_402_disables_credential() {
+    async fn all_four_buckets_402_excludes_without_disable() {
         let harness = mock_four_buckets(
             us_map(monthly_402(), monthly_402(), monthly_402(), monthly_402()),
             false,
@@ -2540,14 +2596,79 @@ mod rate_limit_tests {
             .call_api_stream(TEST_REQUEST_BODY, None, None)
             .await
         {
-            Ok(_) => panic!("all unique buckets 402 should disable the credential"),
+            Ok(_) => panic!("all unique buckets 402 should fail the request"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("402"));
+        assert!(
+            error.downcast_ref::<CreditLimitReachedError>().is_some()
+                || error.to_string().contains("402"),
+            "额度尽应上抛额度错误或 402：{error}"
+        );
         assert_eq!(harness.total_api(), 4);
-        let entry = &harness.provider.token_manager().snapshot().entries[0];
-        assert!(entry.disabled);
-        assert_eq!(entry.disabled_reason.as_deref(), Some("QuotaExceeded"));
+        let manager = harness.provider.token_manager();
+        let entry = &manager.snapshot().entries[0];
+        assert!(!entry.disabled, "超额用尽不应永久禁用凭据");
+        assert_ne!(entry.disabled_reason.as_deref(), Some("QuotaExceeded"));
+        assert!(manager.is_overage_exhausted(1));
+    }
+
+    #[tokio::test]
+    async fn ide_402_then_cli_400_failovers_to_another_credential() {
+        let harness = mock_four_buckets(
+            us_map(
+                monthly_402_then_ok_on(2),
+                monthly_402(),
+                monthly_402(),
+                improperly_formed_400(),
+            ),
+            false,
+            2,
+        )
+        .await;
+        let result = harness
+            .provider
+            .call_api_stream(TEST_REQUEST_BODY, None, None)
+            .await
+            .unwrap();
+        assert_eq!(result.credential_id, 2);
+        assert_eq!(result.response.text().await.unwrap(), "second-account-ok");
+        let manager = harness.provider.token_manager();
+        assert!(manager.is_overage_exhausted(1));
+        assert!(!manager.snapshot().entries[0].disabled);
+    }
+
+    #[tokio::test]
+    async fn opus_5_5_skips_amazonq_cli_hop() {
+        const OPUS_BODY: &str = r#"{
+            "conversationState": {
+                "conversationId": "sess-opus-55",
+                "agentContinuationId": "continue",
+                "agentTaskType": "vibe",
+                "currentMessage": {"userInputMessage": {"modelId": "claude-opus-5.5", "origin": "AI_EDITOR"}}
+            }
+        }"#;
+        let harness = mock_four_buckets(
+            us_map(monthly_402(), monthly_402(), monthly_402(), ok("cli-ok")),
+            false,
+            1,
+        )
+        .await;
+        let error = match harness
+            .provider
+            .call_api_stream(OPUS_BODY, None, None)
+            .await
+        {
+            Ok(_) => panic!("opus-5.5 must not succeed via amazonq-cli"),
+            Err(error) => error,
+        };
+        assert!(
+            error.downcast_ref::<CreditLimitReachedError>().is_some()
+                || error.to_string().contains("402"),
+            "{error}"
+        );
+        assert_eq!(harness.count("amazonq-cli"), 0);
+        assert!(harness.provider.token_manager().is_overage_exhausted(1));
+        assert!(!harness.provider.token_manager().snapshot().entries[0].disabled);
     }
 
     #[tokio::test]

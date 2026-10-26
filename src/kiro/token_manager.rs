@@ -1451,6 +1451,10 @@ struct BalanceSnapshot {
     cached_at: f64,
     /// 用户当前是否开启了超额。未开且 remaining ≤ 0 时调用上游会 402。
     overage_enabled: bool,
+    /// IDE 桶已回报超额/月度额度尽。周期重置或 remaining > 0 刷新前排除该号。
+    overage_exhausted: bool,
+    /// 该标记失效的 Unix 秒（账号 nextResetAt）。None 表示直到余额刷新 remaining > 0。
+    overage_exhausted_until: Option<f64>,
 }
 
 /// 后台余额刷新的间隔，main 用它启动 `start_balance_refresher`
@@ -1478,14 +1482,23 @@ fn credits_exhausted(entry: &CredentialEntry, usage: &HashMap<u64, f64>) -> bool
     usage.get(&entry.id).copied().unwrap_or(0.0) >= limit
 }
 
-/// 订阅额度已用尽且未开启超额。
+/// 订阅额度已用尽且未开启超额，或超额额度也已打尽。
 ///
-/// 无新鲜快照时返回 false：刷新失败不该把账号锁死一个周期。只有明确 remaining ≤ 0
-/// 且 `overage_enabled` 为 false 才排除，避免继续打出 402 `MONTHLY_REQUEST_COUNT`。
+/// 无新鲜快照时不按 remaining 排除：刷新失败不该把账号锁死一个周期。
+/// `overage_exhausted` 不跟余额 TTL 过期，直到周期重置或 remaining > 0 刷新。
 fn included_quota_exhausted(snapshot: Option<&BalanceSnapshot>, now_ts: f64) -> bool {
     let Some(snapshot) = snapshot else {
         return false;
     };
+    if snapshot.overage_exhausted {
+        let still = snapshot
+            .overage_exhausted_until
+            .map(|until| now_ts < until)
+            .unwrap_or(true);
+        if still {
+            return true;
+        }
+    }
     if !snapshot.remaining.is_finite()
         || !snapshot.cached_at.is_finite()
         || now_ts - snapshot.cached_at >= BALANCE_SNAPSHOT_TTL_SECS
@@ -1493,6 +1506,23 @@ fn included_quota_exhausted(snapshot: Option<&BalanceSnapshot>, now_ts: f64) -> 
         return false;
     }
     snapshot.remaining <= 0.0 && !snapshot.overage_enabled
+}
+
+/// 同 priority 内的可服务性：有 included 余量的号排在已开超额、余量为 0 的号前面。
+fn servability_rank(snapshot: Option<&BalanceSnapshot>, now_ts: f64) -> u8 {
+    let Some(snapshot) = snapshot else {
+        return 2;
+    };
+    let fresh = snapshot.remaining.is_finite()
+        && snapshot.cached_at.is_finite()
+        && now_ts - snapshot.cached_at < BALANCE_SNAPSHOT_TTL_SECS;
+    if fresh && snapshot.remaining > 0.0 {
+        return 0;
+    }
+    if snapshot.overage_enabled && !included_quota_exhausted(Some(snapshot), now_ts) {
+        return 1;
+    }
+    2
 }
 
 impl MultiTokenManager {
@@ -1766,12 +1796,27 @@ impl MultiTokenManager {
     ) {
         let mut snapshots = self.balance_snapshots.lock();
         if remaining.is_finite() && cached_at.is_finite() {
+            let previous = snapshots.get(&id).copied();
+            let overage_exhausted = if remaining > 0.0 {
+                false
+            } else {
+                previous
+                    .map(|snapshot| snapshot.overage_exhausted)
+                    .unwrap_or(false)
+            };
+            let overage_exhausted_until = if overage_exhausted {
+                previous.and_then(|snapshot| snapshot.overage_exhausted_until)
+            } else {
+                None
+            };
             snapshots.insert(
                 id,
                 BalanceSnapshot {
                     remaining,
                     cached_at,
                     overage_enabled,
+                    overage_exhausted,
+                    overage_exhausted_until,
                 },
             );
         } else {
@@ -1786,9 +1831,42 @@ impl MultiTokenManager {
         }
     }
 
+    /// IDE 桶已回报月度/超额额度尽：调度排除该号直到周期重置或 remaining > 0。
+    ///
+    /// 不禁用凭据。amazonq-cli 对 5.5 模型回 400 会打断「四桶全 402 才禁用」，
+    /// 若禁用就会把还能用 included 余量的号也锁死；这里只做周期内排除。
+    pub fn mark_overage_exhausted(&self, id: u64) {
+        let reset_at = self.cycle_reset_times.lock().get(&id).copied();
+        let now_ts = Utc::now().timestamp() as f64;
+        let mut snapshots = self.balance_snapshots.lock();
+        if let Some(snapshot) = snapshots.get_mut(&id) {
+            snapshot.overage_exhausted = true;
+            snapshot.overage_exhausted_until = reset_at;
+            return;
+        }
+        snapshots.insert(
+            id,
+            BalanceSnapshot {
+                remaining: 0.0,
+                cached_at: now_ts,
+                overage_enabled: true,
+                overage_exhausted: true,
+                overage_exhausted_until: reset_at,
+            },
+        );
+    }
+
     /// 清除一个账号的额度快照（删除账号、切换身份或余额失效时调用）。
     pub fn clear_balance_snapshot(&self, id: u64) {
         self.balance_snapshots.lock().remove(&id);
+    }
+
+    #[cfg(test)]
+    pub fn is_overage_exhausted(&self, id: u64) -> bool {
+        self.balance_snapshots
+            .lock()
+            .get(&id)
+            .is_some_and(|snapshot| snapshot.overage_exhausted)
     }
 
     /// 全量替换「本周期本机已消耗积分」快照，供 `max_cycle_credits` 判断使用。
@@ -2472,8 +2550,9 @@ impl MultiTokenManager {
 
     /// 根据负载均衡模式选择下一个凭据
     ///
-    /// - priority 模式：`priority` 数字越小越优先；同一 priority 内按成功次数最少摊流量。
-    ///   订阅额度用尽且未开超额的号不参与；已开超额的号与还有剩余的号同等可选。
+    /// - priority 模式：`priority` 数字越小越优先；同一 priority 内先选还有 included
+    ///   余量的号，再选已开超额且未标尽的号，最后按成功次数最少摊。
+    ///   订阅额度用尽且未开超额、或超额也已打尽的号不参与。
     /// - balanced 模式：在可用凭据中均匀随机选择一个（不按 success_count / 模型缓存
     ///   排序，避免新凭据独占流量、Unknown 缓存凭据永远选不到）。
     ///
@@ -2487,6 +2566,8 @@ impl MultiTokenManager {
         model: Option<&str>,
         group: Option<&str>,
     ) -> Option<(u64, KiroCredentials)> {
+        let snapshots = self.balance_snapshots.lock().clone();
+        let now_ts = Utc::now().timestamp() as f64;
         let entries = self.entries.lock();
         let now = Instant::now();
 
@@ -2519,12 +2600,16 @@ impl MultiTokenManager {
                 // 明确要求 priority 压过 discovery_rank，未确认的凭据会在实际调用时
                 // 由模型过滤兜住。
                 //
-                // 同一 priority 内按成功次数升序摊流量，让额度用尽但已开超额的号
-                // 和还有剩余的号一起被调用，而不是永远排在 remaining > 0 后面。
+                // 同一 priority 内：有 included 余量的号压过已开超额的用尽号，
+                // 避免超额也打满的号把还有余量的号挡住。同类再按成功次数升序摊。
                 available.sort_by(|left, right| {
                     left.credentials
                         .priority
                         .cmp(&right.credentials.priority)
+                        .then_with(|| {
+                            servability_rank(snapshots.get(&left.id), now_ts)
+                                .cmp(&servability_rank(snapshots.get(&right.id), now_ts))
+                        })
                         .then_with(|| left.success_count.cmp(&right.success_count))
                         .then_with(|| left.id.cmp(&right.id))
                 });
@@ -2820,7 +2905,7 @@ impl MultiTokenManager {
                         .collect();
                     if !quota_ids.is_empty() {
                         tracing::warn!(
-                            "本请求的可用凭据均已用尽订阅额度且未开启超额（{} 个受限 / 启用 {}，共 {}，分组 {:?}，模型 {:?}）",
+                            "本请求的可用凭据均已用尽订阅额度或超额额度（{} 个受限 / 启用 {}，共 {}，分组 {:?}，模型 {:?}）",
                             quota_ids.len(),
                             available,
                             total,
@@ -2829,7 +2914,7 @@ impl MultiTokenManager {
                         );
                         return Err(anyhow::Error::new(
                             crate::kiro::error::CreditLimitReachedError::new(
-                                "所有可用凭据均已用尽订阅额度且未开启超额，下个计费周期自动恢复"
+                                "所有可用凭据均已用尽订阅额度或超额额度，下个计费周期自动恢复"
                                     .to_string(),
                                 self.earliest_cycle_reset_in_secs(&quota_ids),
                             ),
@@ -9423,8 +9508,7 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_overage_account_competes_by_success_count() {
-        // 额度用尽但已开超额的号不应排在还有剩余的号后面；按成功次数摊。
+    fn remaining_positive_outranks_overage_zero() {
         let manager = MultiTokenManager::new(
             Config::default(),
             vec![grouped_cred("remaining", &[]), grouped_cred("overage", &[])],
@@ -9439,9 +9523,53 @@ mod tests {
         manager.report_success(1);
         assert_eq!(
             manager.select_next_credential(None, None).map(|(id, _)| id),
-            Some(2),
-            "已开超额的用尽号成功次数更少时应被选中"
+            Some(1),
+            "有 included 余量的号应压过已开超额的用尽号"
         );
+    }
+
+    #[test]
+    fn overage_zero_accounts_spread_by_success_count() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("a", &[]), grouped_cred("b", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        set_balance(&manager, 1, 0.0, true);
+        set_balance(&manager, 2, 0.0, true);
+        manager.report_success(1);
+        assert_eq!(
+            manager.select_next_credential(None, None).map(|(id, _)| id),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn mark_overage_exhausted_excludes_until_remaining_refreshes() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("dead", &[]), grouped_cred("live", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        set_balance(&manager, 1, 0.0, true);
+        set_balance(&manager, 2, 50.0, false);
+        manager.mark_overage_exhausted(1);
+        assert!(manager.is_overage_exhausted(1));
+        assert_eq!(manager.available_count(), 1);
+        assert_eq!(
+            manager.select_next_credential(None, None).map(|(id, _)| id),
+            Some(2)
+        );
+
+        set_balance(&manager, 1, 10.0, true);
+        assert!(!manager.is_overage_exhausted(1));
+        assert_eq!(manager.available_count(), 2);
     }
 
     #[test]
@@ -9844,8 +9972,8 @@ mod tests {
             .downcast_ref::<crate::kiro::error::CreditLimitReachedError>()
             .expect("应报订阅额度用尽");
         assert!(
-            limit.to_string().contains("未开启超额"),
-            "错误信息应说明是未开超额：{limit}"
+            limit.to_string().contains("订阅额度"),
+            "错误信息应说明是额度用尽：{limit}"
         );
         assert!(
             !limit.to_string().contains("受限"),
@@ -9910,6 +10038,31 @@ mod tests {
 
         let (ctx, route) = manager
             .acquire_context_routed(None, None, Some("sess-A"), &mut budget)
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 2);
+        assert_eq!(route.sticky_outcome, StickyOutcome::MissUnavailable);
+        assert_eq!(route.previous_credential_id, Some(1));
+    }
+
+    #[tokio::test]
+    async fn sticky_misses_overage_exhausted_account() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("dead", &[]), grouped_cred("live", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let mut budget = manager.new_acquire_wait_budget();
+        manager.bind_session("sess-B", 1);
+        set_balance(&manager, 1, 0.0, true);
+        set_balance(&manager, 2, 80.0, false);
+        manager.mark_overage_exhausted(1);
+
+        let (ctx, route) = manager
+            .acquire_context_routed(None, None, Some("sess-B"), &mut budget)
             .await
             .unwrap();
         assert_eq!(ctx.id, 2);
