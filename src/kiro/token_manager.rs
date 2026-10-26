@@ -1856,6 +1856,14 @@ impl MultiTokenManager {
         );
     }
 
+    /// 清除超额用尽排除，保留余额快照其余字段（手动启用 / 重置时调用）。
+    pub fn clear_overage_exhausted(&self, id: u64) {
+        if let Some(snapshot) = self.balance_snapshots.lock().get_mut(&id) {
+            snapshot.overage_exhausted = false;
+            snapshot.overage_exhausted_until = None;
+        }
+    }
+
     /// 清除一个账号的额度快照（删除账号、切换身份或余额失效时调用）。
     pub fn clear_balance_snapshot(&self, id: u64) {
         self.balance_snapshots.lock().remove(&id);
@@ -1882,10 +1890,19 @@ impl MultiTokenManager {
 
     /// 记录各账号计费周期的重置时刻（Unix 秒），用于生成 `Retry-After`。
     pub fn set_cycle_reset_times(&self, resets: HashMap<u64, f64>) {
-        *self.cycle_reset_times.lock() = resets
+        let resets: HashMap<u64, f64> = resets
             .into_iter()
             .filter(|(_, v)| v.is_finite() && *v > 0.0)
             .collect();
+        *self.cycle_reset_times.lock() = resets.clone();
+        // 标尽时还不知道重置时刻的号，拿到后补上截止，周期翻转即自动恢复。
+        // 两把叶子锁依次获取，不嵌套。
+        let mut snapshots = self.balance_snapshots.lock();
+        for (id, snapshot) in snapshots.iter_mut() {
+            if snapshot.overage_exhausted && snapshot.overage_exhausted_until.is_none() {
+                snapshot.overage_exhausted_until = resets.get(id).copied();
+            }
+        }
     }
 
     /// `ids` 中最早一个账号的周期重置还有多少秒；都没有已知重置时刻时返回 None。
@@ -3707,6 +3724,10 @@ impl MultiTokenManager {
         self.report_quota_exhausted_for_request(id, None, None)
     }
 
+    /// 运行时已不再按 402 永久禁用（对话与 tool 路径都改走
+    /// [`Self::mark_overage_exhausted`] 周期内排除）。保留给测试构造历史
+    /// `QuotaExceeded` 禁用态，验证自愈 / 恢复逻辑仍兼容旧持久化数据。
+    #[cfg(test)]
     pub fn report_quota_exhausted_for_request(
         &self,
         id: u64,
@@ -4056,6 +4077,10 @@ impl MultiTokenManager {
                 entry.clear_self_heal_streak();
             }
         }
+        if !disabled {
+            // 手动启用即人工确认可用：清掉周期内的超额用尽排除。
+            self.clear_overage_exhausted(id);
+        }
         // 持久化更改
         self.persist_credentials()?;
         Ok(())
@@ -4295,6 +4320,7 @@ impl MultiTokenManager {
             }
             entry.reset_health();
         }
+        self.clear_overage_exhausted(id);
         // 持久化更改
         self.persist_credentials()?;
         Ok(())
@@ -9570,6 +9596,63 @@ mod tests {
         set_balance(&manager, 1, 10.0, true);
         assert!(!manager.is_overage_exhausted(1));
         assert_eq!(manager.available_count(), 2);
+    }
+
+    #[test]
+    fn manual_enable_and_reset_clear_overage_exhausted() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("a", &[]), grouped_cred("b", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        set_balance(&manager, 1, 0.0, true);
+        set_balance(&manager, 2, 0.0, true);
+
+        manager.mark_overage_exhausted(1);
+        assert_eq!(manager.available_count(), 1);
+        manager.set_disabled(1, false).unwrap();
+        assert!(!manager.is_overage_exhausted(1), "手动启用应清掉超额用尽标记");
+        assert_eq!(manager.available_count(), 2);
+
+        manager.mark_overage_exhausted(2);
+        assert_eq!(manager.available_count(), 1);
+        manager.reset_and_enable(2).unwrap();
+        assert!(!manager.is_overage_exhausted(2), "重置并启用应清掉超额用尽标记");
+        assert_eq!(manager.available_count(), 2);
+
+        // 手动禁用不应顺带清除。
+        manager.mark_overage_exhausted(1);
+        manager.set_disabled(1, true).unwrap();
+        assert!(manager.is_overage_exhausted(1));
+    }
+
+    #[test]
+    fn overage_exhausted_without_reset_time_gets_deadline_later() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("past", &[]), grouped_cred("future", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        set_balance(&manager, 1, 0.0, true);
+        set_balance(&manager, 2, 0.0, true);
+        manager.mark_overage_exhausted(1);
+        manager.mark_overage_exhausted(2);
+        assert_eq!(manager.available_count(), 0, "无重置时刻时标记应持续生效");
+
+        let now = Utc::now().timestamp() as f64;
+        manager.set_cycle_reset_times(HashMap::from([(1, now - 60.0), (2, now + 3_600.0)]));
+        assert_eq!(
+            manager.select_next_credential(None, None).map(|(id, _)| id),
+            Some(1),
+            "补上的截止已过：#1 应自动回到可选"
+        );
+        assert_eq!(manager.available_count(), 1, "#2 截止未到，仍应排除");
     }
 
     #[test]
