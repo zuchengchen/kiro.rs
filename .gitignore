@@ -49,3 +49,6 @@
 # kiro-account-manager-export-*.json 是 Admin UI「导出」的下载文件名。
 kiro-accounts-*.json
 kiro-account-manager-export-*.json
+
+# Kilo Agent Manager 本地状态、worktree 与计划草稿（本机产物，不入库）
+/.kilo/
