@@ -2606,6 +2606,29 @@ impl MultiTokenManager {
             .map(|(context, _, route)| (context, route))
     }
 
+    /// 钉在指定凭据上取号：不走负载均衡，也不因额度用尽而排除。
+    ///
+    /// Admin 从某张凭据的模型列表发起「真实测试」时用它。禁用或不存在则失败。
+    /// `wait_budget` 与普通取号同形，便于和 `call_api_with_retry` 共用签名。
+    pub async fn acquire_context_for(
+        &self,
+        id: u64,
+        _wait_budget: &mut AcquireWaitBudget,
+    ) -> anyhow::Result<CallContext> {
+        let credentials = {
+            let entries = self.entries.lock();
+            let entry = entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            if entry.disabled {
+                anyhow::bail!("凭据 #{} 已禁用", id);
+            }
+            entry.credentials_snapshot()
+        };
+        self.try_ensure_token(id, &credentials).await
+    }
+
     /// 记录「该凭据成功服务了该会话」，供下一轮粘性命中。
     pub fn bind_session(&self, session: &str, credential_id: u64) {
         self.session_affinity.bind(session, credential_id);
@@ -9257,6 +9280,50 @@ mod tests {
         assert!(manager.select_next_credential(None, Some("nope")).is_none());
         // 未绑定分组(None) → 可选到账号
         assert!(manager.select_next_credential(None, None).is_some());
+    }
+
+    #[tokio::test]
+    async fn acquire_context_for_pins_specified_credential() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("first", &[]), grouped_cred("second", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.report_success(2);
+        set_balance(&manager, 1, 0.0, false);
+        let mut budget = manager.new_acquire_wait_budget();
+        let ctx = manager
+            .acquire_context_for(1, &mut budget)
+            .await
+            .expect("钉测应忽略额度用尽排除");
+        assert_eq!(ctx.id, 1);
+    }
+
+    #[tokio::test]
+    async fn acquire_context_for_rejects_missing_and_disabled() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("only", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.set_disabled(1, true).unwrap();
+        let mut budget = manager.new_acquire_wait_budget();
+        let err = match manager.acquire_context_for(1, &mut budget).await {
+            Ok(_) => panic!("禁用凭据应拒绝钉测"),
+            Err(error) => error.to_string(),
+        };
+        assert!(err.contains("已禁用"), "{err}");
+        let err = match manager.acquire_context_for(99, &mut budget).await {
+            Ok(_) => panic!("不存在的凭据应拒绝钉测"),
+            Err(error) => error.to_string(),
+        };
+        assert!(err.contains("不存在"), "{err}");
     }
 
     #[test]

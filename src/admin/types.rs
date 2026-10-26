@@ -464,6 +464,9 @@ pub struct AvailableModelItem {
 #[serde(rename_all = "camelCase")]
 pub struct ModelTestRequest {
     pub model_id: String,
+    /// 从某张凭据的模型列表发起时带上，测试必须打这张号，不能按池子另选。
+    #[serde(default)]
+    pub credential_id: Option<u64>,
 }
 
 /// 真实模型请求测试结果。
@@ -1443,4 +1446,21 @@ pub struct CustomModelItem {
 #[serde(rename_all = "camelCase")]
 pub struct SetCustomModelsRequest {
     pub models: Vec<CustomModelItem>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ModelTestRequest;
+
+    #[test]
+    fn model_test_request_credential_id_is_optional() {
+        let request: ModelTestRequest =
+            serde_json::from_str(r#"{"modelId":"claude-opus-5.5"}"#).unwrap();
+        assert_eq!(request.model_id, "claude-opus-5.5");
+        assert_eq!(request.credential_id, None);
+
+        let request: ModelTestRequest =
+            serde_json::from_str(r#"{"modelId":"claude-opus-5.5","credentialId":613}"#).unwrap();
+        assert_eq!(request.credential_id, Some(613));
+    }
 }

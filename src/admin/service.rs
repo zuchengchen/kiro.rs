@@ -1259,9 +1259,27 @@ impl AdminService {
         .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
 
         let started = std::time::Instant::now();
+        let pinned_id = request.credential_id;
+        if let Some(id) = pinned_id {
+            let snapshot = self.token_manager.snapshot();
+            let entry = snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .ok_or(AdminServiceError::NotFound { id })?;
+            if entry.disabled {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "凭据 #{id} 已禁用，无法测试模型"
+                )));
+            }
+        }
         let (credential_id, bytes) =
             tokio::time::timeout(std::time::Duration::from_secs(90), async {
-                let call = provider.call_api(&body, None, None).await?;
+                let call = if let Some(id) = pinned_id {
+                    provider.call_api_for_credential(&body, id).await?
+                } else {
+                    provider.call_api(&body, None, None).await?
+                };
                 let credential_id = call.credential_id;
                 let bytes = call.response.bytes().await?;
                 Ok::<_, anyhow::Error>((credential_id, bytes))

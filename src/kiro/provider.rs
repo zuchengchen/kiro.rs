@@ -22,6 +22,7 @@ use crate::kiro::error::{
 };
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::session_affinity::RouteDecision;
 use crate::kiro::token_manager::AcquireWaitBudget;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::TlsBackend;
@@ -332,8 +333,29 @@ impl KiroProvider {
         group: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
         let mut wait_budget = self.token_manager.new_acquire_wait_budget();
-        self.call_api_with_retry(request_body, false, sink, group, &mut wait_budget)
+        self.call_api_with_retry(request_body, false, sink, group, &mut wait_budget, None)
             .await
+    }
+
+    /// 用指定凭据发非流式请求：同账号仍换桶，但不转其他凭据。
+    ///
+    /// Admin「真实测试」从某张凭据的模型列表发起时必须走这条路径，否则会按池子选号，
+    /// 测到的不是对话框里那张号。
+    pub async fn call_api_for_credential(
+        &self,
+        request_body: &str,
+        credential_id: u64,
+    ) -> anyhow::Result<KiroCallResult> {
+        let mut wait_budget = self.token_manager.new_acquire_wait_budget();
+        self.call_api_with_retry(
+            request_body,
+            false,
+            None,
+            None,
+            &mut wait_budget,
+            Some(credential_id),
+        )
+        .await
     }
 
     /// 发送流式 API 请求
@@ -344,7 +366,7 @@ impl KiroProvider {
         group: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
         let mut wait_budget = self.token_manager.new_acquire_wait_budget();
-        self.call_api_with_retry(request_body, true, sink, group, &mut wait_budget)
+        self.call_api_with_retry(request_body, true, sink, group, &mut wait_budget, None)
             .await
     }
 
@@ -359,7 +381,7 @@ impl KiroProvider {
         group: Option<&str>,
         wait_budget: &mut AcquireWaitBudget,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, false, sink, group, wait_budget)
+        self.call_api_with_retry(request_body, false, sink, group, wait_budget, None)
             .await
     }
 
@@ -371,7 +393,7 @@ impl KiroProvider {
         group: Option<&str>,
         wait_budget: &mut AcquireWaitBudget,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, true, sink, group, wait_budget)
+        self.call_api_with_retry(request_body, true, sink, group, wait_budget, None)
             .await
     }
 
@@ -907,9 +929,14 @@ impl KiroProvider {
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
         wait_budget: &mut AcquireWaitBudget,
+        pinned_credential_id: Option<u64>,
     ) -> anyhow::Result<KiroCallResult> {
         // 重试预算按当前请求所属分组的账号数计算，避免小分组按全局账号数获得过多无效重试
-        let total_credentials = self.token_manager.total_count_in_group(group).max(1);
+        let total_credentials = if pinned_credential_id.is_some() {
+            1
+        } else {
+            self.token_manager.total_count_in_group(group).max(1)
+        };
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
@@ -922,11 +949,21 @@ impl KiroProvider {
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
             // 获取调用上下文（绑定 index、credentials、token）；同一会话优先沿用上一轮凭据
-            let mut ctx = match self
-                .token_manager
-                .acquire_context_routed(model.as_deref(), group, session_id.as_deref(), wait_budget)
-                .await
-            {
+            let mut ctx = match if let Some(id) = pinned_credential_id {
+                self.token_manager
+                    .acquire_context_for(id, wait_budget)
+                    .await
+                    .map(|c| (c, RouteDecision::none()))
+            } else {
+                self.token_manager
+                    .acquire_context_routed(
+                        model.as_deref(),
+                        group,
+                        session_id.as_deref(),
+                        wait_budget,
+                    )
+                    .await
+            } {
                 Ok((c, route)) => {
                     // 只在首次选号时计入命中率并上报 trace；重试轮次的判定受本请求内
                     // 刚发生的失败影响，不代表会话层面的粘性效果。
@@ -948,6 +985,9 @@ impl KiroProvider {
                             sink, &mut hop_seq, 0, "", None, outcome::TRANSIENT,
                             Some(&e.to_string()), attempt_start,
                         );
+                        return Err(e);
+                    }
+                    if pinned_credential_id.is_some() {
                         return Err(e);
                     }
                     if let Some(rate_limit) = take_rate_limit_error(&mut last_error) {
