@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
+use crate::kiro::cli_fallback::CliModelRejections;
 use crate::kiro::credential_id_watermark;
 use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::kiro_version::USAGE_API_KIRO_VERSION;
@@ -1108,6 +1109,21 @@ impl CredentialEntry {
     }
 }
 
+/// 额度用尽标记的持久化条目（`quota_marks.json`）。
+///
+/// 0.9.2.4 前只在内存：每次重启/部署后，已打满超额的号会重新参与调度，各自再吃一次
+/// 402 才被重新标记；叠加快照过期还会把可用号挡在后面。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QuotaMark {
+    /// 标记失效的 Unix 秒（周期重置时刻）。None 表示直到余额刷新 remaining > 0。
+    until: Option<f64>,
+    #[serde(default)]
+    cli_exhausted: bool,
+    #[serde(default)]
+    overage_enabled: bool,
+}
+
 /// 统计数据持久化条目
 #[derive(Serialize, Deserialize)]
 struct StatsEntry {
@@ -1298,6 +1314,11 @@ pub struct MultiTokenManager {
     quota_reset_recovery_enabled: AtomicBool,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
+    /// 运行时学习到的 amazonq-cli 模型拒绝（模型级，跨账号）。
+    cli_rejections: CliModelRejections,
+    /// 最近一次落盘的额度用尽标记，用于跳过无变化的写入。持锁期间完成比较与写盘，
+    /// 让并发标记按序落盘、不互相覆盖。锁顺序：quota_marks_io → balance_snapshots。
+    quota_marks_io: Mutex<Option<HashMap<u64, QuotaMark>>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
     /// 每个凭据最后一次成功加载的完整模型列表。
@@ -1459,6 +1480,20 @@ struct BalanceSnapshot {
     overage_exhausted: bool,
     /// 该标记失效的 Unix 秒（账号 nextResetAt）。None 表示直到余额刷新 remaining > 0。
     overage_exhausted_until: Option<f64>,
+    /// amazonq-cli 桶也回过 402（或拓扑里没有独立 CLI 桶）。与 `overage_exhausted`
+    /// 同生命周期；为 false 时 IDE 用尽的号对 CLI 可服务的模型仍可作最后一档兜底。
+    cli_exhausted: bool,
+}
+
+impl BalanceSnapshot {
+    /// 超额/月度用尽标记是否仍在有效期内。
+    fn exhaustion_mark_active(&self, now_ts: f64) -> bool {
+        self.overage_exhausted
+            && self
+                .overage_exhausted_until
+                .map(|until| now_ts < until)
+                .unwrap_or(true)
+    }
 }
 
 /// 后台余额刷新的间隔，main 用它启动 `start_balance_refresher`
@@ -1494,14 +1529,8 @@ fn included_quota_exhausted(snapshot: Option<&BalanceSnapshot>, now_ts: f64) -> 
     let Some(snapshot) = snapshot else {
         return false;
     };
-    if snapshot.overage_exhausted {
-        let still = snapshot
-            .overage_exhausted_until
-            .map(|until| now_ts < until)
-            .unwrap_or(true);
-        if still {
-            return true;
-        }
+    if snapshot.exhaustion_mark_active(now_ts) {
+        return true;
     }
     if !snapshot.remaining.is_finite()
         || !snapshot.cached_at.is_finite()
@@ -1512,18 +1541,45 @@ fn included_quota_exhausted(snapshot: Option<&BalanceSnapshot>, now_ts: f64) -> 
     snapshot.remaining <= 0.0 && !snapshot.overage_enabled
 }
 
-/// 同 priority 内的可服务性：有 included 余量的号排在已开超额、余量为 0 的号前面。
+/// IDE 额度用尽后能否靠 amazonq-cli 兜底服务该模型：CLI 桶未尽且 CLI 接受该模型。
+fn cli_fallback_open(
+    snapshot: Option<&BalanceSnapshot>,
+    model: Option<&str>,
+    rejections: &CliModelRejections,
+) -> bool {
+    let cli_exhausted = snapshot.is_some_and(|snapshot| snapshot.cli_exhausted);
+    !cli_exhausted && rejections.cli_may_serve(model)
+}
+
+/// 本请求是否因额度排除该号：IDE 用尽且无法走 CLI 兜底。
+fn quota_excludes(
+    snapshot: Option<&BalanceSnapshot>,
+    now_ts: f64,
+    model: Option<&str>,
+    rejections: &CliModelRejections,
+) -> bool {
+    included_quota_exhausted(snapshot, now_ts) && !cli_fallback_open(snapshot, model, rejections)
+}
+
+/// 同 priority 内的可服务性档位，数字越小越优先：
+///
+/// - 0：最后一次已知 remaining > 0，且未被标尽。快照过期也按最后已知值排：过期只说明
+///   刷新失败，不说明额度变了；按「无数据」降档会让它输给超额已打满的号（0.9.2.4 前
+///   的实测反转）。真用完了第一次调用就会 402 并标尽。
+/// - 1：已开超额、未标尽。超额要花钱，排在 included 余量之后。
+/// - 2：无快照（未知）。
+/// - 3：IDE 已用尽，只能走 amazonq-cli 兜底（仅当 [`quota_excludes`] 放行时才会出现）。
 fn servability_rank(snapshot: Option<&BalanceSnapshot>, now_ts: f64) -> u8 {
     let Some(snapshot) = snapshot else {
         return 2;
     };
-    let fresh = snapshot.remaining.is_finite()
-        && snapshot.cached_at.is_finite()
-        && now_ts - snapshot.cached_at < BALANCE_SNAPSHOT_TTL_SECS;
-    if fresh && snapshot.remaining > 0.0 {
+    if included_quota_exhausted(Some(snapshot), now_ts) {
+        return 3;
+    }
+    if snapshot.remaining.is_finite() && snapshot.remaining > 0.0 {
         return 0;
     }
-    if snapshot.overage_enabled && !included_quota_exhausted(Some(snapshot), now_ts) {
+    if snapshot.overage_enabled {
         return 1;
     }
     2
@@ -1710,6 +1766,8 @@ impl MultiTokenManager {
             self_heal_max_consecutive_rounds: AtomicU32::new(self_heal_max_consecutive_rounds),
             quota_reset_recovery_enabled: AtomicBool::new(quota_reset_recovery_enabled),
             last_stats_save_at: Mutex::new(None),
+            cli_rejections: CliModelRejections::default(),
+            quota_marks_io: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
             model_cache: Mutex::new(HashMap::new()),
             model_refresh_locks: Mutex::new(HashMap::new()),
@@ -1757,6 +1815,7 @@ impl MultiTokenManager {
 
         // 加载持久化的统计数据（success_count, last_used_at）
         manager.load_stats();
+        manager.load_quota_marks();
 
         Ok(manager)
     }
@@ -1814,6 +1873,8 @@ impl MultiTokenManager {
             } else {
                 None
             };
+            let cli_exhausted =
+                overage_exhausted && previous.is_some_and(|snapshot| snapshot.cli_exhausted);
             snapshots.insert(
                 id,
                 BalanceSnapshot {
@@ -1822,11 +1883,14 @@ impl MultiTokenManager {
                     overage_enabled,
                     overage_exhausted,
                     overage_exhausted_until,
+                    cli_exhausted,
                 },
             );
         } else {
             snapshots.remove(&id);
         }
+        drop(snapshots);
+        self.persist_quota_marks();
     }
 
     /// 只更新超额开关，保留剩余额度。Admin 打开/关闭超额后立刻反映到调度，不必等下一轮余额刷新。
@@ -1840,25 +1904,34 @@ impl MultiTokenManager {
     ///
     /// 不禁用凭据。amazonq-cli 对 5.5 模型回 400 会打断「四桶全 402 才禁用」，
     /// 若禁用就会把还能用 included 余量的号也锁死；这里只做周期内排除。
-    pub fn mark_overage_exhausted(&self, id: u64) {
+    ///
+    /// `cli_exhausted`：amazonq-cli 也确认 402（或没有独立 CLI 桶）。为 false 时该号对
+    /// CLI 可服务的模型仍可作最后一档兜底；一旦为 true，同周期内不会被改回 false。
+    pub fn mark_overage_exhausted(&self, id: u64, cli_exhausted: bool) {
         let reset_at = self.cycle_reset_times.lock().get(&id).copied();
         let now_ts = Utc::now().timestamp() as f64;
-        let mut snapshots = self.balance_snapshots.lock();
-        if let Some(snapshot) = snapshots.get_mut(&id) {
-            snapshot.overage_exhausted = true;
-            snapshot.overage_exhausted_until = reset_at;
-            return;
+        {
+            let mut snapshots = self.balance_snapshots.lock();
+            if let Some(snapshot) = snapshots.get_mut(&id) {
+                let already_marked = snapshot.exhaustion_mark_active(now_ts);
+                snapshot.overage_exhausted = true;
+                snapshot.overage_exhausted_until = reset_at;
+                snapshot.cli_exhausted = cli_exhausted || (already_marked && snapshot.cli_exhausted);
+            } else {
+                snapshots.insert(
+                    id,
+                    BalanceSnapshot {
+                        remaining: 0.0,
+                        cached_at: now_ts,
+                        overage_enabled: true,
+                        overage_exhausted: true,
+                        overage_exhausted_until: reset_at,
+                        cli_exhausted,
+                    },
+                );
+            }
         }
-        snapshots.insert(
-            id,
-            BalanceSnapshot {
-                remaining: 0.0,
-                cached_at: now_ts,
-                overage_enabled: true,
-                overage_exhausted: true,
-                overage_exhausted_until: reset_at,
-            },
-        );
+        self.persist_quota_marks();
     }
 
     /// 清除超额用尽排除，保留余额快照其余字段（手动启用 / 重置时调用）。
@@ -1866,12 +1939,130 @@ impl MultiTokenManager {
         if let Some(snapshot) = self.balance_snapshots.lock().get_mut(&id) {
             snapshot.overage_exhausted = false;
             snapshot.overage_exhausted_until = None;
+            snapshot.cli_exhausted = false;
         }
+        self.persist_quota_marks();
     }
 
     /// 清除一个账号的额度快照（删除账号、切换身份或余额失效时调用）。
     pub fn clear_balance_snapshot(&self, id: u64) {
         self.balance_snapshots.lock().remove(&id);
+        self.persist_quota_marks();
+    }
+
+    /// 记录 amazonq-cli 不接受该模型（400 Improperly formed request）。
+    pub fn record_cli_model_rejection(&self, model: &str) {
+        tracing::warn!("amazonq-cli 不接受模型 {:?}，暂停对该模型的 CLI 兜底", model);
+        self.cli_rejections.record(model);
+    }
+
+    /// 本请求的模型是否值得 hop 到 amazonq-cli。
+    pub fn cli_may_serve(&self, model: Option<&str>) -> bool {
+        self.cli_rejections.cli_may_serve(model)
+    }
+
+    fn quota_marks_path(&self) -> Option<PathBuf> {
+        self.cache_dir().map(|d| d.join("quota_marks.json"))
+    }
+
+    /// 当前仍有效的额度用尽标记。
+    fn active_quota_marks(&self) -> HashMap<u64, QuotaMark> {
+        let now_ts = Utc::now().timestamp() as f64;
+        self.balance_snapshots
+            .lock()
+            .iter()
+            .filter(|(_, snapshot)| snapshot.exhaustion_mark_active(now_ts))
+            .map(|(&id, snapshot)| {
+                (
+                    id,
+                    QuotaMark {
+                        until: snapshot.overage_exhausted_until,
+                        cli_exhausted: snapshot.cli_exhausted,
+                        overage_enabled: snapshot.overage_enabled,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// 标记有变化时原子落盘（tmp + rename）。无凭据路径（测试）时不落盘。
+    fn persist_quota_marks(&self) {
+        let Some(path) = self.quota_marks_path() else {
+            return;
+        };
+        let mut last = self.quota_marks_io.lock();
+        let marks = self.active_quota_marks();
+        if last.as_ref() == Some(&marks) {
+            return;
+        }
+        let serializable: HashMap<String, QuotaMark> =
+            marks.iter().map(|(id, mark)| (id.to_string(), *mark)).collect();
+        let json = match serde_json::to_string_pretty(&serializable) {
+            Ok(json) => json,
+            Err(error) => {
+                tracing::warn!("序列化额度用尽标记失败: {}", error);
+                return;
+            }
+        };
+        let tmp = path.with_extension("json.tmp");
+        let result = std::fs::write(&tmp, json).and_then(|_| std::fs::rename(&tmp, &path));
+        match result {
+            Ok(()) => *last = Some(marks),
+            Err(error) => tracing::warn!("保存额度用尽标记失败: {}", error),
+        }
+    }
+
+    /// 启动时恢复未过期的额度用尽标记。
+    ///
+    /// 在 Admin 服务同步余额缓存之前调用：恢复出的占位快照随后会被
+    /// `set_balance_snapshot` 覆盖余额，而标记按「remaining > 0 才清除」的规则保留。
+    fn load_quota_marks(&self) {
+        let Some(path) = self.quota_marks_path() else {
+            return;
+        };
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(_) => return,
+        };
+        let marks: HashMap<String, QuotaMark> = match serde_json::from_str(&content) {
+            Ok(marks) => marks,
+            Err(error) => {
+                tracing::warn!("解析额度用尽标记失败，将忽略: {}", error);
+                return;
+            }
+        };
+        let now_ts = Utc::now().timestamp() as f64;
+        let known: std::collections::HashSet<u64> =
+            self.entries.lock().iter().map(|entry| entry.id).collect();
+        let mut restored = HashMap::new();
+        {
+            let mut snapshots = self.balance_snapshots.lock();
+            for (key, mark) in marks {
+                let Ok(id) = key.parse::<u64>() else {
+                    continue;
+                };
+                if !known.contains(&id) || mark.until.is_some_and(|until| now_ts >= until) {
+                    continue;
+                }
+                snapshots.insert(
+                    id,
+                    BalanceSnapshot {
+                        remaining: 0.0,
+                        // 占位快照按「已过期」处理：不参与 remaining 判定，只承载标记。
+                        cached_at: 0.0,
+                        overage_enabled: mark.overage_enabled,
+                        overage_exhausted: true,
+                        overage_exhausted_until: mark.until,
+                        cli_exhausted: mark.cli_exhausted,
+                    },
+                );
+                restored.insert(id, mark);
+            }
+        }
+        if !restored.is_empty() {
+            tracing::info!("已恢复 {} 个额度用尽标记", restored.len());
+        }
+        *self.quota_marks_io.lock() = Some(restored);
     }
 
     #[cfg(test)]
@@ -1880,6 +2071,14 @@ impl MultiTokenManager {
             .lock()
             .get(&id)
             .is_some_and(|snapshot| snapshot.overage_exhausted)
+    }
+
+    #[cfg(test)]
+    pub fn is_cli_exhausted(&self, id: u64) -> bool {
+        self.balance_snapshots
+            .lock()
+            .get(&id)
+            .is_some_and(|snapshot| snapshot.cli_exhausted)
     }
 
     /// 全量替换「本周期本机已消耗积分」快照，供 `max_cycle_credits` 判断使用。
@@ -1902,12 +2101,15 @@ impl MultiTokenManager {
         *self.cycle_reset_times.lock() = resets.clone();
         // 标尽时还不知道重置时刻的号，拿到后补上截止，周期翻转即自动恢复。
         // 两把叶子锁依次获取，不嵌套。
-        let mut snapshots = self.balance_snapshots.lock();
-        for (id, snapshot) in snapshots.iter_mut() {
-            if snapshot.overage_exhausted && snapshot.overage_exhausted_until.is_none() {
-                snapshot.overage_exhausted_until = resets.get(id).copied();
+        {
+            let mut snapshots = self.balance_snapshots.lock();
+            for (id, snapshot) in snapshots.iter_mut() {
+                if snapshot.overage_exhausted && snapshot.overage_exhausted_until.is_none() {
+                    snapshot.overage_exhausted_until = resets.get(id).copied();
+                }
             }
         }
+        self.persist_quota_marks();
     }
 
     /// `ids` 中最早一个账号的周期重置还有多少秒；都没有已知重置时刻时返回 None。
@@ -1936,8 +2138,19 @@ impl MultiTokenManager {
         credits_exhausted(entry, &usage)
     }
 
-    /// 订阅额度用尽且未开超额。无新鲜快照时不排除。
-    fn included_quota_exhausted_for(&self, id: u64) -> bool {
+    /// 本请求是否因额度排除该号：IDE 用尽（含标尽）且无法靠 amazonq-cli 兜底该模型。
+    fn quota_excludes_for(&self, id: u64, model: Option<&str>) -> bool {
+        let snapshots = self.balance_snapshots.lock();
+        quota_excludes(
+            snapshots.get(&id),
+            Utc::now().timestamp() as f64,
+            model,
+            &self.cli_rejections,
+        )
+    }
+
+    /// IDE 额度已用尽（含标尽），只能走 CLI 兜底档。
+    fn ide_quota_exhausted_for(&self, id: u64) -> bool {
         let snapshots = self.balance_snapshots.lock();
         included_quota_exhausted(snapshots.get(&id), Utc::now().timestamp() as f64)
     }
@@ -2400,7 +2613,7 @@ impl MultiTokenManager {
                 .unwrap_or(false)
             && !self.rpm_exceeded(entry, now)
             && !self.cycle_credits_exhausted(entry)
-            && !self.included_quota_exhausted_for(entry.id)
+            && !self.quota_excludes_for(entry.id, model)
             && credential_matches_request(&entry.credentials, model, group)
             && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
     }
@@ -2455,7 +2668,7 @@ impl MultiTokenManager {
                     .map(|until| until > now)
                     .unwrap_or(false)
                 && !self.cycle_credits_exhausted(entry)
-                && !self.included_quota_exhausted_for(entry.id)
+                && !self.quota_excludes_for(entry.id, model)
                 && credential_matches_request(&entry.credentials, model, group)
                 && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
         }) {
@@ -2551,7 +2764,7 @@ impl MultiTokenManager {
                 // 冷却结束后仍被积分上限或未开超额的用尽额度挡住的账号，等它的冷却没有意义
                 !entry.disabled
                     && !self.cycle_credits_exhausted(entry)
-                    && !self.included_quota_exhausted_for(entry.id)
+                    && !self.quota_excludes_for(entry.id, model)
                     && credential_matches_request(&entry.credentials, model, group)
                     && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
             })
@@ -2629,8 +2842,8 @@ impl MultiTokenManager {
                 // 明确要求 priority 压过 discovery_rank，未确认的凭据会在实际调用时
                 // 由模型过滤兜住。
                 //
-                // 同一 priority 内：有 included 余量的号压过已开超额的用尽号，
-                // 避免超额也打满的号把还有余量的号挡住。同类再按成功次数升序摊。
+                // 同一 priority 内按可服务性档位（见 servability_rank），同档再按最近
+                // 被选中的时刻做 LRU 轮转：从未选中的排最前，同为未选中时按成功次数兜底。
                 available.sort_by(|left, right| {
                     left.credentials
                         .priority
@@ -2783,10 +2996,13 @@ impl MultiTokenManager {
         };
         let entries = self.entries.lock();
         let now = Instant::now();
+        // CLI 兜底档（IDE 已用尽）不保粘性：它只是临时兜底，粘住会让会话在更好的号恢复后
+        // 仍停在慢路径上；落空后由正常选号决定，没有更好的号时仍会选回它。
         let pick = entries
             .iter()
             .find(|e| e.id == bound_id)
             .filter(|e| self.entry_available_for_request(e, model, group, now))
+            .filter(|e| !self.ide_quota_exhausted_for(e.id))
             .map(|e| (e.id, e.credentials.clone()));
         let outcome = if pick.is_some() {
             StickyOutcome::Hit
@@ -2929,7 +3145,12 @@ impl MultiTokenManager {
                         .iter()
                         .filter(|e| {
                             !e.disabled
-                                && included_quota_exhausted(snapshots.get(&e.id), now_ts)
+                                && quota_excludes(
+                                    snapshots.get(&e.id),
+                                    now_ts,
+                                    model,
+                                    &self.cli_rejections,
+                                )
                                 && credential_matches_request(&e.credentials, model, group)
                                 && self.cached_model_support(e.id, model)
                                     != CachedModelSupport::Unsupported
@@ -9597,7 +9818,7 @@ mod tests {
         .unwrap();
         set_balance(&manager, 1, 0.0, true);
         set_balance(&manager, 2, 50.0, false);
-        manager.mark_overage_exhausted(1);
+        manager.mark_overage_exhausted(1, true);
         assert!(manager.is_overage_exhausted(1));
         assert_eq!(manager.available_count(), 1);
         assert_eq!(
@@ -9623,20 +9844,20 @@ mod tests {
         set_balance(&manager, 1, 0.0, true);
         set_balance(&manager, 2, 0.0, true);
 
-        manager.mark_overage_exhausted(1);
+        manager.mark_overage_exhausted(1, true);
         assert_eq!(manager.available_count(), 1);
         manager.set_disabled(1, false).unwrap();
         assert!(!manager.is_overage_exhausted(1), "手动启用应清掉超额用尽标记");
         assert_eq!(manager.available_count(), 2);
 
-        manager.mark_overage_exhausted(2);
+        manager.mark_overage_exhausted(2, true);
         assert_eq!(manager.available_count(), 1);
         manager.reset_and_enable(2).unwrap();
         assert!(!manager.is_overage_exhausted(2), "重置并启用应清掉超额用尽标记");
         assert_eq!(manager.available_count(), 2);
 
         // 手动禁用不应顺带清除。
-        manager.mark_overage_exhausted(1);
+        manager.mark_overage_exhausted(1, true);
         manager.set_disabled(1, true).unwrap();
         assert!(manager.is_overage_exhausted(1));
     }
@@ -9653,8 +9874,8 @@ mod tests {
         .unwrap();
         set_balance(&manager, 1, 0.0, true);
         set_balance(&manager, 2, 0.0, true);
-        manager.mark_overage_exhausted(1);
-        manager.mark_overage_exhausted(2);
+        manager.mark_overage_exhausted(1, true);
+        manager.mark_overage_exhausted(2, true);
         assert_eq!(manager.available_count(), 0, "无重置时刻时标记应持续生效");
 
         let now = Utc::now().timestamp() as f64;
@@ -10151,6 +10372,150 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn stale_snapshot_with_remaining_still_outranks_overage_zero() {
+        // 0.9.2.4 实测反转：#613 余额刷新连续失败后快照过期，降到与已打满超额的号同档，
+        // 又因累计成功次数更高排在它们后面。
+        let manager = quota_manager(&["dead612", "good613"]);
+        let now = Utc::now().timestamp() as f64;
+        manager.set_balance_snapshot(1, 0.0, now, true);
+        manager.set_balance_snapshot(2, 4959.0, now - 3.0 * BALANCE_SNAPSHOT_TTL_SECS, true);
+        for _ in 0..5 {
+            manager.report_success(2);
+        }
+        assert_eq!(
+            manager.select_next_credential(None, None).map(|(id, _)| id),
+            Some(2),
+            "过期快照按最后已知 remaining 排序"
+        );
+    }
+
+    #[test]
+    fn stale_snapshot_does_not_exclude_or_promote_exhausted_free_account() {
+        let manager = quota_manager(&["free", "overage"]);
+        let now = Utc::now().timestamp() as f64;
+        manager.set_balance_snapshot(1, 0.0, now - 3.0 * BALANCE_SNAPSHOT_TTL_SECS, false);
+        manager.set_balance_snapshot(2, 0.0, now, true);
+        assert_eq!(manager.available_count(), 2, "过期快照不排除账号");
+        assert_eq!(
+            manager.select_next_credential(None, None).map(|(id, _)| id),
+            Some(2),
+            "已开超额（1 档）先于过期且无余量的号（2 档）"
+        );
+    }
+
+    #[test]
+    fn cli_fallback_admits_ide_exhausted_account_last_for_cli_models_only() {
+        let manager = quota_manager(&["free-exhausted", "overage"]);
+        set_balance(&manager, 1, 0.0, false);
+        set_balance(&manager, 2, 0.0, true);
+
+        // 5.5 不能走 CLI：IDE 用尽的号照旧排除。
+        assert_eq!(
+            manager
+                .select_next_credential(Some("claude-opus-5.5"), None)
+                .map(|(id, _)| id),
+            Some(2)
+        );
+        // haiku-4.5 可走 CLI：IDE 用尽的号作为最后一档。
+        manager.mark_overage_exhausted(2, true);
+        assert_eq!(
+            manager
+                .select_next_credential(Some("claude-haiku-4.5"), None)
+                .map(|(id, _)| id),
+            Some(1),
+            "CLI 可服务的模型应允许 IDE 用尽的号兜底"
+        );
+        assert!(
+            manager
+                .select_next_credential(Some("claude-opus-5.5"), None)
+                .is_none(),
+            "5.5 在两个号都不可用时应无号可选"
+        );
+        // 无模型（tool）不走 CLI 兜底。
+        assert!(manager.select_next_credential(None, None).is_none());
+    }
+
+    #[test]
+    fn cli_fallback_ranks_after_every_other_tier() {
+        let manager = quota_manager(&["free-exhausted", "unknown", "overage"]);
+        set_balance(&manager, 1, 0.0, false);
+        set_balance(&manager, 3, 0.0, true);
+        manager.report_success(2);
+        manager.report_success(3);
+        assert_eq!(
+            manager
+                .select_next_credential(Some("claude-haiku-4.5"), None)
+                .map(|(id, _)| id),
+            Some(3),
+            "已开超额（1 档）最先"
+        );
+        manager.mark_overage_exhausted(3, true);
+        assert_eq!(
+            manager
+                .select_next_credential(Some("claude-haiku-4.5"), None)
+                .map(|(id, _)| id),
+            Some(2),
+            "无快照（2 档）先于 CLI 兜底（3 档）"
+        );
+    }
+
+    #[test]
+    fn cli_exhausted_or_learned_rejection_closes_cli_fallback() {
+        let manager = quota_manager(&["a", "b"]);
+        set_balance(&manager, 1, 0.0, false);
+        set_balance(&manager, 2, 0.0, false);
+        let pick = |m: &MultiTokenManager| {
+            m.select_next_credential(Some("claude-haiku-4.5"), None)
+                .map(|(id, _)| id)
+        };
+        assert!(pick(&manager).is_some());
+
+        manager.mark_overage_exhausted(1, true);
+        assert!(manager.is_cli_exhausted(1));
+        assert_eq!(pick(&manager), Some(2), "CLI 也尽的号不再兜底");
+
+        // IDE-only 标记不能把已确认的 CLI 尽改回去。
+        manager.mark_overage_exhausted(1, false);
+        assert!(manager.is_cli_exhausted(1));
+
+        manager.record_cli_model_rejection("claude-haiku-4.5");
+        assert!(pick(&manager).is_none(), "CLI 不接受该模型时无兜底");
+        assert!(
+            manager
+                .select_next_credential(Some("claude-sonnet-4.5"), None)
+                .is_some(),
+            "学习到的拒绝只针对该模型"
+        );
+    }
+
+    #[test]
+    fn remaining_refresh_clears_cli_exhausted_with_the_mark() {
+        let manager = quota_manager(&["a"]);
+        set_balance(&manager, 1, 0.0, true);
+        manager.mark_overage_exhausted(1, true);
+        set_balance(&manager, 1, 0.0, true);
+        assert!(manager.is_cli_exhausted(1), "remaining 仍 ≤ 0 时保留");
+        set_balance(&manager, 1, 25.0, true);
+        assert!(!manager.is_overage_exhausted(1));
+        assert!(!manager.is_cli_exhausted(1));
+    }
+
+    #[tokio::test]
+    async fn sticky_does_not_hold_cli_fallback_account() {
+        let manager = quota_manager(&["free-exhausted", "good"]);
+        let mut budget = manager.new_acquire_wait_budget();
+        set_balance(&manager, 1, 0.0, false);
+        set_balance(&manager, 2, 100.0, false);
+        manager.bind_session("sess-cli", 1);
+        let (ctx, route) = manager
+            .acquire_context_routed(Some("claude-haiku-4.5"), None, Some("sess-cli"), &mut budget)
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 2, "CLI 兜底档不保粘性，有更好的号时应换走");
+        assert_eq!(route.sticky_outcome, StickyOutcome::MissUnavailable);
+    }
+
     #[tokio::test]
     async fn same_tier_rotates_by_last_selection_not_lifetime_success() {
         let manager = quota_manager(&["veteran", "newcomer"]);
@@ -10176,6 +10541,65 @@ mod tests {
         );
     }
 
+    #[test]
+    fn quota_marks_survive_restart_and_expire() {
+        let (dir, path) = issue51_credentials_path("quota_marks");
+        let creds = || {
+            (1..=3)
+                .map(|id| {
+                    let mut c = grouped_cred(&format!("c{id}"), &[]);
+                    c.id = Some(id);
+                    c
+                })
+                .collect::<Vec<_>>()
+        };
+        let now = Utc::now().timestamp() as f64;
+        {
+            let manager =
+                MultiTokenManager::new(Config::default(), creds(), None, Some(path.clone()), true)
+                    .unwrap();
+            manager.set_cycle_reset_times(HashMap::from([(1, now + 3_600.0), (3, now + 3_600.0)]));
+            set_balance(&manager, 1, 0.0, true);
+            set_balance(&manager, 2, 0.0, true);
+            set_balance(&manager, 3, 0.0, true);
+            manager.mark_overage_exhausted(1, true);
+            manager.mark_overage_exhausted(2, false);
+            manager.mark_overage_exhausted(3, true);
+            manager.clear_overage_exhausted(3);
+        }
+        assert!(dir.join("quota_marks.json").exists());
+
+        let manager =
+            MultiTokenManager::new(Config::default(), creds(), None, Some(path.clone()), true)
+                .unwrap();
+        assert!(manager.is_overage_exhausted(1), "重启后应恢复标记");
+        assert!(manager.is_cli_exhausted(1));
+        assert!(manager.is_overage_exhausted(2));
+        assert!(!manager.is_cli_exhausted(2));
+        assert!(!manager.is_overage_exhausted(3), "已清除的标记不应恢复");
+        // 模拟 Admin 启动时同步的余额缓存：remaining 仍 ≤ 0，标记必须保留。
+        manager.set_balance_snapshot(1, 0.0, now, true);
+        assert!(manager.is_overage_exhausted(1));
+        assert_eq!(
+            manager
+                .select_next_credential(Some("claude-opus-5.5"), None)
+                .map(|(id, _)| id),
+            Some(3),
+            "恢复的标记应继续把用尽的号挡在外面"
+        );
+        drop(manager);
+
+        // 截止已过的标记在加载时丢弃。
+        let expired = serde_json::json!({
+            "1": {"until": now - 10.0, "cliExhausted": true, "overageEnabled": true}
+        });
+        std::fs::write(dir.join("quota_marks.json"), expired.to_string()).unwrap();
+        let manager =
+            MultiTokenManager::new(Config::default(), creds(), None, Some(path), true).unwrap();
+        assert!(!manager.is_overage_exhausted(1), "过期标记不应恢复");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn sticky_misses_overage_exhausted_account() {
         let manager = MultiTokenManager::new(
@@ -10190,7 +10614,7 @@ mod tests {
         manager.bind_session("sess-B", 1);
         set_balance(&manager, 1, 0.0, true);
         set_balance(&manager, 2, 80.0, false);
-        manager.mark_overage_exhausted(1);
+        manager.mark_overage_exhausted(1, true);
 
         let (ctx, route) = manager
             .acquire_context_routed(None, None, Some("sess-B"), &mut budget)
