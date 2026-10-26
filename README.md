@@ -703,6 +703,7 @@ data/
 ├── client_api_keys.json
 ├── kiro_stats.json
 ├── kiro_balance_cache.json
+├── quota_marks.json
 ├── proxy_pool.json
 ├── cache_metering.json
 ├── traces.db
@@ -714,6 +715,7 @@ data/
 - `client_api_keys.json`：系统 Key 和 Admin 生成的 `sk-...` 客户端 Key，明文存储，用于鉴权。
 - `kiro_stats.json`：凭据成功 / 失败 / 额度 / 冷却等统计。
 - `kiro_balance_cache.json`：凭据订阅、额度、邮箱等缓存。
+- `quota_marks.json`：本周期已确认用尽（402）的账号标记及截止时间，重启后恢复；周期重置、余额刷新出 remaining > 0、Admin 启用 / 重置时清除。
 - `proxy_pool.json`：代理池与健康状态。
 - `cache_metering.json`：prompt cache 计量快照，**默认不再读写**（需显式 `cacheMeteringPersistEnabled: true`）。
 - `traces.db`：SQLite 请求链路追踪数据库，WAL 模式。
@@ -878,14 +880,15 @@ credential.proxyUrl -> config.proxyUrl -> direct
 
 `loadBalancingMode` 支持：
 
-- `priority`：优先使用最近 5 分钟内已成功查询且剩余额度较多的可用凭据；额度相同时使用 `priority` 数字较小的凭据。额度缓存缺失或过期时回退到原有 priority 顺序。
+- `priority`：`priority` 数字小的严格优先。同一 priority 内按档位：最后已知 remaining > 0 → 已开超额且未用尽 → 无余额数据 → 仅能走 amazonq-cli 兜底；同档内按最近被选中时间轮转（最久未选的先）。余额快照过期只影响「是否因余额排除」，不影响排序。会话粘性优先，但不粘在 CLI 兜底档上。
 - `balanced`：在可用凭据之间均衡分配。
 
 故障处理：
 
 - 单凭据连续 API 失败会增加失败计数，达到阈值后跳过。
-- 同一凭据上的 429，以及 402 月度限额（`MONTHLY_REQUEST_COUNT` / `OVERAGE_REQUEST_LIMIT_EXCEEDED`），会按 host+path 跳到该凭据尚未用过的上游桶。US 最多 4 个（runtime、CodeWhisperer、Amazon Q、amazonq-cli）；EU 的 CodeWhisperer 与 Amazon Q 共用一个桶。成功即停，不改写凭据 `endpoint`；全部耗尽后才冷却 / 禁用并换号。MCP 不换桶。后继桶的 401 / 403 立即停跳并换号，不再重走同一凭据。
-- 其它 402 / quota exhausted 会禁用该凭据并切换。
+- 同一凭据上的 429，以及 402 月度限额（`MONTHLY_REQUEST_COUNT` / `OVERAGE_REQUEST_LIMIT_EXCEEDED`），会按 host+path 跳到该凭据尚未用过的上游桶。US 最多 4 个（runtime、CodeWhisperer、Amazon Q、amazonq-cli）；EU 的 CodeWhisperer 与 Amazon Q 共用一个桶。成功即停，不改写凭据 `endpoint`；MCP 不换桶。后继桶的 401 / 403 立即停跳并换号，不再重走同一凭据。
+- 402 月度 / 超额用尽：本周期内排除该账号并换号，不禁用；周期重置后自动恢复。amazonq-cli 也 402 时连 CLI 兜底一起排除；CLI 只是不接受该模型（400 Improperly formed request）时只记「CLI 不接受该模型」（6 小时），该账号对 CLI 可服务的模型（实测 `claude-haiku-4.5`）仍可作为最后一档兜底。5.5 系列不走 CLI。
+- 账号级 429 且 `accountThrottleFailover` 开启：有别的账号能服务本请求时冷却并切换；没有时不冷却，直接返回 429 + `Retry-After`，避免冷却唯一可用账号造成全池 429。
 - 401 / 403 中识别到 bearer token 失效时，会对该凭据强制刷新一次 token 后重试。
 - USER/CREDIT 请求限流和 suspicious activity 429 可触发账号级冷却并切换凭据。
 - `INSUFFICIENT_MODEL_CAPACITY` 等容量类 429 不切换凭据，可配置是否在当前凭据上退避重试。
