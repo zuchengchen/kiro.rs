@@ -1297,8 +1297,11 @@ impl KiroProvider {
                             }
 
                             if hop_saw_402_quota
-                                && hop_status.as_u16() == 400
-                                && !hop_body.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD")
+                                && is_cli_400_after_quota(
+                                    hop_endpoint.name(),
+                                    hop_status.as_u16(),
+                                    &hop_body,
+                                )
                             {
                                 // IDE 桶额度尽后再 hop 到 CLI，5.5 模型会 400。
                                 // 不能当成客户端坏请求结束：要标尽并换号。
@@ -1459,11 +1462,11 @@ impl KiroProvider {
 
             // IDE 桶额度尽（含 hop 到 CLI 后的 400）：周期内排除该号并换号。
             // 不永久禁用：CLI 400 会打断「四桶全 402」，禁用会把号锁死到手动恢复。
+            // 其它桶的 400 仍是真实的请求错误，照常返回客户端。
             let quota_failover = hop_saw_402_quota
                 && !hop_aborted
                 && (status.as_u16() == 402
-                    || (status.as_u16() == 400
-                        && !body.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD")));
+                    || is_cli_400_after_quota(endpoint_name, status.as_u16(), &body));
             if quota_failover {
                 tracing::warn!(
                     "API 请求失败（额度已用尽，本周期排除凭据 #{} 并换号，尝试 {}/{}）: {} {}",
@@ -2029,6 +2032,15 @@ impl KiroProvider {
 
 fn is_rate_limit_error(error: &anyhow::Error) -> bool {
     error.downcast_ref::<UpstreamRateLimitError>().is_some()
+}
+
+/// IDE 桶已 402 额度尽之后，amazonq-cli hop 回的 400 属于同一额度事件
+/// （CLI 不接受该模型，`Improperly formed request`），应换号而不是当客户端坏请求。
+/// 仅限 amazonq-cli：其它桶的 400 和超长内容 400 仍是真实请求错误。
+fn is_cli_400_after_quota(endpoint_name: &str, status: u16, body: &str) -> bool {
+    endpoint_name == crate::kiro::endpoint::cli::AMAZON_Q_CLI_ENDPOINT_NAME
+        && status == 400
+        && !body.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD")
 }
 
 /// amazonq-cli 不接受这些实验模型 ID，hop 过去只会 400 Improperly formed request。
@@ -2638,6 +2650,50 @@ mod rate_limit_tests {
         let manager = harness.provider.token_manager();
         assert!(manager.is_overage_exhausted(1));
         assert!(!manager.snapshot().entries[0].disabled);
+    }
+
+    #[tokio::test]
+    async fn non_cli_400_after_402_stays_a_client_error() {
+        // codewhisperer 402 → runtime 400：真实请求错误，不能伪装成额度用尽换号。
+        let harness = mock_four_buckets(
+            us_map(monthly_402(), ok("unused"), improperly_formed_400(), ok("unused")),
+            false,
+            2,
+        )
+        .await;
+        let error = match harness
+            .provider
+            .call_api_stream(TEST_REQUEST_BODY, None, None)
+            .await
+        {
+            Ok(_) => panic!("runtime 400 must surface as a client error"),
+            Err(error) => error,
+        };
+        assert!(
+            error.downcast_ref::<CreditLimitReachedError>().is_none(),
+            "不应变成额度错误：{error}"
+        );
+        assert!(error.to_string().contains("400"), "{error}");
+        assert_eq!(harness.count("codewhisperer"), 1, "不应换号重走");
+        assert_eq!(harness.count("runtime"), 1);
+        assert_eq!(harness.count("amazonq-cli"), 0);
+        let manager = harness.provider.token_manager();
+        assert!(!manager.is_overage_exhausted(1));
+        assert!(!manager.is_overage_exhausted(2));
+    }
+
+    #[test]
+    fn cli_400_after_quota_is_limited_to_amazonq_cli() {
+        let improper = r#"{"message":"Improperly formed request."}"#;
+        assert!(is_cli_400_after_quota("amazonq-cli", 400, improper));
+        assert!(!is_cli_400_after_quota("runtime", 400, improper));
+        assert!(!is_cli_400_after_quota("codewhisperer", 400, improper));
+        assert!(!is_cli_400_after_quota(
+            "amazonq-cli",
+            400,
+            r#"{"reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#
+        ));
+        assert!(!is_cli_400_after_quota("amazonq-cli", 402, improper));
     }
 
     #[tokio::test]
