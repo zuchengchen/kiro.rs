@@ -1662,6 +1662,37 @@ impl KiroProvider {
                             .get_account_throttle_cooldown_secs()
                             .max(1);
                         let cooldown = std::time::Duration::from_secs(cooldown_secs);
+                        // 没有别的号能服务本请求时不打冷却：冷却唯一可用的号只会让后续所有
+                        // 请求在冷却期内全池 429（这正是 accountThrottleFailover 曾被关掉的原因）。
+                        // 直接把本次 429 + Retry-After 交给客户端，与故障转移关闭时一致。
+                        if !self.token_manager.has_other_available_for_request(
+                            ctx.id,
+                            model.as_deref(),
+                            group,
+                        ) {
+                            tracing::warn!(
+                                "API 请求失败（账号级限流，凭据 #{} 无可切换账号，不冷却直接返回）: {}",
+                                ctx.id,
+                                body
+                            );
+                            if !skip_failed_emit {
+                                Self::emit_attempt_seq(
+                                    sink,
+                                    &mut hop_seq,
+                                    ctx.id,
+                                    endpoint_name,
+                                    Some(429),
+                                    outcome::ACCOUNT_THROTTLED,
+                                    Some(&body),
+                                    attempt_start,
+                                );
+                            }
+                            return Err(account_rate_limit_with_fallback(
+                                rate_limit_error,
+                                cooldown_secs,
+                            )
+                            .into());
+                        }
                         tracing::warn!(
                             "API 请求失败（账号级限流，凭据 #{} 冷却 {}s 并切换，尝试 {}/{}）: {}",
                             ctx.id,
@@ -2570,7 +2601,11 @@ mod rate_limit_tests {
         assert_eq!(harness.total_api(), 4);
         let entry = &harness.provider.token_manager().snapshot().entries[0];
         assert!(!entry.disabled);
-        assert!(entry.throttled_remaining_secs.is_some());
+        // 唯一可用的号不打冷却：冷却它只会让冷却期内所有请求全池 429。
+        assert!(
+            entry.throttled_remaining_secs.is_none(),
+            "无可切换账号时不应冷却唯一的号"
+        );
         assert_ne!(entry.disabled_reason.as_deref(), Some("QuotaExceeded"));
     }
 
@@ -2596,6 +2631,33 @@ mod rate_limit_tests {
         let entry = &harness.provider.token_manager().snapshot().entries[0];
         assert!(!entry.disabled);
         assert_ne!(entry.disabled_reason.as_deref(), Some("QuotaExceeded"));
+    }
+
+    #[tokio::test]
+    async fn account_429_cools_down_and_switches_when_another_account_exists() {
+        let harness = mock_four_buckets(
+            us_map(
+                rate_429_then_ok_on(2),
+                rate_429(),
+                rate_429(),
+                rate_429(),
+            ),
+            false,
+            2,
+        )
+        .await;
+        let result = harness
+            .provider
+            .call_api_stream(TEST_REQUEST_BODY, None, None)
+            .await
+            .unwrap();
+        assert_eq!(result.credential_id, 2);
+        let snapshot = harness.provider.token_manager().snapshot();
+        assert!(
+            snapshot.entries[0].throttled_remaining_secs.is_some(),
+            "有可切换账号时应冷却被限流的号"
+        );
+        assert!(snapshot.entries[1].throttled_remaining_secs.is_none());
     }
 
     #[tokio::test]

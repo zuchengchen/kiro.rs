@@ -4118,17 +4118,12 @@ impl MultiTokenManager {
                 );
             }
 
+            // 与选号同一套可用性判定：只看「未禁用、未冷却、分组匹配」会把额度用尽、
+            // 已知不支持该模型的号也算进来，导致调用方以为还能换号，下一轮取号却全池失败。
             let throttled_now = Instant::now();
             entries
                 .iter()
-                .filter(|e| {
-                    !e.disabled
-                        && !e
-                            .throttled_until
-                            .map(|t| t > throttled_now)
-                            .unwrap_or(false)
-                        && credential_matches_request(&e.credentials, model, group)
-                })
+                .filter(|e| self.entry_available_for_request(e, model, group, throttled_now))
                 .count()
         }
     }
