@@ -3724,6 +3724,10 @@ impl MultiTokenManager {
         self.report_quota_exhausted_for_request(id, None, None)
     }
 
+    /// 运行时已不再按 402 永久禁用（对话与 tool 路径都改走
+    /// [`Self::mark_overage_exhausted`] 周期内排除）。保留给测试构造历史
+    /// `QuotaExceeded` 禁用态，验证自愈 / 恢复逻辑仍兼容旧持久化数据。
+    #[cfg(test)]
     pub fn report_quota_exhausted_for_request(
         &self,
         id: u64,
