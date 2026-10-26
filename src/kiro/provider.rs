@@ -679,12 +679,15 @@ impl KiroProvider {
                     Some(&body),
                     attempt_start,
                 );
-                let has_available = self
-                    .token_manager
-                    .report_quota_exhausted_for_request(ctx.id, None, group);
-                if !has_available {
-                    anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
-                }
+                // 与对话路径一致：周期内排除并换号，不永久禁用。全部用尽时下一轮取号
+                // 返回 CreditLimitReachedError（429 + Retry-After）。
+                tracing::warn!(
+                    "MCP 请求额度已用尽，本周期排除凭据 #{} 并换号（尝试 {}/{}）",
+                    ctx.id,
+                    attempt + 1,
+                    max_retries
+                );
+                self.token_manager.mark_overage_exhausted(ctx.id);
                 last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
                 continue;
             }
@@ -2846,6 +2849,51 @@ mod rate_limit_tests {
         assert_eq!(harness.count("mcp"), 1);
         assert_eq!(harness.total_api(), 0);
     }
+
+    #[tokio::test]
+    async fn mcp_402_excludes_credential_without_disable_and_switches() {
+        let mut map = us_map(ok("unused"), ok("unused"), ok("unused"), ok("unused"));
+        map.mcp = monthly_402_then_ok_on(2);
+        let harness = mock_four_buckets(map, false, 2).await;
+        let mut budget = harness.provider.token_manager().new_acquire_wait_budget();
+        let response = harness
+            .provider
+            .call_mcp(TEST_REQUEST_BODY, None, &mut budget)
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(harness.count("mcp"), 2);
+        let manager = harness.provider.token_manager();
+        let entry = &manager.snapshot().entries[0];
+        assert!(!entry.disabled, "MCP 402 不应永久禁用凭据");
+        assert_ne!(entry.disabled_reason.as_deref(), Some("QuotaExceeded"));
+        assert!(manager.is_overage_exhausted(1));
+        assert!(!manager.is_overage_exhausted(2));
+    }
+
+    #[tokio::test]
+    async fn mcp_402_on_every_credential_returns_credit_limit() {
+        let mut map = us_map(ok("unused"), ok("unused"), ok("unused"), ok("unused"));
+        map.mcp = monthly_402();
+        let harness = mock_four_buckets(map, false, 2).await;
+        let mut budget = harness.provider.token_manager().new_acquire_wait_budget();
+        let error = match harness
+            .provider
+            .call_mcp(TEST_REQUEST_BODY, None, &mut budget)
+            .await
+        {
+            Ok(_) => panic!("all credentials 402 must fail"),
+            Err(error) => error,
+        };
+        assert!(
+            error.downcast_ref::<CreditLimitReachedError>().is_some(),
+            "全部用尽应返回额度错误（429 + Retry-After）：{error}"
+        );
+        assert_eq!(harness.count("mcp"), 2);
+        let manager = harness.provider.token_manager();
+        assert!(manager.snapshot().entries.iter().all(|entry| !entry.disabled));
+    }
+
 
     #[test]
     fn mcp_validation_treats_caller_accepted_errors_as_success() {
