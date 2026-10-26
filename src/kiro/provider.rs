@@ -13,6 +13,7 @@ use tokio::time::sleep;
 
 use crate::admin::trace_db::{TraceAttempt, TraceRoute, TraceSink, outcome, truncate_snippet};
 use crate::http_client::{ProxyConfig, build_client_with_timeouts};
+use crate::kiro::cli_fallback::is_cli_400_after_quota;
 use crate::kiro::endpoint::{
     KiroEndpoint, RequestContext, unique_api_buckets as unique_api_bucket_queue,
 };
@@ -687,7 +688,8 @@ impl KiroProvider {
                     attempt + 1,
                     max_retries
                 );
-                self.token_manager.mark_overage_exhausted(ctx.id);
+                // tool 路径不 hop，无法确认 CLI：只标 IDE 尽。
+                self.token_manager.mark_overage_exhausted(ctx.id, false);
                 last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
                 continue;
             }
@@ -1157,6 +1159,12 @@ impl KiroProvider {
             let mut hop_saw_429 = status.as_u16() == 429;
             let mut hop_saw_402_quota = false;
             let mut later_hop_replaced_auth = false;
+            // amazonq-cli 桶的结局，决定额度用尽时是否连 CLI 兜底也一并标尽：
+            // - cli_saw_402：CLI 也确认 402 → 标尽；
+            // - cli_rejected_model：CLI 回 400（不接受该模型）→ 记模型拒绝，不标尽；
+            // - CLI 因模型被跳过 → 不标尽（其它模型仍可走 CLI）。
+            let mut cli_saw_402 = false;
+            let mut cli_rejected_model = false;
 
             if status.as_u16() == 402 {
                 let body = match primary_response.take() {
@@ -1165,17 +1173,28 @@ impl KiroProvider {
                 };
                 if endpoint.is_monthly_request_limit(&body) {
                     hop_saw_402_quota = true;
+                    if endpoint.name() == crate::kiro::endpoint::cli::AMAZON_Q_CLI_ENDPOINT_NAME {
+                        cli_saw_402 = true;
+                    }
                 }
                 error_body = Some(body);
             }
 
-            let remaining_buckets: Vec<_> = self
+            let all_buckets: Vec<_> = self
                 .unique_api_buckets(Arc::clone(&endpoint), &rctx)
+                .into_iter()
+                .collect();
+            // 拓扑里根本没有独立 CLI 桶（如 apiDomain=kiro 合并成单桶）时，IDE 用尽即无兜底。
+            let topology_has_cli = all_buckets
+                .iter()
+                .any(|bucket| bucket.name() == crate::kiro::endpoint::cli::AMAZON_Q_CLI_ENDPOINT_NAME);
+            let cli_may_serve = self.token_manager.cli_may_serve(model.as_deref());
+            let remaining_buckets: Vec<_> = all_buckets
                 .into_iter()
                 .skip(1)
                 .filter(|hop| {
                     hop.name() != crate::kiro::endpoint::cli::AMAZON_Q_CLI_ENDPOINT_NAME
-                        || !cli_rejects_model(model.as_deref())
+                        || cli_may_serve
                 })
                 .collect();
             let should_hop = (status.as_u16() == 429 || hop_saw_402_quota)
@@ -1282,6 +1301,11 @@ impl KiroProvider {
                                 && hop_endpoint.is_monthly_request_limit(&hop_body)
                             {
                                 hop_saw_402_quota = true;
+                                if hop_endpoint.name()
+                                    == crate::kiro::endpoint::cli::AMAZON_Q_CLI_ENDPOINT_NAME
+                                {
+                                    cli_saw_402 = true;
+                                }
                                 Self::emit_attempt_seq(
                                     sink,
                                     &mut hop_seq,
@@ -1303,7 +1327,8 @@ impl KiroProvider {
                                     &hop_body,
                                 )
                             {
-                                // IDE 桶额度尽后再 hop 到 CLI，5.5 模型会 400。
+                                // IDE 桶额度尽后再 hop 到 CLI，CLI 不接受的模型会 400。
+                                cli_rejected_model = true;
                                 // 不能当成客户端坏请求结束：要标尽并换号。
                                 Self::emit_attempt_seq(
                                     sink,
@@ -1408,7 +1433,10 @@ impl KiroProvider {
                 }
                 if skip_failed_emit {
                     fallback_exhausted = true;
-                    if hop_saw_429 {
+                    // CLI 400 已判定为额度事件（IDE 402 + CLI 不接受该模型）：不能再被
+                    // 链上某个桶的 429 改写成账号级限流，否则会走「故障转移关闭直接 429」
+                    // 而不是换号（实测 #602 opus-5 返回 429 + Improperly formed 正文）。
+                    if hop_saw_429 && !cli_rejected_model {
                         status = reqwest::StatusCode::TOO_MANY_REQUESTS;
                         if rate_limit_error.is_none() {
                             rate_limit_error = Some(UpstreamRateLimitError::new(None));
@@ -1488,7 +1516,13 @@ impl KiroProvider {
                         attempt_start,
                     );
                 }
-                self.token_manager.mark_overage_exhausted(ctx.id);
+                // CLI 也 402，或拓扑里没有独立 CLI 桶：连 CLI 兜底一起标尽。CLI 因模型被跳过
+                // 或回 400（不接受该模型）时只标 IDE 尽，该号对 CLI 可服务的模型仍可兜底。
+                if cli_rejected_model && let Some(model) = model.as_deref() {
+                    self.token_manager.record_cli_model_rejection(model);
+                }
+                self.token_manager
+                    .mark_overage_exhausted(ctx.id, cli_saw_402 || !topology_has_cli);
 
                 last_error = Some(anyhow::anyhow!(
                     "{} API 请求失败: {} {}",
@@ -1662,6 +1696,37 @@ impl KiroProvider {
                             .get_account_throttle_cooldown_secs()
                             .max(1);
                         let cooldown = std::time::Duration::from_secs(cooldown_secs);
+                        // 没有别的号能服务本请求时不打冷却：冷却唯一可用的号只会让后续所有
+                        // 请求在冷却期内全池 429（这正是 accountThrottleFailover 曾被关掉的原因）。
+                        // 直接把本次 429 + Retry-After 交给客户端，与故障转移关闭时一致。
+                        if !self.token_manager.has_other_available_for_request(
+                            ctx.id,
+                            model.as_deref(),
+                            group,
+                        ) {
+                            tracing::warn!(
+                                "API 请求失败（账号级限流，凭据 #{} 无可切换账号，不冷却直接返回）: {}",
+                                ctx.id,
+                                body
+                            );
+                            if !skip_failed_emit {
+                                Self::emit_attempt_seq(
+                                    sink,
+                                    &mut hop_seq,
+                                    ctx.id,
+                                    endpoint_name,
+                                    Some(429),
+                                    outcome::ACCOUNT_THROTTLED,
+                                    Some(&body),
+                                    attempt_start,
+                                );
+                            }
+                            return Err(account_rate_limit_with_fallback(
+                                rate_limit_error,
+                                cooldown_secs,
+                            )
+                            .into());
+                        }
                         tracing::warn!(
                             "API 请求失败（账号级限流，凭据 #{} 冷却 {}s 并切换，尝试 {}/{}）: {}",
                             ctx.id,
@@ -2032,27 +2097,6 @@ impl KiroProvider {
 
 fn is_rate_limit_error(error: &anyhow::Error) -> bool {
     error.downcast_ref::<UpstreamRateLimitError>().is_some()
-}
-
-/// IDE 桶已 402 额度尽之后，amazonq-cli hop 回的 400 属于同一额度事件
-/// （CLI 不接受该模型，`Improperly formed request`），应换号而不是当客户端坏请求。
-/// 仅限 amazonq-cli：其它桶的 400 和超长内容 400 仍是真实请求错误。
-fn is_cli_400_after_quota(endpoint_name: &str, status: u16, body: &str) -> bool {
-    endpoint_name == crate::kiro::endpoint::cli::AMAZON_Q_CLI_ENDPOINT_NAME
-        && status == 400
-        && !body.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD")
-}
-
-/// amazonq-cli 不接受这些实验模型 ID，hop 过去只会 400 Improperly formed request。
-fn cli_rejects_model(model: Option<&str>) -> bool {
-    let Some(model) = model else {
-        return false;
-    };
-    let normalized = model.to_ascii_lowercase().replace('_', "-");
-    normalized.contains("haiku-5.5")
-        || normalized.contains("haiku-5-5")
-        || normalized.contains("opus-5.5")
-        || normalized.contains("opus-5-5")
 }
 
 fn take_rate_limit_error(last_error: &mut Option<anyhow::Error>) -> Option<anyhow::Error> {
@@ -2570,8 +2614,39 @@ mod rate_limit_tests {
         assert_eq!(harness.total_api(), 4);
         let entry = &harness.provider.token_manager().snapshot().entries[0];
         assert!(!entry.disabled);
-        assert!(entry.throttled_remaining_secs.is_some());
+        // 唯一可用的号不打冷却：冷却它只会让冷却期内所有请求全池 429。
+        assert!(
+            entry.throttled_remaining_secs.is_none(),
+            "无可切换账号时不应冷却唯一的号"
+        );
         assert_ne!(entry.disabled_reason.as_deref(), Some("QuotaExceeded"));
+    }
+
+    #[tokio::test]
+    async fn account_429_cools_down_and_switches_when_another_account_exists() {
+        let harness = mock_four_buckets(
+            us_map(
+                rate_429_then_ok_on(2),
+                rate_429(),
+                rate_429(),
+                rate_429(),
+            ),
+            false,
+            2,
+        )
+        .await;
+        let result = harness
+            .provider
+            .call_api_stream(TEST_REQUEST_BODY, None, None)
+            .await
+            .unwrap();
+        assert_eq!(result.credential_id, 2);
+        let snapshot = harness.provider.token_manager().snapshot();
+        assert!(
+            snapshot.entries[0].throttled_remaining_secs.is_some(),
+            "有可切换账号时应冷却被限流的号"
+        );
+        assert!(snapshot.entries[1].throttled_remaining_secs.is_none());
     }
 
     #[tokio::test]
@@ -2625,6 +2700,7 @@ mod rate_limit_tests {
         assert!(!entry.disabled, "超额用尽不应永久禁用凭据");
         assert_ne!(entry.disabled_reason.as_deref(), Some("QuotaExceeded"));
         assert!(manager.is_overage_exhausted(1));
+        assert!(manager.is_cli_exhausted(1), "CLI 也 402：CLI 兜底一并标尽");
     }
 
     #[tokio::test]
@@ -2650,6 +2726,61 @@ mod rate_limit_tests {
         let manager = harness.provider.token_manager();
         assert!(manager.is_overage_exhausted(1));
         assert!(!manager.snapshot().entries[0].disabled);
+        assert!(
+            !manager.is_cli_exhausted(1),
+            "CLI 只是不接受该模型，不能把 CLI 兜底标尽"
+        );
+        assert!(
+            !manager.cli_may_serve(Some("claude-sonnet-4.6")),
+            "应学到 CLI 不接受该模型"
+        );
+    }
+
+    #[tokio::test]
+    async fn learned_cli_rejection_skips_cli_hop_next_time() {
+        let harness = mock_four_buckets(
+            us_map(monthly_402(), monthly_402(), monthly_402(), improperly_formed_400()),
+            false,
+            1,
+        )
+        .await;
+        let _ = harness
+            .provider
+            .call_api_stream(TEST_REQUEST_BODY, None, None)
+            .await;
+        assert_eq!(harness.count("amazonq-cli"), 1);
+        harness.provider.token_manager().clear_overage_exhausted(1);
+        let _ = harness
+            .provider
+            .call_api_stream(TEST_REQUEST_BODY, None, None)
+            .await;
+        assert_eq!(harness.count("amazonq-cli"), 1, "学到拒绝后不再 hop 到 CLI");
+    }
+
+    #[tokio::test]
+    async fn cli_400_after_402_is_not_rewritten_to_429_by_an_earlier_hop() {
+        // 实测 #602 claude-opus-5：链上某桶 429、CLI 400，原逻辑把结局改写成账号级 429，
+        // 故障转移关闭时直接返回客户端，而不是换到有余量的号。
+        let harness = mock_four_buckets(
+            us_map(
+                monthly_402_then_ok_on(2),
+                monthly_402(),
+                rate_429(),
+                improperly_formed_400(),
+            ),
+            false,
+            2,
+        )
+        .await;
+        let result = harness
+            .provider
+            .call_api_stream(TEST_REQUEST_BODY, None, None)
+            .await
+            .unwrap();
+        assert_eq!(result.credential_id, 2, "应换号而不是返回 429");
+        let manager = harness.provider.token_manager();
+        assert!(manager.is_overage_exhausted(1));
+        assert!(!manager.is_cli_exhausted(1));
     }
 
     #[tokio::test]
@@ -2680,20 +2811,6 @@ mod rate_limit_tests {
         let manager = harness.provider.token_manager();
         assert!(!manager.is_overage_exhausted(1));
         assert!(!manager.is_overage_exhausted(2));
-    }
-
-    #[test]
-    fn cli_400_after_quota_is_limited_to_amazonq_cli() {
-        let improper = r#"{"message":"Improperly formed request."}"#;
-        assert!(is_cli_400_after_quota("amazonq-cli", 400, improper));
-        assert!(!is_cli_400_after_quota("runtime", 400, improper));
-        assert!(!is_cli_400_after_quota("codewhisperer", 400, improper));
-        assert!(!is_cli_400_after_quota(
-            "amazonq-cli",
-            400,
-            r#"{"reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#
-        ));
-        assert!(!is_cli_400_after_quota("amazonq-cli", 402, improper));
     }
 
     #[tokio::test]

@@ -25,6 +25,9 @@
 # 本机全周期累计积分（运行时产物，不入库；.tmp 是落盘时的中间文件）
 /credit_total.json
 /credit_total.json.tmp
+# 额度用尽标记（运行时产物，不入库；.tmp 是落盘时的中间文件）
+/quota_marks.json
+/quota_marks.json.tmp
 # 请求链路追踪 SQLite 库（运行时产物，含 WAL 边车文件）
 /traces.db
 /traces.db-shm
