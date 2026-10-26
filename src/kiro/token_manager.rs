@@ -999,6 +999,10 @@ struct CredentialEntry {
     /// 队列长度达到 `account_rpm_limit` 时该凭据本窗口内被排除出候选。
     /// 不持久化，进程重启后清空；限流关闭时始终为空。
     rpm_window: VecDeque<Instant>,
+    /// 最近一次被真实业务请求选中（含粘性命中）的时刻。同档内按它做 LRU 轮转，
+    /// 取代累计 success_count：后者从不清零，新号会独占整档直到追平老号（实测 #610
+    /// 独占一小时内吃了 546 次 429）。不持久化，重启后同档按 success_count 兜底。
+    last_selected_at: Option<Instant>,
     /// 当前凭据连续执行自愈的轮数。同一凭据成功后清零。
     self_heal_consecutive_rounds: u32,
     /// 当前凭据累计被自愈恢复的次数。
@@ -1610,6 +1614,7 @@ impl MultiTokenManager {
                     last_used_at: None,
                     throttled_until: None,
                     rpm_window: VecDeque::new(),
+                    last_selected_at: None,
                     self_heal_consecutive_rounds: cred.self_heal_consecutive_rounds,
                     self_heal_total_count: cred.self_heal_total_count,
                     last_self_heal_at,
@@ -2492,6 +2497,13 @@ impl MultiTokenManager {
     /// 在同一把 `entries` 锁内完成过期清理、上限检查和记账，避免多个并发请求
     /// 在选择阶段同时通过检查后全部写入窗口。返回 `false` 表示额度已被其它请求
     /// 抢先占用，调用方应重新选择凭据。
+    /// 记录凭据被真实业务请求选中，供同档 LRU 轮转。
+    fn touch_selected(&self, id: u64) {
+        if let Some(entry) = self.entries.lock().iter_mut().find(|e| e.id == id) {
+            entry.last_selected_at = Some(Instant::now());
+        }
+    }
+
     fn record_request(&self, id: u64) -> bool {
         let now = Instant::now();
         let window = StdDuration::from_secs(RPM_WINDOW_SECS);
@@ -2627,6 +2639,7 @@ impl MultiTokenManager {
                             servability_rank(snapshots.get(&left.id), now_ts)
                                 .cmp(&servability_rank(snapshots.get(&right.id), now_ts))
                         })
+                        .then_with(|| left.last_selected_at.cmp(&right.last_selected_at))
                         .then_with(|| left.success_count.cmp(&right.success_count))
                         .then_with(|| left.id.cmp(&right.id))
                 });
@@ -2836,8 +2849,11 @@ impl MultiTokenManager {
 
                 let (id, credentials) = if let Some((new_id, new_creds)) = best {
                     if update_current {
-                        let mut current_id = self.current_id.lock();
-                        *current_id = new_id;
+                        {
+                            let mut current_id = self.current_id.lock();
+                            *current_id = new_id;
+                        }
+                        self.touch_selected(new_id);
                     }
                     (new_id, new_creds)
                 } else {
@@ -4944,6 +4960,7 @@ impl MultiTokenManager {
                 last_used_at: None,
                 throttled_until: None,
                 rpm_window: VecDeque::new(),
+                last_selected_at: None,
                 self_heal_consecutive_rounds: 0,
                 self_heal_total_count: 0,
                 last_self_heal_at: None,
@@ -10121,6 +10138,42 @@ mod tests {
         assert_eq!(ctx.id, 2);
         assert_eq!(route.sticky_outcome, StickyOutcome::MissUnavailable);
         assert_eq!(route.previous_credential_id, Some(1));
+    }
+
+    fn quota_manager(names: &[&str]) -> MultiTokenManager {
+        MultiTokenManager::new(
+            Config::default(),
+            names.iter().map(|name| grouped_cred(name, &[])).collect(),
+            None,
+            None,
+            false,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn same_tier_rotates_by_last_selection_not_lifetime_success() {
+        let manager = quota_manager(&["veteran", "newcomer"]);
+        set_balance(&manager, 1, 49.0, false);
+        set_balance(&manager, 2, 4959.0, true);
+        for _ in 0..50 {
+            manager.report_success(1);
+        }
+        let mut picks = Vec::new();
+        for _ in 0..4 {
+            let mut budget = manager.new_acquire_wait_budget();
+            let ctx = manager
+                .acquire_context_with_budget(None, None, &mut budget)
+                .await
+                .unwrap();
+            picks.push(ctx.id);
+        }
+        assert_eq!(picks[0], 2, "首次同为未选中，按成功次数兜底选新号");
+        assert_eq!(
+            picks,
+            vec![2, 1, 2, 1],
+            "同档按最近选中轮转，不让新号独占"
+        );
     }
 
     #[tokio::test]
